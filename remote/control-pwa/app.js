@@ -1079,12 +1079,37 @@ function startControlLoops() {
 }
 
 function connectionRequiresPassword(connection, connectionUrl, remoteInfo = null) {
+  if (!connectionUsesCloudRemote(connection, connectionUrl)) {
+    return false;
+  }
   return (
     booleanFlag(connection.requirePassword) ||
     booleanFlag(connection.require_password) ||
     booleanFlag(connectionUrl.searchParams.get("requirePassword")) ||
     connectionUrl.searchParams.get("e2ee") === E2EE_VERSION ||
     booleanFlag(remoteInfoField(remoteInfo, "requirePassword", "require_password"))
+  );
+}
+
+function connectionUsesCloudRemote(connection, connectionUrl) {
+  const authMode = String(
+    connection.auth ||
+      connection.authMode ||
+      connection.auth_mode ||
+      connectionUrl.searchParams.get("auth") ||
+      "",
+  )
+    .trim()
+    .toLowerCase();
+  return (
+    authMode === "cloud" ||
+    Boolean(
+      connection.cloudUser ||
+        connection.cloud_user ||
+        connection.jwt ||
+        connectionUrl.searchParams.get("cloudUser") ||
+        connectionUrl.searchParams.get("jwt"),
+    )
   );
 }
 
@@ -1518,6 +1543,9 @@ function buildInstanceFromConnection(connection, { existing = null, name = "", s
   if (requirePassword) {
     connectionUrl.searchParams.set("requirePassword", "1");
     connectionUrl.searchParams.set("e2ee", E2EE_VERSION);
+  } else {
+    connectionUrl.searchParams.delete("requirePassword");
+    connectionUrl.searchParams.delete("e2ee");
   }
 
   const now = Date.now();

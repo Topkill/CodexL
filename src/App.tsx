@@ -1893,7 +1893,7 @@ function App() {
     (profile: ProviderProfile, remote: RemoteControlInfo) => {
       try {
         const url = remote.lan_url || remote.url;
-        const qrUrl = compactRemoteQrUrl(url, remote);
+        const qrUrl = compactRemoteQrUrl(url);
         setRemoteQr({
           profile,
           remote,
@@ -5606,7 +5606,7 @@ function normalizeRemoteFrontendMode(value: unknown): RemoteFrontendMode {
   return typeof value === "string" && value.trim().toLowerCase() === "cli" ? "cli" : "app";
 }
 
-function compactRemoteQrUrl(value: string, remote: RemoteControlInfo) {
+function compactRemoteQrUrl(value: string) {
   try {
     const url = new URL(value);
     for (const key of [
@@ -5618,10 +5618,6 @@ function compactRemoteQrUrl(value: string, remote: RemoteControlInfo) {
       "web_asset_version",
     ]) {
       url.searchParams.delete(key);
-    }
-    if (remote.require_password) {
-      url.searchParams.set("requirePassword", "1");
-      url.searchParams.set("e2ee", "v1");
     }
     return url.toString();
   } catch {

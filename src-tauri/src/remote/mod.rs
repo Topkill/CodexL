@@ -332,7 +332,7 @@ pub async fn start_remote_control(
         cdp_port,
     };
     let raw_lan_url = remote_url(&server_config.host, server_config.port, &token);
-    let lan_url = append_remote_connection_params(raw_lan_url.clone(), &server_config)?;
+    let lan_url = append_remote_connection_params(raw_lan_url.clone(), &server_config, false)?;
     let raw_url = if let Some(relay_url) = relay_url.as_deref() {
         remote_relay_url(
             relay_url,
@@ -344,7 +344,11 @@ pub async fn start_remote_control(
     } else {
         raw_lan_url
     };
-    let url = append_remote_connection_params(raw_url, &server_config)?;
+    let url = append_remote_connection_params(
+        raw_url,
+        &server_config,
+        remote_requires_crypto(&server_config),
+    )?;
     let listener = TcpListener::bind((server_config.host.as_str(), server_config.port))
         .await
         .map_err(|e| format!("failed to bind remote control server: {}", e))?;
@@ -384,7 +388,7 @@ pub async fn start_remote_control(
             lan_url,
             relay_url,
             relay_connected: false,
-            require_password: server_config.crypto.is_some(),
+            require_password: remote_requires_crypto(&server_config),
             web_asset_mode: if server_config.web_asset_base_url.is_some() {
                 "registry".to_string()
             } else if runtime.backend.mode() == "cli" {
@@ -596,7 +600,7 @@ async fn route_remote_request(
         }
         (&Method::GET, "/api/remote-info") => Ok(json_response(
             StatusCode::OK,
-            runtime.remote_connection_info()?,
+            runtime.remote_connection_info(request_is_cloud_remote_context(request))?,
         )),
         (&Method::GET, "/api/targets") => {
             let targets = runtime.bridge_targets().await?;
@@ -980,9 +984,9 @@ impl RemoteRuntimeState {
         }
     }
 
-    fn remote_connection_info(&self) -> Result<Value, String> {
+    fn remote_connection_info(&self, cloud_context: bool) -> Result<Value, String> {
         let raw_lan_url = remote_url(&self.config.host, self.config.port, &self.config.token);
-        let lan_url = append_remote_connection_params(raw_lan_url.clone(), &self.config)?;
+        let lan_url = append_remote_connection_params(raw_lan_url.clone(), &self.config, false)?;
         let raw_url = if let Some(relay_url) = self.config.relay_url.as_deref() {
             remote_relay_url(
                 relay_url,
@@ -998,7 +1002,11 @@ impl RemoteRuntimeState {
         } else {
             raw_lan_url
         };
-        let url = append_remote_connection_params(raw_url, &self.config)?;
+        let url = append_remote_connection_params(
+            raw_url,
+            &self.config,
+            remote_requires_crypto(&self.config),
+        )?;
         let web_asset_mode = if self.config.web_asset_base_url.is_some() {
             "registry"
         } else {
@@ -1025,6 +1033,8 @@ impl RemoteRuntimeState {
             .as_ref()
             .map(RemoteCloudAuthConfig::display_label);
 
+        let require_password = cloud_context && remote_requires_crypto(&self.config);
+
         Ok(json!({
             "url": url,
             "lanUrl": lan_url.clone(),
@@ -1042,8 +1052,8 @@ impl RemoteRuntimeState {
             "port": self.config.port,
             "relayUrl": self.config.relay_url.clone(),
             "relay_url": self.config.relay_url.clone(),
-            "requirePassword": self.config.crypto.is_some(),
-            "require_password": self.config.crypto.is_some(),
+            "requirePassword": require_password,
+            "require_password": require_password,
             "remoteMode": "web",
             "remote_mode": "web",
             "remoteFrontendMode": self.config.remote_frontend_mode.clone(),
@@ -1996,9 +2006,33 @@ fn append_remote_web_asset_params(
 fn append_remote_connection_params(
     remote_url: String,
     config: &RemoteServerConfig,
+    include_crypto_params: bool,
 ) -> Result<String, String> {
     let remote_url = append_remote_web_asset_params(remote_url, config)?;
-    append_remote_crypto_params(remote_url, config.crypto.is_some())
+    append_remote_crypto_params(
+        remote_url,
+        include_crypto_params && remote_requires_crypto(config),
+    )
+}
+
+fn remote_requires_crypto(config: &RemoteServerConfig) -> bool {
+    config.relay_url.is_some() && config.crypto.is_some()
+}
+
+fn request_is_cloud_remote_context(request: &Request<Incoming>) -> bool {
+    query_is_cloud_remote_context(request.uri().query().unwrap_or(""))
+}
+
+fn query_is_cloud_remote_context(query: &str) -> bool {
+    query_param(query, "auth")
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("cloud"))
+        || query_param(query, "cloudUser")
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || query_param(query, "jwt")
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn non_empty_trimmed(value: String) -> Option<String> {
@@ -6511,6 +6545,74 @@ mod tests {
             pairs.get("webAssetMode").map(String::as_str),
             Some("registry")
         );
+    }
+
+    #[test]
+    fn lan_remote_url_omits_cloud_relay_crypto_params() {
+        let crypto = RemoteCrypto::from_password(Some("secret"), "connection-1")
+            .expect("remote crypto")
+            .map(Arc::new);
+        let config = RemoteServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3147,
+            token: "remote-token".to_string(),
+            relay_url: Some("https://relay.example.com".to_string()),
+            relay_connection_id: Some("connection-1".to_string()),
+            crypto,
+            remote_frontend_mode: "app".to_string(),
+            device_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace 1".to_string(),
+            workspace_path: "/tmp/workspace-1".to_string(),
+            cloud_auth: None,
+            web_asset_base_url: None,
+            web_asset_version: "latest".to_string(),
+            cdp_host: "127.0.0.1".to_string(),
+            cdp_port: 9222,
+        };
+
+        let lan_url = append_remote_connection_params(
+            "http://127.0.0.1:3147/?token=remote-token".to_string(),
+            &config,
+            false,
+        )
+        .expect("lan url");
+        let lan_pairs = reqwest::Url::parse(&lan_url)
+            .expect("parse lan url")
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(lan_pairs.get("requirePassword"), None);
+        assert_eq!(lan_pairs.get("e2ee"), None);
+
+        let cloud_url = append_remote_connection_params(
+            "https://relay.example.com/?auth=cloud&token=connection-1".to_string(),
+            &config,
+            true,
+        )
+        .expect("cloud url");
+        let cloud_pairs = reqwest::Url::parse(&cloud_url)
+            .expect("parse cloud url")
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            cloud_pairs.get("requirePassword").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(cloud_pairs.get("e2ee").map(String::as_str), Some("v1"));
+    }
+
+    #[test]
+    fn cloud_remote_context_is_detected_from_query_metadata() {
+        assert!(query_is_cloud_remote_context("auth=cloud&token=relay"));
+        assert!(query_is_cloud_remote_context(
+            "token=relay&cloudUser=user-1"
+        ));
+        assert!(query_is_cloud_remote_context("token=relay&jwt=jwt-1"));
+        assert!(!query_is_cloud_remote_context("token=remote-token"));
     }
 
     #[test]
