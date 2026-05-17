@@ -156,6 +156,7 @@ struct RemoteServerConfig {
     relay_url: Option<String>,
     relay_connection_id: Option<String>,
     crypto: Option<Arc<RemoteCrypto>>,
+    remote_frontend_mode: String,
     device_uuid: String,
     workspace_id: String,
     workspace_name: String,
@@ -222,7 +223,6 @@ pub async fn start_remote_control(
                 .map(|profile| profile.start_remote_cloud_on_launch)
         })
         .unwrap_or(false);
-    let require_e2ee = use_cloud_relay;
     let workspace_id = profile
         .as_ref()
         .map(|profile| profile.id.clone())
@@ -231,7 +231,22 @@ pub async fn start_remote_control(
         .as_ref()
         .map(|profile| generated_codex_home(profile).to_string_lossy().to_string())
         .unwrap_or_default();
-    let cloud_auth = if use_cloud_relay {
+    let relay_url = if use_cloud_relay {
+        match cloud_relay_url_for_startup(&app_config).await {
+            Ok(relay_url) => Some(relay_url),
+            Err(err) => {
+                eprintln!(
+                    "Cloud relay unavailable for {}; continuing with LAN remote control: {}",
+                    profile_name, err
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let require_e2ee = relay_url.is_some();
+    let cloud_auth = if relay_url.is_some() {
         let mut auth = app_config.remote_cloud_auth.clone();
         auth.normalize();
         if !auth.is_logged_in() {
@@ -249,11 +264,6 @@ pub async fn start_remote_control(
             }
         }
         Some(auth)
-    } else {
-        None
-    };
-    let relay_url = if use_cloud_relay {
-        Some(discover_cloud_relay_url().await?)
     } else {
         None
     };
@@ -280,6 +290,7 @@ pub async fn start_remote_control(
         .await?;
         (RemoteBackend::App, launch.cdp_host, launch.cdp_port)
     };
+    let remote_frontend_mode = backend.mode().to_string();
 
     let token = make_token();
     let relay_connection_id = relay_url.as_ref().map(|_| make_relay_connection_id());
@@ -309,6 +320,7 @@ pub async fn start_remote_control(
         relay_url: relay_url.clone(),
         relay_connection_id: relay_connection_id.clone(),
         crypto: crypto.map(Arc::new),
+        remote_frontend_mode,
         device_uuid: app_config.device_uuid.clone(),
         workspace_id,
         workspace_name: profile_name.clone(),
@@ -467,6 +479,25 @@ async fn discover_cloud_relay_url() -> Result<String, String> {
         .await
         .map_err(|e| format!("failed to parse cloud relay discovery response: {}", e))?;
     selected_cloud_relay_url(discovery)
+}
+
+async fn cloud_relay_url_for_startup(app_config: &AppConfig) -> Result<String, String> {
+    if let Some(relay_url) = configured_cloud_relay_url(&app_config.remote_relay_url)? {
+        return Ok(relay_url);
+    }
+
+    discover_cloud_relay_url().await
+}
+
+fn configured_cloud_relay_url(value: &str) -> Result<Option<String>, String> {
+    let relay_url = value.trim().trim_end_matches('/');
+    if relay_url.is_empty() {
+        return Ok(None);
+    }
+
+    relay_host_ws_url(relay_url, "probe", true)
+        .map_err(|err| format!("invalid configured cloud relay URL: {}", err))?;
+    Ok(Some(relay_url.to_string()))
 }
 
 fn selected_cloud_relay_url(discovery: CloudRelayDiscoveryResponse) -> Result<String, String> {
@@ -1015,6 +1046,8 @@ impl RemoteRuntimeState {
             "require_password": self.config.crypto.is_some(),
             "remoteMode": "web",
             "remote_mode": "web",
+            "remoteFrontendMode": self.config.remote_frontend_mode.clone(),
+            "remote_frontend_mode": self.config.remote_frontend_mode.clone(),
             "webAssetMode": web_asset_mode,
             "web_asset_mode": web_asset_mode,
             "webAssetBaseUrl": self.config.web_asset_base_url.clone(),
@@ -1923,7 +1956,9 @@ fn append_relay_metadata_to_ws_url(
         query
             .append_pair("deviceType", "desktop")
             .append_pair("platform", &platform)
-            .append_pair("clientVersion", env!("CARGO_PKG_VERSION"));
+            .append_pair("clientVersion", env!("CARGO_PKG_VERSION"))
+            .append_pair("remoteFrontendMode", config.remote_frontend_mode.trim())
+            .append_pair("remote_frontend_mode", config.remote_frontend_mode.trim());
     }
 
     Ok(url.to_string())
@@ -6441,6 +6476,7 @@ mod tests {
             relay_url: None,
             relay_connection_id: None,
             crypto: None,
+            remote_frontend_mode: "cli".to_string(),
             device_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             workspace_id: "workspace-1".to_string(),
             workspace_name: "Workspace 1".to_string(),
@@ -7708,6 +7744,7 @@ mod tests {
             relay_url: Some("https://relay.example.com".to_string()),
             relay_connection_id: Some("connection-1".to_string()),
             crypto: None,
+            remote_frontend_mode: "cli".to_string(),
             device_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             workspace_id: "workspace-1".to_string(),
             workspace_name: "Workspace 1".to_string(),
@@ -7729,11 +7766,16 @@ mod tests {
             .query_pairs()
             .find(|(key, _)| key == "deviceUuid")
             .map(|(_, value)| value.into_owned());
+        let remote_frontend_mode = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "remoteFrontendMode")
+            .map(|(_, value)| value.into_owned());
 
         assert_eq!(
             device_uuid.as_deref(),
             Some("11111111-1111-4111-8111-111111111111")
         );
+        assert_eq!(remote_frontend_mode.as_deref(), Some("cli"));
     }
 
     #[tokio::test]
@@ -7745,6 +7787,7 @@ mod tests {
             relay_url: Some("https://relay.example.com".to_string()),
             relay_connection_id: Some("connection-1".to_string()),
             crypto: None,
+            remote_frontend_mode: "app".to_string(),
             device_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             workspace_id: "workspace-1".to_string(),
             workspace_name: "Workspace 1".to_string(),
@@ -7790,6 +7833,21 @@ mod tests {
         .expect("relay url");
 
         assert_eq!(url, "https://us1.codexl.io");
+    }
+
+    #[test]
+    fn configured_cloud_relay_url_trims_and_validates_url() {
+        let url = configured_cloud_relay_url("https://relay.example.com/")
+            .expect("configured relay URL should parse");
+
+        assert_eq!(url.as_deref(), Some("https://relay.example.com"));
+    }
+
+    #[test]
+    fn configured_cloud_relay_url_allows_empty_value() {
+        let url = configured_cloud_relay_url("   ").expect("empty relay URL is not an error");
+
+        assert_eq!(url, None);
     }
 
     #[test]
