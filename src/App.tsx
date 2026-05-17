@@ -333,6 +333,7 @@ type RemoteCloudAuthConfig = {
   email: string;
   avatar_url: string;
   is_pro: boolean;
+  subscription_expires_at: number;
   access_token: string;
   refresh_token: string;
   expires_at: number;
@@ -848,6 +849,8 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     signOut: t("account.signOut"),
     signedInAs: (name: string) => t("account.signedInAs", { name }),
     openDashboard: t("account.openDashboard"),
+    pro: t("account.pro"),
+    proExpiresAt: (date: string) => t("account.proExpiresAt", { date }),
     loginFailed: t("account.loginFailed"),
     loginExpired: t("account.loginExpired"),
     scanQrInWeixin: t("bot.scanQrInWeixin"),
@@ -929,7 +932,25 @@ const emptyHandoffScanState: BotHandoffScanState = {
 const HANDOFF_TARGET_NONE_VALUE = "__codexl_handoff_target_none__";
 const BOT_CONFIG_CUSTOM_VALUE = "__codexl_bot_config_custom__";
 const WORKSPACE_PROVIDER_GATEWAY_VALUE = "__codexl_workspace_provider_gateway__";
+const DEFAULT_CODEXL_SERVER_URL = "https://codexl.io";
 let initialAppUpdateCheckStarted = false;
+
+function isEditableTextTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+
+  const editable = target.closest("input, textarea, [contenteditable]");
+  if (!editable) {
+    return false;
+  }
+
+  if (editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement) {
+    return !editable.disabled;
+  }
+
+  return editable.getAttribute("contenteditable") !== "false";
+}
 
 function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -976,6 +997,23 @@ function App() {
   const language = normalizeLanguage(config?.language);
   const appearance = normalizeAppearance(config?.appearance);
   const gatewayProfileEnabled = nextAiGatewayEnabled(config?.extensions);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      return;
+    }
+
+    const preventWebViewContextMenu = (event: MouseEvent) => {
+      if (!isEditableTextTarget(event.target)) {
+        event.preventDefault();
+      }
+    };
+
+    document.addEventListener("contextmenu", preventWebViewContextMenu, { capture: true });
+    return () => {
+      document.removeEventListener("contextmenu", preventWebViewContextMenu, { capture: true });
+    };
+  }, []);
 
   const showSettingsError = useCallback((error: unknown) => {
     const message = errorMessage(error).replace(/^Error:\s*/, "");
@@ -2012,6 +2050,7 @@ function App() {
             auth={config?.remote_cloud_auth ?? emptyRemoteCloudAuth()}
             busy={accountLoginState === "polling"}
             error={accountError}
+            language={language}
             strings={strings}
             onSignIn={() => beginDesktopLogin().catch(showSettingsError)}
             onSignOut={() => clearRemoteCloudAuth().catch(showSettingsError)}
@@ -2165,6 +2204,7 @@ function AccountMenu({
   auth,
   busy,
   error,
+  language,
   strings,
   onSignIn,
   onSignOut,
@@ -2173,6 +2213,7 @@ function AccountMenu({
   auth: RemoteCloudAuthConfig;
   busy: boolean;
   error: string;
+  language: Language;
   strings: AppStrings;
   onSignIn: () => void;
   onSignOut: () => void;
@@ -2183,6 +2224,8 @@ function AccountMenu({
   const email = remoteCloudEmail(auth);
   const avatarUrl = remoteCloudAvatarUrl(auth);
   const isPro = Boolean(auth.is_pro);
+  const proExpiresAt = isPro ? remoteCloudSubscriptionExpiresAt(auth) : 0;
+  const proExpiresAtText = proExpiresAt ? formatAccountDate(proExpiresAt, language) : "";
 
   if (!signedIn) {
     return (
@@ -2221,9 +2264,21 @@ function AccountMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-64">
         <div className="px-2 py-2">
-          <div className="truncate text-sm font-medium">{label}</div>
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="min-w-0 truncate text-sm font-medium">{label}</div>
+            {isPro ? (
+              <Badge className="account-pro-badge shrink-0 px-1.5 py-0 text-[10px] leading-4">
+                {strings.pro}
+              </Badge>
+            ) : null}
+          </div>
+          {proExpiresAtText ? (
+            <div className="mt-0.5 truncate text-xs text-muted-foreground">
+              {strings.proExpiresAt(proExpiresAtText)}
+            </div>
+          ) : null}
           {email ? (
-            <div className="truncate text-xs text-muted-foreground">{email}</div>
+            <div className="mt-0.5 truncate text-xs text-muted-foreground">{email}</div>
           ) : null}
         </div>
         <DropdownMenuSeparator />
@@ -2256,6 +2311,7 @@ function AccountAvatar({
   }, [avatarUrl]);
 
   const className = `account-avatar-shell ${premium ? "account-avatar-premium" : ""}`;
+  const avatarSizeClassName = premium ? "h-[1.625rem] w-[1.625rem]" : "h-7 w-7";
 
   if (avatarUrl && !failed) {
     return (
@@ -2263,7 +2319,7 @@ function AccountAvatar({
         <img
           src={avatarUrl}
           alt=""
-          className="relative z-10 h-7 w-7 rounded-full object-cover"
+          className={cn("relative z-10 rounded-full object-cover", avatarSizeClassName)}
           referrerPolicy="no-referrer"
           onError={() => setFailed(true)}
         />
@@ -2273,7 +2329,12 @@ function AccountAvatar({
 
   return (
     <span className={className}>
-      <span className="relative z-10 flex h-7 w-7 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">
+      <span
+        className={cn(
+          "relative z-10 flex items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground",
+          avatarSizeClassName,
+        )}
+      >
         {accountInitials(label)}
       </span>
     </span>
@@ -5251,7 +5312,7 @@ function WeixinBotQrDialog({
 }
 
 function codexServerBaseUrl() {
-  return (import.meta.env.VITE_CODEXL_SERVER_URL || "http://127.0.0.1:3000").replace(/\/+$/, "");
+  return (import.meta.env.VITE_CODEXL_SERVER_URL || DEFAULT_CODEXL_SERVER_URL).replace(/\/+$/, "");
 }
 
 function codexServerUrl(path: string) {
@@ -5316,6 +5377,7 @@ function remoteCloudAuthFromDesktopLogin(
       email: result.cloudAuth.email,
       avatar_url: result.cloudAuth.avatarUrl ?? "",
       is_pro: result.user.hasSubscription,
+      subscription_expires_at: subscriptionExpiresAtFromDesktopLogin(result),
       access_token: result.cloudAuth.accessToken,
       refresh_token: result.cloudAuth.refreshToken,
       expires_at: result.cloudAuth.expiresAt,
@@ -5328,10 +5390,51 @@ function remoteCloudAuthFromDesktopLogin(
     email: result.user.email,
     avatar_url: result.user.avatarUrl ?? "",
     is_pro: result.user.hasSubscription,
+    subscription_expires_at: subscriptionExpiresAtFromDesktopLogin(result),
     access_token: "",
     refresh_token: "",
     expires_at: 0,
   };
+}
+
+function subscriptionExpiresAtFromDesktopLogin(
+  result: Extract<DesktopAuthPollResponse, { status: "authenticated" }>,
+) {
+  const user = objectValue(result.user);
+  const cloudAuth = objectValue(result.cloudAuth);
+  const userSubscription = objectValue(user.subscription);
+  const cloudSubscription = objectValue(cloudAuth.subscription);
+
+  return firstUnixSeconds(
+    cloudAuth.subscription_expires_at,
+    cloudAuth.subscriptionExpiresAt,
+    cloudAuth.subscription_ends_at,
+    cloudAuth.subscriptionEndsAt,
+    cloudAuth.pro_expires_at,
+    cloudAuth.proExpiresAt,
+    cloudAuth.current_period_end,
+    cloudAuth.currentPeriodEnd,
+    cloudSubscription.expires_at,
+    cloudSubscription.expiresAt,
+    cloudSubscription.ends_at,
+    cloudSubscription.endsAt,
+    cloudSubscription.current_period_end,
+    cloudSubscription.currentPeriodEnd,
+    user.subscription_expires_at,
+    user.subscriptionExpiresAt,
+    user.subscription_ends_at,
+    user.subscriptionEndsAt,
+    user.pro_expires_at,
+    user.proExpiresAt,
+    user.current_period_end,
+    user.currentPeriodEnd,
+    userSubscription.expires_at,
+    userSubscription.expiresAt,
+    userSubscription.ends_at,
+    userSubscription.endsAt,
+    userSubscription.current_period_end,
+    userSubscription.currentPeriodEnd,
+  );
 }
 
 function remoteRelayUrlFromDesktopLogin(
@@ -5359,6 +5462,7 @@ function emptyRemoteCloudAuth(): RemoteCloudAuthConfig {
     email: "",
     avatar_url: "",
     is_pro: false,
+    subscription_expires_at: 0,
     access_token: "",
     refresh_token: "",
     expires_at: 0,
@@ -5393,6 +5497,21 @@ function remoteCloudAvatarUrl(auth: RemoteCloudAuthConfig) {
   return auth.avatar_url?.trim() || stringClaim(claims, "picture") || stringClaim(claims, "avatarUrl");
 }
 
+function remoteCloudSubscriptionExpiresAt(auth: RemoteCloudAuthConfig) {
+  const claims = remoteCloudJwtClaims(auth);
+  return firstUnixSeconds(
+    auth.subscription_expires_at,
+    claims?.subscription_expires_at,
+    claims?.subscriptionExpiresAt,
+    claims?.subscription_ends_at,
+    claims?.subscriptionEndsAt,
+    claims?.pro_expires_at,
+    claims?.proExpiresAt,
+    claims?.current_period_end,
+    claims?.currentPeriodEnd,
+  );
+}
+
 function remoteCloudJwtClaims(auth: RemoteCloudAuthConfig) {
   const parts = auth.access_token?.split(".") ?? [];
 
@@ -5412,6 +5531,52 @@ function remoteCloudJwtClaims(auth: RemoteCloudAuthConfig) {
 function stringClaim(claims: Record<string, unknown> | null, key: string) {
   const value = claims?.[key];
   return typeof value === "string" ? value.trim() : "";
+}
+
+function firstUnixSeconds(...values: unknown[]) {
+  for (const value of values) {
+    const seconds = unixSecondsValue(value);
+    if (seconds > 0) {
+      return seconds;
+    }
+  }
+  return 0;
+}
+
+function unixSecondsValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value > 1_000_000_000_000 ? value / 1000 : value);
+  }
+
+  if (typeof value !== "string") {
+    return 0;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isFinite(parsed) ? Math.trunc(parsed > 1_000_000_000_000 ? parsed / 1000 : parsed) : 0;
+  }
+
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? Math.trunc(parsed / 1000) : 0;
+}
+
+function formatAccountDate(unixSeconds: number, language: Language) {
+  const date = new Date(unixSeconds * 1000);
+  if (!Number.isFinite(date.getTime())) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(date);
 }
 
 function accountInitials(label: string) {

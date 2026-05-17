@@ -87,6 +87,25 @@ html[data-theme="light"] {
     body {
         @apply bg-background text-foreground font-sans;
     }
+
+    html,
+    body,
+    #root {
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    input,
+    textarea,
+    [contenteditable]:not([contenteditable="false"]) {
+        -webkit-user-select: text;
+        user-select: text;
+    }
+
+    img,
+    svg {
+        -webkit-user-drag: none;
+    }
 }
 
 @layer components {
@@ -101,72 +120,73 @@ html[data-theme="light"] {
         border-radius: 9999px;
     }
 
+    .account-pro-badge {
+        border: 1px solid color-mix(in oklch, oklch(0.78 0.12 86) 34%, transparent);
+        background: color-mix(in oklch, oklch(0.78 0.12 86) 14%, transparent);
+        color: oklch(0.84 0.12 86);
+    }
+
+    html[data-theme="light"] .account-pro-badge {
+        border-color: color-mix(in oklch, oklch(0.58 0.13 76) 36%, transparent);
+        background: color-mix(in oklch, oklch(0.82 0.12 86) 18%, transparent);
+        color: oklch(0.45 0.12 76);
+    }
+
     .account-avatar-premium {
-        --premium-glow-a: oklch(0.78 0.17 86);
-        --premium-glow-b: oklch(0.76 0.13 165);
-        --premium-glow-c: oklch(0.72 0.16 262);
+        --premium-ring-a: oklch(0.78 0.12 86);
+        --premium-ring-b: oklch(0.76 0.1 178);
+        --premium-ring-c: oklch(0.76 0.12 278);
+        height: 1.875rem;
+        width: 1.875rem;
+        background: color-mix(in oklch, var(--app-card) 82%, transparent);
+        box-shadow:
+            0 0 0 1px color-mix(in oklch, var(--app-background) 75%, transparent),
+            0 1px 4px rgb(0 0 0 / 0.22);
     }
 
     .account-avatar-premium::before {
         content: "";
         position: absolute;
-        inset: -4px;
-        z-index: -1;
+        inset: 0;
+        z-index: 0;
         border-radius: inherit;
         background: conic-gradient(
-            from 140deg,
-            var(--premium-glow-a),
-            var(--premium-glow-b),
-            var(--premium-glow-c),
-            var(--premium-glow-a)
+            from 225deg,
+            var(--premium-ring-a),
+            var(--premium-ring-b) 34%,
+            var(--premium-ring-c) 68%,
+            var(--premium-ring-a)
         );
-        filter: blur(3px);
-        opacity: 0.92;
-    }
-
-    @media (prefers-reduced-motion: no-preference) {
-        .account-avatar-premium::before {
-            animation: account-avatar-premium-glow 3.2s ease-in-out infinite;
-        }
-    }
-
-    @keyframes account-avatar-premium-glow {
-        0%,
-        100% {
-            opacity: 0.72;
-            transform: scale(0.96);
-        }
-
-        50% {
-            opacity: 1;
-            transform: scale(1.04);
-        }
+        opacity: 0.95;
     }
 
     .account-avatar-premium::after {
         content: "";
         position: absolute;
-        inset: -1px;
-        z-index: 0;
+        inset: 2px;
+        z-index: 20;
         pointer-events: none;
         border-radius: inherit;
-        border: 1px solid color-mix(in oklch, var(--premium-glow-a) 78%, transparent);
+        border: 1px solid rgb(255 255 255 / 0.28);
+        box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.18);
     }
 
-    html[data-theme="dark"] .account-avatar-premium {
-        box-shadow:
-            0 0 0 1px color-mix(in oklch, var(--premium-glow-a) 55%, transparent),
-            0 0 18px color-mix(in oklch, var(--premium-glow-b) 54%, transparent),
-            0 0 34px color-mix(in oklch, var(--premium-glow-c) 34%, transparent);
+    .account-avatar-premium > img,
+    .account-avatar-premium > span {
+        box-shadow: 0 0 0 1px color-mix(in oklch, var(--app-card) 88%, transparent);
     }
 
     html[data-theme="light"] .account-avatar-premium {
-        --premium-glow-a: oklch(0.68 0.15 83);
-        --premium-glow-b: oklch(0.62 0.13 165);
-        --premium-glow-c: oklch(0.58 0.15 262);
+        --premium-ring-a: oklch(0.64 0.14 82);
+        --premium-ring-b: oklch(0.58 0.12 178);
+        --premium-ring-c: oklch(0.58 0.13 278);
         box-shadow:
-            0 0 0 1px color-mix(in oklch, var(--premium-glow-a) 62%, transparent),
-            0 0 12px color-mix(in oklch, var(--premium-glow-b) 38%, transparent),
-            0 0 24px color-mix(in oklch, var(--premium-glow-c) 24%, transparent);
+            0 0 0 1px rgb(255 255 255 / 0.85),
+            0 1px 5px rgb(0 0 0 / 0.16);
+    }
+
+    html[data-theme="light"] .account-avatar-premium::after {
+        border-color: rgb(255 255 255 / 0.5);
+        box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.1);
     }
 }
