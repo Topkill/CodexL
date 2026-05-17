@@ -1,10 +1,12 @@
 use crate::{
+    cli_middleware,
     config::{
         self, generated_codex_home, AppConfig, ProviderProfile, RemoteCloudAuthConfig,
         REMOTE_FRONTEND_MODE_CLI,
     },
     launcher, ports, server, AppState,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
@@ -58,11 +60,14 @@ const RELAY_WEB_BRIDGE_NOTIFICATION_PUMP_TTL_MS: u64 = 10 * 60_000;
 const FRAME_META_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_REQUEST_TIMEOUT_MS: u64 = 5 * 60_000;
 const CLI_APP_SERVER_FETCH_TIMEOUT_MS: u64 = 30_000;
+const CLI_READ_FILE_BINARY_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const CLI_APP_SERVER_RESUME_TURNS_LIMIT: u64 = 5;
 const CLI_APP_SERVER_REQUEST_ID_PREFIX: &str = "codexl-remote-cli-";
 const CLI_APP_SERVER_PROTOCOL_VERSION: &str = "2025-11-25";
+const CLI_ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const CLI_PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
 const CLI_THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
+const CLI_WORKSPACE_ROOT_OPTIONS_KEY: &str = "workspace-root-options";
 const DEFAULT_SCREENSHOT_MAX_HEIGHT: u64 = 900;
 const DEFAULT_SCREENSHOT_MAX_WIDTH: u64 = 1440;
 const DEFAULT_PAGE_ZOOM_SCALE: f64 = 1.0;
@@ -2085,6 +2090,7 @@ struct CliAppBridge {
     next_subscription_id: AtomicUsize,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     subscribers: Mutex<HashMap<usize, mpsc::UnboundedSender<Value>>>,
+    workspace_name: String,
     writer: Mutex<ChildStdin>,
 }
 
@@ -2110,7 +2116,8 @@ impl CliAppBridge {
             .arg("app-server")
             .arg("--analytics-default-enabled")
             .env("CODEX_HOME", &codex_home)
-            .env("CODEXL_WORKSPACE_NAME", workspace_name)
+            .env(cli_middleware::CODEX_WORKSPACE_NAME_ENV, &workspace_name)
+            .env("CODEXL_WORKSPACE_NAME", &workspace_name)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
@@ -2139,6 +2146,7 @@ impl CliAppBridge {
             next_subscription_id: AtomicUsize::new(1),
             pending: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
+            workspace_name,
             writer: Mutex::new(stdin),
         });
         bridge.clone().spawn_stdout_reader(stdout);
@@ -2355,6 +2363,9 @@ impl CliAppBridge {
     }
 
     async fn dispatch_message(&self, message: Value) -> Result<Value, String> {
+        if cdp_resources::is_web_file_picker_message(&message) {
+            return cdp_resources::dispatch_web_file_picker_message(message);
+        }
         match message.get("type").and_then(Value::as_str).unwrap_or("") {
             "mcp-request" => self.dispatch_mcp_request(message).await,
             "mcp-response" => self.dispatch_mcp_response(message).await,
@@ -2376,14 +2387,52 @@ impl CliAppBridge {
                     "value": Value::Null,
                 }],
             })),
+            "electron-add-new-workspace-root-option" => {
+                self.dispatch_cli_add_workspace_root_message(message).await
+            }
+            "electron-set-active-workspace-root" => {
+                self.dispatch_cli_set_active_workspace_root_message(message)
+                    .await
+            }
+            "electron-update-workspace-root-options" => {
+                self.dispatch_cli_update_workspace_root_options_message(message)
+                    .await
+            }
             "codex-web-bridge-request-snapshot"
             | "desktop-notification-hide"
-            | "electron-add-new-workspace-root-option"
-            | "electron-set-active-workspace-root"
-            | "electron-update-workspace-root-options"
             | "thread-stream-state-changed" => Ok(json!({ "messages": [] })),
             _ => Ok(json!({ "messages": [] })),
         }
+    }
+
+    async fn dispatch_cli_add_workspace_root_message(
+        &self,
+        message: Value,
+    ) -> Result<Value, String> {
+        let Some(root) = message.get("root").and_then(Value::as_str) else {
+            return Ok(json!({ "messages": [] }));
+        };
+        let mut store = self.global_state.lock().await;
+        let messages = cli_add_workspace_root_messages(&mut store, root, true, true)?;
+        Ok(json!({ "messages": messages }))
+    }
+
+    async fn dispatch_cli_set_active_workspace_root_message(
+        &self,
+        message: Value,
+    ) -> Result<Value, String> {
+        let mut store = self.global_state.lock().await;
+        let messages = cli_set_active_workspace_root_messages(&mut store, &message)?;
+        Ok(json!({ "messages": messages }))
+    }
+
+    async fn dispatch_cli_update_workspace_root_options_message(
+        &self,
+        message: Value,
+    ) -> Result<Value, String> {
+        let mut store = self.global_state.lock().await;
+        let messages = cli_update_workspace_root_options_messages(&mut store, &message)?;
+        Ok(json!({ "messages": messages }))
     }
 
     async fn dispatch_mcp_request(&self, message: Value) -> Result<Value, String> {
@@ -2412,6 +2461,27 @@ impl CliAppBridge {
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": self.cached_initialize_result().await,
+                    },
+                }],
+            }));
+        }
+        if let Some(result) = cli_auth_method_result(
+            method,
+            request.get("params").unwrap_or(&Value::Null),
+            &self.codex_home,
+            &self.workspace_name,
+        ) {
+            let Some(id) = request.get("id").cloned() else {
+                return Ok(json!({ "messages": [] }));
+            };
+            return Ok(json!({
+                "messages": [{
+                    "type": "mcp-response",
+                    "hostId": host_id,
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
                     },
                 }],
             }));
@@ -2484,7 +2554,9 @@ impl CliAppBridge {
                 "[codex-web][cli] fetch unsupported requestId={} url={}",
                 request_id, url
             );
-            if let Some(response) = cli_external_fetch_response(url) {
+            if let Some(response) =
+                cli_external_fetch_response(url, &self.codex_home, &self.workspace_name)
+            {
                 return Ok(json!({
                     "messages": [fetch_response_body_success(&request_id, response)],
                 }));
@@ -2573,6 +2645,21 @@ impl CliAppBridge {
                 )],
             }));
         }
+        if let Some(result) =
+            cli_auth_method_result(method, &params, &self.codex_home, &self.workspace_name)
+        {
+            return Ok(json!({
+                "messages": [fetch_response_success(
+                    &request_id,
+                    &app_request_id,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": app_request_id,
+                        "result": result,
+                    }),
+                )],
+            }));
+        }
         let app_request_params = cli_app_server_method_params(method, params);
         let app_request = json!({
             "id": app_request_id,
@@ -2613,11 +2700,27 @@ impl CliAppBridge {
         params: Value,
     ) -> Result<(Value, Vec<Value>), String> {
         match endpoint {
+            "active-workspace-roots" => {
+                let store = self.global_state.lock().await;
+                return Ok((cli_active_workspace_roots_response(&store), Vec::new()));
+            }
+            "add-workspace-root-option" => {
+                let mut store = self.global_state.lock().await;
+                let (response, messages) =
+                    cli_add_workspace_root_endpoint_response(&mut store, &params)?;
+                return Ok((response, messages));
+            }
             "get-global-state" => {
                 let key = cli_global_state_key(&params)?;
                 let store = self.global_state.lock().await;
                 return Ok((
                     cli_global_state_get_response_for_key(&store, &key, &params, &self.codex_home)?,
+                    Vec::new(),
+                ));
+            }
+            "remote-workspace-directory-entries" => {
+                return Ok((
+                    cli_remote_workspace_directory_entries_response(&params)?,
                     Vec::new(),
                 ));
             }
@@ -2628,11 +2731,18 @@ impl CliAppBridge {
                     Vec::new(),
                 ));
             }
+            "workspace-root-options" => {
+                let store = self.global_state.lock().await;
+                return Ok((cli_workspace_root_options_response(&store), Vec::new()));
+            }
             _ => {}
         }
-        if let Some(response) =
-            cli_frontend_compat_endpoint_response(endpoint, &params, &self.codex_home)
-        {
+        if let Some(response) = cli_frontend_compat_endpoint_response(
+            endpoint,
+            &params,
+            &self.codex_home,
+            &self.workspace_name,
+        ) {
             return Ok((response, Vec::new()));
         }
         match endpoint {
@@ -2696,6 +2806,7 @@ impl CliAppBridge {
                     Vec::new(),
                 ))
             }
+            "read-file-binary" => Ok((cli_read_file_binary_response(&params)?, Vec::new())),
             "start-turn-for-host" => {
                 let conversation_id = params
                     .get("conversationId")
@@ -2953,6 +3064,15 @@ impl CliAppBridge {
         params: Value,
         timeout_ms: u64,
     ) -> Result<Value, String> {
+        if let Some(result) =
+            cli_auth_method_result(method, &params, &self.codex_home, &self.workspace_name)
+        {
+            return Ok(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "result": result,
+            }));
+        }
         let mut response = self
             .request_raw(
                 json!({
@@ -3333,13 +3453,320 @@ fn codex_fetch_endpoint_params(value: &Value) -> &Value {
         .unwrap_or(value)
 }
 
+fn cli_read_file_binary_response(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let path = endpoint_params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "read-file-binary missing path".to_string())?;
+    let path = Path::new(path);
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("cannot open file {}: {}", path.display(), err))?;
+    if !metadata.is_file() {
+        return Err(format!("not a file: {}", path.display()));
+    }
+    if metadata.len() > CLI_READ_FILE_BINARY_MAX_BYTES {
+        return Err(format!(
+            "file too large for binary preview: {} bytes (limit {} bytes)",
+            metadata.len(),
+            CLI_READ_FILE_BINARY_MAX_BYTES
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|err| format!("cannot read file {}: {}", path.display(), err))?;
+    Ok(json!({ "contentsBase64": BASE64_STANDARD.encode(&bytes) }))
+}
+
+fn cli_workspace_root_options_response(store: &HashMap<String, Value>) -> Value {
+    json!({
+        "roots": cli_workspace_roots(store),
+        "labels": {},
+    })
+}
+
+fn cli_active_workspace_roots_response(store: &HashMap<String, Value>) -> Value {
+    json!({ "roots": cli_active_workspace_roots(store) })
+}
+
+fn cli_add_workspace_root_endpoint_response(
+    store: &mut HashMap<String, Value>,
+    params: &Value,
+) -> Result<(Value, Vec<Value>), String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let root = endpoint_params
+        .get("root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "add-workspace-root-option missing root".to_string())?;
+    let set_active = endpoint_params
+        .get("setActive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let messages = cli_add_workspace_root_messages(store, root, set_active, false)?;
+    Ok((json!({ "success": true }), messages))
+}
+
+fn cli_remote_workspace_directory_entries_response(params: &Value) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let directory_path = endpoint_params
+        .get("directoryPath")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let directories_only = endpoint_params
+        .get("directoriesOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let directory = normalize_cli_workspace_picker_path(Some(directory_path))?;
+    let metadata = std::fs::metadata(&directory)
+        .map_err(|err| format!("cannot open directory {}: {}", directory.display(), err))?;
+    if !metadata.is_dir() {
+        return Err(format!("not a directory: {}", directory.display()));
+    }
+
+    let mut entries = Vec::new();
+    let read_dir = std::fs::read_dir(&directory)
+        .map_err(|err| format!("cannot read directory {}: {}", directory.display(), err))?;
+    for entry in read_dir.flatten() {
+        let Some((entry_type, _size_bytes)) = cli_workspace_picker_entry_type(&entry) else {
+            continue;
+        };
+        if directories_only && entry_type != "directory" {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty() {
+            continue;
+        }
+        entries.push(json!({
+            "name": name,
+            "path": entry.path().to_string_lossy().into_owned(),
+            "type": entry_type,
+        }));
+    }
+    entries.sort_by(|left, right| {
+        let left_type = left.get("type").and_then(Value::as_str).unwrap_or("");
+        let right_type = right.get("type").and_then(Value::as_str).unwrap_or("");
+        let left_name = left.get("name").and_then(Value::as_str).unwrap_or("");
+        let right_name = right.get("name").and_then(Value::as_str).unwrap_or("");
+        let left_hidden = left_name.starts_with('.');
+        let right_hidden = right_name.starts_with('.');
+        type_rank(left_type)
+            .cmp(&type_rank(right_type))
+            .then_with(|| left_hidden.cmp(&right_hidden))
+            .then_with(|| {
+                left_name
+                    .to_lowercase()
+                    .cmp(&right_name.to_lowercase())
+                    .then_with(|| left_name.cmp(right_name))
+            })
+    });
+
+    Ok(json!({
+        "directoryPath": directory.to_string_lossy().into_owned(),
+        "entries": entries,
+        "parentPath": directory.parent().map(|path| path.to_string_lossy().into_owned()),
+    }))
+}
+
+fn type_rank(entry_type: &str) -> u8 {
+    if entry_type == "directory" {
+        0
+    } else {
+        1
+    }
+}
+
+fn cli_workspace_picker_entry_type(
+    entry: &std::fs::DirEntry,
+) -> Option<(&'static str, Option<u64>)> {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_dir() => Some(("directory", None)),
+        Ok(file_type) if file_type.is_file() => {
+            let size_bytes = entry.metadata().ok().map(|metadata| metadata.len());
+            Some(("file", size_bytes))
+        }
+        Ok(file_type) if file_type.is_symlink() => {
+            let metadata = entry.metadata().ok()?;
+            if metadata.is_dir() {
+                Some(("directory", None))
+            } else if metadata.is_file() {
+                Some(("file", Some(metadata.len())))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn cli_workspace_roots(store: &HashMap<String, Value>) -> Vec<String> {
+    cli_string_vec_from_store(store, CLI_WORKSPACE_ROOT_OPTIONS_KEY)
+}
+
+fn cli_active_workspace_roots(store: &HashMap<String, Value>) -> Vec<String> {
+    cli_string_vec_from_store(store, CLI_ACTIVE_WORKSPACE_ROOTS_KEY)
+}
+
+fn cli_string_vec_from_store(store: &HashMap<String, Value>, key: &str) -> Vec<String> {
+    store
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn cli_store_string_vec(store: &mut HashMap<String, Value>, key: &str, values: Vec<String>) {
+    store.insert(
+        key.to_string(),
+        Value::Array(values.into_iter().map(Value::String).collect()),
+    );
+}
+
+fn cli_add_workspace_root_messages(
+    store: &mut HashMap<String, Value>,
+    root: &str,
+    set_active: bool,
+    navigate: bool,
+) -> Result<Vec<Value>, String> {
+    let root = normalize_cli_workspace_root(root)?;
+    let mut roots = cli_workspace_roots(store);
+    let changed = !roots.iter().any(|existing| existing == &root);
+    if changed {
+        roots.retain(|existing| existing != &root);
+        roots.insert(0, root.clone());
+        cli_store_string_vec(store, CLI_WORKSPACE_ROOT_OPTIONS_KEY, roots);
+    }
+
+    let mut messages = Vec::new();
+    if changed {
+        messages.push(json!({ "type": "workspace-root-options-updated" }));
+    }
+    if set_active {
+        cli_store_string_vec(store, CLI_ACTIVE_WORKSPACE_ROOTS_KEY, vec![root.clone()]);
+        messages.push(json!({ "type": "active-workspace-roots-updated" }));
+    }
+    messages.push(json!({ "type": "workspace-root-option-added", "root": root }));
+    if navigate {
+        messages.push(json!({
+            "type": "navigate-to-route",
+            "path": "/",
+            "state": { "focusComposerNonce": now_millis() },
+        }));
+    }
+    Ok(messages)
+}
+
+fn cli_set_active_workspace_root_messages(
+    store: &mut HashMap<String, Value>,
+    params: &Value,
+) -> Result<Vec<Value>, String> {
+    let roots = if let Some(values) = params.get("roots").and_then(Value::as_array) {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(normalize_cli_workspace_root)
+            .collect::<Result<Vec<_>, _>>()?
+    } else if let Some(root) = params.get("root").and_then(Value::as_str) {
+        vec![normalize_cli_workspace_root(root)?]
+    } else {
+        Vec::new()
+    };
+    cli_store_string_vec(store, CLI_ACTIVE_WORKSPACE_ROOTS_KEY, roots);
+    Ok(vec![json!({ "type": "active-workspace-roots-updated" })])
+}
+
+fn cli_update_workspace_root_options_messages(
+    store: &mut HashMap<String, Value>,
+    params: &Value,
+) -> Result<Vec<Value>, String> {
+    let roots = params
+        .get("roots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(normalize_cli_workspace_root)
+        .collect::<Result<Vec<_>, _>>()?;
+    let root_set = roots.iter().cloned().collect::<HashSet<_>>();
+    let active = cli_active_workspace_roots(store)
+        .into_iter()
+        .filter(|root| root_set.contains(root))
+        .collect::<Vec<_>>();
+    cli_store_string_vec(store, CLI_WORKSPACE_ROOT_OPTIONS_KEY, roots);
+    cli_store_string_vec(store, CLI_ACTIVE_WORKSPACE_ROOTS_KEY, active);
+    Ok(vec![
+        json!({ "type": "workspace-root-options-updated" }),
+        json!({ "type": "active-workspace-roots-updated" }),
+    ])
+}
+
+fn normalize_cli_workspace_root(path: &str) -> Result<String, String> {
+    let path = normalize_cli_workspace_picker_path(Some(path))?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|err| format!("cannot open workspace root {}: {}", path.display(), err))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "workspace root is not a directory: {}",
+            path.display()
+        ));
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn normalize_cli_workspace_picker_path(path: Option<&str>) -> Result<PathBuf, String> {
+    let trimmed = path.unwrap_or("").trim();
+    let mut directory = if trimmed.is_empty() {
+        home_directory()
+    } else if trimmed == "~" {
+        home_directory()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        match home_directory_opt() {
+            Some(home) => home.join(rest),
+            None => PathBuf::from(trimmed),
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&directory) {
+        directory = canonical;
+    }
+    Ok(directory)
+}
+
+fn home_directory() -> PathBuf {
+    home_directory_opt().unwrap_or_else(|| {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\")
+        } else {
+            PathBuf::from("/")
+        }
+    })
+}
+
+fn home_directory_opt() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
 fn cli_frontend_compat_endpoint_response(
     endpoint: &str,
     params: &Value,
     codex_home: &str,
+    workspace_name: &str,
 ) -> Option<Value> {
     let params = codex_fetch_endpoint_params(params);
     match endpoint {
+        "account-info" => Some(cli_account_info_response(codex_home, workspace_name)),
         "active-workspace-roots" => Some(json!({ "roots": [] })),
         "ambient-suggestions" => Some(json!({
             "file": {
@@ -3395,17 +3822,99 @@ fn cli_frontend_compat_endpoint_response(
     }
 }
 
-fn cli_external_fetch_response(url: &str) -> Option<Value> {
+fn cli_external_fetch_response(url: &str, codex_home: &str, workspace_name: &str) -> Option<Value> {
+    if url.starts_with("/wham/accounts/check") {
+        return Some(cli_wham_accounts_check_response(codex_home, workspace_name));
+    }
     if url.starts_with("/wham/tasks/list") {
         return Some(json!({ "items": [] }));
     }
     if url.starts_with("/wham/usage") {
         return Some(Value::Null);
     }
-    if url.starts_with("https://ab.chatgpt.com/") || url.starts_with("https://chatgpt.com/ces/") {
-        return Some(json!({}));
+    if cli_is_statsig_initialize_url(url) {
+        return Some(cli_statsig_initialize_response());
+    }
+    if cli_is_statsig_event_url(url) {
+        return Some(json!({ "success": true }));
     }
     None
+}
+
+fn cli_account_info_response(codex_home: &str, workspace_name: &str) -> Value {
+    let auth = cli_middleware::ChatGptAuth::load_for_codex_home(codex_home, workspace_name);
+    let account = auth.account_read_result();
+    let account = account.get("account").unwrap_or(&Value::Null);
+    let email = account
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    let plan = account
+        .get("planType")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    json!({
+        "account_id": email,
+        "account_user_id": email,
+        "email": email,
+        "id": email,
+        "plan": plan,
+        "plan_type": plan,
+        "profile_picture_url": Value::Null,
+        "structure": "personal",
+    })
+}
+
+fn cli_wham_accounts_check_response(codex_home: &str, workspace_name: &str) -> Value {
+    let account = cli_account_info_response(codex_home, workspace_name);
+    json!({
+        "accounts": [account.clone()],
+        "current_account": account,
+    })
+}
+
+fn cli_is_statsig_initialize_url(url: &str) -> bool {
+    matches!(
+        statsig_url_host_and_path(url).as_deref(),
+        Some("ab.chatgpt.com/v1/initialize")
+            | Some("featureassets.org/v1/initialize")
+            | Some("api.statsig.com/v1/initialize")
+    )
+}
+
+fn cli_is_statsig_event_url(url: &str) -> bool {
+    matches!(
+        statsig_url_host_and_path(url).as_deref(),
+        Some("chatgpt.com/ces/v1/rgstr")
+            | Some("ab.chatgpt.com/v1/rgstr")
+            | Some("prodregistryv2.org/v1/rgstr")
+            | Some("ab.chatgpt.com/v1/sdk_exception")
+    )
+}
+
+fn statsig_url_host_and_path(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
+    let path = path.split('?').next().unwrap_or(path).trim_matches('/');
+    Some(format!("{}/{}", host, path))
+}
+
+fn cli_statsig_initialize_response() -> Value {
+    json!({
+        "has_updates": true,
+        "time": now_millis(),
+        "feature_gates": {},
+        "dynamic_configs": {},
+        "layer_configs": {},
+        "param_stores": {},
+        "exposures": {},
+        "sdk_flags": {},
+        "hash_used": "djb2",
+        "full_checksum": "",
+        "derived_fields": {},
+    })
 }
 
 fn cli_paths_exist_response(params: &Value) -> Value {
@@ -3817,6 +4326,26 @@ fn json_response_result(response: Value) -> Result<Value, String> {
         return Err(json_error_message(error));
     }
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn cli_auth_method_result(
+    method: &str,
+    params: &Value,
+    codex_home: &str,
+    workspace_name: &str,
+) -> Option<Value> {
+    let auth = cli_middleware::ChatGptAuth::load_for_codex_home(codex_home, workspace_name);
+    match method {
+        "account/read" => Some(auth.account_read_result()),
+        "getAuthStatus" => {
+            let include_token = params
+                .get("includeToken")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(auth.auth_status_result(include_token))
+        }
+        _ => None,
+    }
 }
 
 fn response_error_is_method_not_found(response: &Value) -> bool {
@@ -6038,6 +6567,113 @@ mod tests {
     }
 
     #[test]
+    fn cli_read_file_binary_response_returns_base64_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-read-file-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("image.png");
+        std::fs::write(&file, b"hello").expect("write temp file");
+
+        let response = cli_read_file_binary_response(&json!({
+            "params": { "path": file.to_string_lossy() }
+        }))
+        .expect("read binary response");
+
+        assert_eq!(
+            response.get("contentsBase64").and_then(Value::as_str),
+            Some("aGVsbG8=")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_workspace_root_endpoint_tracks_added_root() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-workspace-root-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let canonical_root = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut store = HashMap::new();
+
+        let (response, messages) = cli_add_workspace_root_endpoint_response(
+            &mut store,
+            &json!({ "params": { "root": root.to_string_lossy(), "setActive": true } }),
+        )
+        .expect("add workspace root");
+
+        assert_eq!(response.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            cli_workspace_root_options_response(&store)
+                .get("roots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str),
+            Some(canonical_root.as_str())
+        );
+        assert_eq!(
+            cli_active_workspace_roots_response(&store)
+                .get("roots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str),
+            Some(canonical_root.as_str())
+        );
+        assert!(messages.iter().any(|message| {
+            message.get("type").and_then(Value::as_str) == Some("workspace-root-option-added")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_remote_workspace_directory_entries_lists_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-remote-dir-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(root.join("Beta")).expect("create beta");
+        std::fs::create_dir_all(root.join("alpha")).expect("create alpha");
+        std::fs::write(root.join("note.txt"), b"note").expect("write note");
+        let canonical_root = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let response = cli_remote_workspace_directory_entries_response(&json!({
+            "params": {
+                "directoryPath": root.to_string_lossy(),
+                "directoriesOnly": true
+            }
+        }))
+        .expect("directory entries");
+        let names = response
+            .get("entries")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["alpha", "Beta"]);
+        assert_eq!(
+            response.get("directoryPath").and_then(Value::as_str),
+            Some(canonical_root.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cli_direct_fetch_response_body_is_not_ipc_wrapped() {
         let response = fetch_response_body_success(
             "fetch-1",
@@ -6080,7 +6716,8 @@ mod tests {
             cli_frontend_compat_endpoint_response(
                 "get-copilot-api-proxy-info",
                 &Value::Null,
-                "/tmp/codex-home"
+                "/tmp/codex-home",
+                "Default",
             ),
             Some(Value::Null)
         );
@@ -6088,7 +6725,8 @@ mod tests {
             cli_frontend_compat_endpoint_response(
                 "mcp-codex-config",
                 &Value::Null,
-                "/tmp/codex-home"
+                "/tmp/codex-home",
+                "Default",
             ),
             Some(json!({ "config": {} }))
         );
@@ -6097,6 +6735,7 @@ mod tests {
                 "developer-instructions",
                 &json!({ "params": { "baseInstructions": "base" } }),
                 "/tmp/codex-home",
+                "Default",
             ),
             Some(json!({ "instructions": "base" }))
         );
@@ -6105,13 +6744,140 @@ mod tests {
                 "worktree-shell-environment-config",
                 &Value::Null,
                 "/tmp/codex-home",
+                "Default",
             ),
             Some(json!({ "shellEnvironment": Value::Null }))
         );
         assert_eq!(
-            cli_frontend_compat_endpoint_response("git-origins", &Value::Null, "/tmp/codex-home"),
+            cli_frontend_compat_endpoint_response(
+                "git-origins",
+                &Value::Null,
+                "/tmp/codex-home",
+                "Default",
+            ),
             Some(json!({ "origins": [] }))
         );
+    }
+
+    #[test]
+    fn cli_statsig_initialize_response_has_required_shape() {
+        let response = cli_external_fetch_response(
+            "https://ab.chatgpt.com/v1/initialize?k=client-key",
+            "/tmp/codex-home",
+            "Default",
+        )
+        .expect("statsig response");
+
+        assert_eq!(
+            response.get("has_updates").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(response.get("feature_gates").is_some_and(Value::is_object));
+        assert!(response
+            .get("dynamic_configs")
+            .is_some_and(Value::is_object));
+        assert!(response.get("layer_configs").is_some_and(Value::is_object));
+    }
+
+    #[test]
+    fn cli_account_info_uses_workspace_fallback() {
+        let response = cli_frontend_compat_endpoint_response(
+            "account-info",
+            &Value::Null,
+            "/tmp/codex-home",
+            "workspace-a",
+        )
+        .expect("account info");
+
+        assert_eq!(
+            response.get("email").and_then(Value::as_str),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            response.get("plan").and_then(Value::as_str),
+            Some("unknown")
+        );
+
+        let wham =
+            cli_external_fetch_response("/wham/accounts/check", "/tmp/codex-home", "workspace-a")
+                .expect("accounts check");
+        assert_eq!(
+            wham.get("accounts")
+                .and_then(Value::as_array)
+                .and_then(|accounts| accounts.first())
+                .and_then(|account| account.get("email"))
+                .and_then(Value::as_str),
+            Some("workspace-a")
+        );
+    }
+
+    #[test]
+    fn cli_auth_method_result_reads_codex_home_auth_json() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-auth-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let token = "header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJ1c2VyQGV4YW1wbGUuY29tIn0sImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMifX0.signature";
+        std::fs::write(
+            root.join("auth.json"),
+            format!(
+                r#"{{
+  "auth_mode": "chatgpt",
+  "tokens": {{
+    "access_token": "{}",
+    "id_token": "{}",
+    "refresh_token": "refresh",
+    "account_id": "account"
+  }}
+}}"#,
+                token, token
+            ),
+        )
+        .expect("write auth json");
+        let codex_home = root.to_string_lossy();
+
+        let account = cli_auth_method_result("account/read", &Value::Null, &codex_home, "cli")
+            .expect("account result");
+        assert_eq!(account["account"]["type"], "chatgpt");
+        assert_eq!(account["account"]["email"], "user@example.com");
+        assert_eq!(account["account"]["planType"], "plus");
+        assert_eq!(account["requiresOpenaiAuth"], true);
+
+        let status = cli_auth_method_result(
+            "getAuthStatus",
+            &json!({ "includeToken": true }),
+            &codex_home,
+            "cli",
+        )
+        .expect("auth status");
+        assert_eq!(status["authMethod"], "chatgpt");
+        assert_eq!(status["authToken"], token);
+        assert_eq!(status["requiresOpenaiAuth"], true);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_auth_method_result_falls_back_to_workspace_name() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-cli-auth-empty-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let codex_home = root.to_string_lossy();
+
+        let account =
+            cli_auth_method_result("account/read", &Value::Null, &codex_home, "workspace-a")
+                .expect("account result");
+        assert_eq!(account["account"]["type"], "chatgpt");
+        assert_eq!(account["account"]["email"], "workspace-a");
+        assert_eq!(account["account"]["planType"], "unknown");
+        assert_eq!(account["requiresOpenaiAuth"], true);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

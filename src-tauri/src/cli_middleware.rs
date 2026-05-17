@@ -53,7 +53,7 @@ struct RequestInfo {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ChatGptAuth {
+pub(crate) struct ChatGptAuth {
     email: Option<String>,
     workspace_name: Option<String>,
     plan_type: Option<String>,
@@ -670,6 +670,13 @@ impl ChatGptAuth {
         auth
     }
 
+    pub(crate) fn load_for_codex_home(codex_home: &str, workspace_name: &str) -> Self {
+        let auth_path = expand_home_path(codex_home.trim()).join("auth.json");
+        let mut auth = Self::from_auth_json_path(&auth_path).unwrap_or_default();
+        auth.workspace_name = normalize_profile(Some(workspace_name));
+        auth
+    }
+
     fn from_auth_json_path(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let value = serde_json::from_str::<Value>(&content).ok()?;
@@ -715,7 +722,7 @@ impl ChatGptAuth {
         })
     }
 
-    fn account_read_result(&self) -> Value {
+    pub(crate) fn account_read_result(&self) -> Value {
         json!({
             "account": {
                 "type": "chatgpt",
@@ -733,7 +740,7 @@ impl ChatGptAuth {
             .unwrap_or("codex")
     }
 
-    fn auth_status_result(&self, include_token: bool) -> Value {
+    pub(crate) fn auth_status_result(&self, include_token: bool) -> Value {
         let mut result = serde_json::Map::new();
         result.insert("authMethod".to_string(), json!("chatgpt"));
         if include_token {

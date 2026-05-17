@@ -31,6 +31,7 @@ pub use bridge::{
 pub(crate) use bridge::{
     is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message, web_bridge_socket_response,
 };
+pub(crate) use file_picker::{dispatch_web_file_picker_message, is_web_file_picker_message};
 pub use resource::{
     dispatch_web_resource_socket_payload, get_web_resource, handle_web_resource_websocket,
 };
@@ -45,7 +46,7 @@ use bridge::{
 #[cfg(test)]
 use bridge_script::WEB_BRIDGE_SCRIPT;
 #[cfg(test)]
-use file_picker::web_file_picker_directory_payload;
+use file_picker::{web_file_picker_directory_payload, web_file_picker_payload, WebFilePickerMode};
 #[cfg(test)]
 use resource::{
     extension_from_url, infer_resource_url, inject_web_bridge_script,

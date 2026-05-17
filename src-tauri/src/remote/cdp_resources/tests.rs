@@ -190,6 +190,11 @@ fn web_bridge_script_intercepts_workspace_picker() {
     assert!(WEB_BRIDGE_SCRIPT.contains("electron-pick-workspace-root-option"));
     assert!(WEB_BRIDGE_SCRIPT.contains("electron-add-new-workspace-root-option"));
     assert!(WEB_BRIDGE_SCRIPT.contains("workspace-root-option-picked"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("\"pick-files\""));
+    assert!(WEB_BRIDGE_SCRIPT.contains("dispatchWebPickerFetchSuccess"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("file-item"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("remote-workspace-root-requested"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("add-workspace-root-option"));
     assert!(WEB_BRIDGE_SCRIPT.contains(WEB_FILE_PICKER_LIST_MESSAGE));
 }
 
@@ -502,6 +507,90 @@ fn web_file_picker_payload_lists_directories_only() {
     assert_eq!(
         payload.get("path").and_then(Value::as_str),
         Some(expected_path.as_str())
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn web_file_picker_payload_lists_files_in_file_mode() {
+    let root =
+        std::env::temp_dir().join(format!("codex-web-picker-file-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("zeta")).unwrap();
+    fs::create_dir_all(root.join("Alpha")).unwrap();
+    fs::write(root.join("note.txt"), b"note").unwrap();
+    fs::write(root.join("image.PNG"), b"png").unwrap();
+
+    let payload =
+        web_file_picker_payload(Some(root.to_str().unwrap()), WebFilePickerMode::File, false)
+            .unwrap();
+    let entries = payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry.get("kind").and_then(Value::as_str).unwrap(),
+                entry.get("name").and_then(Value::as_str).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        entries,
+        vec![
+            ("directory", "Alpha"),
+            ("directory", "zeta"),
+            ("file", "image.PNG"),
+            ("file", "note.txt"),
+        ]
+    );
+
+    let image_payload =
+        web_file_picker_payload(Some(root.to_str().unwrap()), WebFilePickerMode::File, true)
+            .unwrap();
+    let image_names = image_payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    assert_eq!(image_names, vec!["Alpha", "zeta", "image.PNG"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn web_file_picker_dispatch_returns_payload_for_bridge_message() {
+    let root = std::env::temp_dir().join(format!(
+        "codex-web-picker-dispatch-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("project")).unwrap();
+
+    let response = dispatch_web_file_picker_message(json!({
+        "type": WEB_FILE_PICKER_LIST_MESSAGE,
+        "path": root.to_string_lossy(),
+        "mode": "directory",
+    }))
+    .unwrap();
+    let entries = response
+        .get("value")
+        .and_then(|value| value.get("entries"))
+        .and_then(Value::as_array)
+        .unwrap();
+
+    assert_eq!(
+        entries
+            .first()
+            .and_then(|entry| entry.get("name"))
+            .and_then(Value::as_str),
+        Some("project")
     );
 
     let _ = fs::remove_dir_all(&root);

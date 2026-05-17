@@ -300,6 +300,9 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       return;
     }
     const hostMessage = stripBridgeMetadata(normalizeHostMessageForCodexApp(message));
+    if (maybeHandleRemoteWorkspaceRootRequest(hostMessage)) {
+      return;
+    }
     bridgeDebug("dispatchHostMessage", bridgeMessageLabel(hostMessage));
     if (hostMessage.type === "shared-object-updated" && typeof hostMessage.key === "string") {
       sharedObjects[hostMessage.key] = hostMessage.value;
@@ -1350,6 +1353,10 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       ["polyline", { points: "15 10 20 15 15 20" }],
       ["path", { d: "M4 4v7a4 4 0 0 0 4 4h12" }],
     ],
+    file: [
+      ["path", { d: "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" }],
+      ["path", { d: "M14 2v4a2 2 0 0 0 2 2h4" }],
+    ],
     folder: [
       [
         "path",
@@ -1725,6 +1732,10 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         background: var(--codex-picker-background);
         outline: 0;
       }
+      .codex-web-folder-picker-row-selected {
+        border-color: var(--codex-picker-ring);
+        background: var(--codex-picker-background);
+      }
       .codex-web-folder-picker-icon {
         width: 18px;
         height: 18px;
@@ -1845,9 +1856,11 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
     document.head.appendChild(style);
   }
 
-  async function requestWebFolderPickerDirectory(path) {
+  async function requestWebFolderPickerDirectory(path, { imagesOnly = false, mode = "directory" } = {}) {
     const payload = await sendBridgeRequest({
       type: "web-file-picker-list",
+      imagesOnly: !!imagesOnly,
+      mode,
       path: typeof path === "string" ? path : "",
     });
     return payload.value || {};
@@ -1855,10 +1868,17 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 
   let activeFolderPicker = null;
 
-  function showWebFolderPicker({ title = "Choose project folder" } = {}) {
+  function showWebFolderPicker({
+    imagesOnly = false,
+    mode = "directory",
+    multiple = false,
+    selectLabel = null,
+    title = "Choose project folder",
+  } = {}) {
     if (activeFolderPicker) {
       return activeFolderPicker;
     }
+    const fileMode = mode === "file";
     activeFolderPicker = new Promise((resolve) => {
       ensureWebFolderPickerStyle();
       const backdrop = document.createElement("div");
@@ -1880,7 +1900,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       const titleNode = document.createElement("div");
       titleNode.className = "codex-web-folder-picker-title";
       titleNode.dataset.slot = "dialog-title";
-      titleNode.appendChild(createLucideIcon("folderOpen", "codex-web-folder-picker-title-icon"));
+      titleNode.appendChild(createLucideIcon(fileMode ? "file" : "folderOpen", "codex-web-folder-picker-title-icon"));
       const titleText = document.createElement("span");
       titleText.textContent = title;
       titleNode.appendChild(titleText);
@@ -1942,7 +1962,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       pathInput.dataset.slot = "input";
       pathInput.type = "text";
       pathInput.spellcheck = false;
-      pathInput.setAttribute("aria-label", "Folder path");
+      pathInput.setAttribute("aria-label", fileMode ? "Directory path" : "Folder path");
       pathShell.appendChild(pathInput);
 
       const goButton = createWebPickerButton({
@@ -1982,14 +2002,16 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 
       const selectButton = createWebPickerButton({
         icon: "check",
-        label: "Select folder",
-        title: "Select current folder",
+        label: selectLabel || (fileMode ? (multiple ? "Select files" : "Select file") : "Select folder"),
+        title: fileMode ? "Select chosen files" : "Select current folder",
         variant: "default",
       });
       actions.appendChild(selectButton);
 
       let currentPath = "";
+      let currentEntries = [];
       let parentPath = null;
+      let selectedFilePaths = new Set();
       let loadSequence = 0;
 
       function finish(value) {
@@ -2003,7 +2025,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         goButton.disabled = isBusy;
         homeButton.disabled = isBusy;
         refreshButton.disabled = isBusy;
-        selectButton.disabled = isBusy || !currentPath;
+        selectButton.disabled = isBusy || (fileMode ? selectedFilePaths.size === 0 : !currentPath);
         upButton.disabled = isBusy || !parentPath;
       }
 
@@ -2049,7 +2071,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         loading.className = "codex-web-folder-picker-loading";
         loading.appendChild(createLucideIcon("loaderCircle", "codex-web-folder-picker-spin"));
         const text = document.createElement("span");
-        text.textContent = "Loading folders...";
+        text.textContent = fileMode ? "Loading files..." : "Loading folders...";
         loading.appendChild(text);
         list.replaceChildren(loading);
       }
@@ -2060,20 +2082,32 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
           const empty = document.createElement("div");
           empty.className = "codex-web-folder-picker-empty";
           const text = document.createElement("span");
-          empty.replaceChildren(createLucideIcon("folderOpen"), text);
-          text.textContent = "No folders in this directory.";
+          empty.replaceChildren(createLucideIcon(fileMode ? "file" : "folderOpen"), text);
+          text.textContent = fileMode
+            ? imagesOnly
+              ? "No image files in this directory."
+              : "No files in this directory."
+            : "No folders in this directory.";
           list.appendChild(empty);
           return;
         }
         for (const entry of entries) {
+          const kind = entry.kind === "file" ? "file" : "directory";
+          const isFile = kind === "file";
           const row = document.createElement("button");
-          row.className = "codex-web-folder-picker-row";
+          row.className = `codex-web-folder-picker-row${
+            isFile && selectedFilePaths.has(entry.path) ? " codex-web-folder-picker-row-selected" : ""
+          }`;
           row.type = "button";
           row.dataset.path = entry.path;
-          row.dataset.slot = "directory-item";
+          row.dataset.kind = kind;
+          row.dataset.slot = isFile ? "file-item" : "directory-item";
+          if (isFile) {
+            row.setAttribute("aria-selected", selectedFilePaths.has(entry.path) ? "true" : "false");
+          }
           row.title = entry.path || entry.name || "";
 
-          row.appendChild(createLucideIcon("folder", "codex-web-folder-picker-icon"));
+          row.appendChild(createLucideIcon(isFile ? "file" : "folder", "codex-web-folder-picker-icon"));
 
           const body = document.createElement("span");
           body.className = "codex-web-folder-picker-row-body";
@@ -2089,7 +2123,9 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
           entryPath.textContent = entry.path || "";
           body.appendChild(entryPath);
 
-          row.appendChild(createLucideIcon("chevronRight", "codex-web-folder-picker-row-chevron"));
+          if (!isFile) {
+            row.appendChild(createLucideIcon("chevronRight", "codex-web-folder-picker-row-chevron"));
+          }
 
           list.appendChild(row);
         }
@@ -2098,23 +2134,29 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       async function loadDirectory(path) {
         const sequence = ++loadSequence;
         setBusy(true);
-        setStatus("Loading folders...", { icon: "loaderCircle" });
+        setStatus(fileMode ? "Loading files..." : "Loading folders...", { icon: "loaderCircle" });
         renderLoading();
         try {
-          const data = await requestWebFolderPickerDirectory(path);
+          const data = await requestWebFolderPickerDirectory(path, { imagesOnly, mode });
           if (sequence !== loadSequence) {
             return;
           }
           currentPath = data.path || path || "";
+          currentEntries = Array.isArray(data.entries) ? data.entries : [];
           parentPath = data.parent || null;
+          selectedFilePaths.clear();
           pathInput.value = currentPath;
           renderBreadcrumbs(currentPath);
-          renderEntries(Array.isArray(data.entries) ? data.entries : []);
-          const entryCount = Array.isArray(data.entries) ? data.entries.length : 0;
+          renderEntries(currentEntries);
+          const entryCount = currentEntries.length;
+          const directoryCount = currentEntries.filter((entry) => entry.kind !== "file").length;
+          const fileCount = currentEntries.filter((entry) => entry.kind === "file").length;
           setStatus(
             data.truncated
-              ? `Showing first ${entryCount} folders`
-              : `${entryCount} ${entryCount === 1 ? "folder" : "folders"}`,
+              ? `Showing first ${entryCount} items`
+              : fileMode
+                ? `${directoryCount} ${directoryCount === 1 ? "folder" : "folders"}, ${fileCount} ${fileCount === 1 ? "file" : "files"}`
+                : `${entryCount} ${entryCount === 1 ? "folder" : "folders"}`,
           );
         } catch (error) {
           if (sequence !== loadSequence) {
@@ -2139,11 +2181,39 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         }
       }
 
+      function toggleFileSelection(path) {
+        if (!path) {
+          return;
+        }
+        if (!multiple) {
+          selectedFilePaths.clear();
+          selectedFilePaths.add(path);
+        } else if (selectedFilePaths.has(path)) {
+          selectedFilePaths.delete(path);
+        } else {
+          selectedFilePaths.add(path);
+        }
+        renderEntries(currentEntries);
+        setBusy(false);
+      }
+
       list.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : null;
         const row = target ? target.closest(".codex-web-folder-picker-row") : null;
         if (row && row.dataset.path) {
-          void loadDirectory(row.dataset.path);
+          if (fileMode && row.dataset.kind === "file") {
+            toggleFileSelection(row.dataset.path);
+          } else {
+            void loadDirectory(row.dataset.path);
+          }
+        }
+      });
+      list.addEventListener("dblclick", (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        const row = target ? target.closest(".codex-web-folder-picker-row") : null;
+        if (fileMode && row && row.dataset.kind === "file" && row.dataset.path) {
+          selectedFilePaths.add(row.dataset.path);
+          finish(Array.from(selectedFilePaths));
         }
       });
       breadcrumbs.addEventListener("click", (event) => {
@@ -2175,7 +2245,9 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       });
       cancelButton.addEventListener("click", () => finish(null));
       closeButton.addEventListener("click", () => finish(null));
-      selectButton.addEventListener("click", () => finish(currentPath || null));
+      selectButton.addEventListener("click", () => {
+        finish(fileMode ? Array.from(selectedFilePaths) : currentPath || null);
+      });
       backdrop.addEventListener("click", (event) => {
         if (event.target === backdrop) {
           finish(null);
@@ -2187,6 +2259,142 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       void loadDirectory("");
     });
     return activeFolderPicker;
+  }
+
+  function webPickerBasename(path) {
+    return String(path || "").split(/[\\/]+/).filter(Boolean).pop() || String(path || "");
+  }
+
+  function webPickerFetchEndpoint(message) {
+    if (message?.type !== "fetch" || typeof message.url !== "string") {
+      return "";
+    }
+    try {
+      const url = new URL(message.url, window.location.href);
+      if (url.protocol !== "vscode:" || url.hostname !== "codex") {
+        return "";
+      }
+      return url.pathname.replace(/^\/+/, "");
+    } catch {
+      const prefix = "vscode://codex/";
+      return message.url.startsWith(prefix) ? message.url.slice(prefix.length).split(/[?#]/, 1)[0] : "";
+    }
+  }
+
+  function webPickerFetchParams(message) {
+    let body = message?.body;
+    if (typeof body === "string") {
+      if (!body.trim()) {
+        body = {};
+      } else {
+        try {
+          body = JSON.parse(body);
+        } catch {
+          body = {};
+        }
+      }
+    }
+    if (!body || typeof body !== "object") {
+      return {};
+    }
+    return body.params && typeof body.params === "object" ? body.params : body;
+  }
+
+  function dispatchWebPickerFetchSuccess(requestId, body) {
+    dispatchHostMessage({
+      type: "fetch-response",
+      requestId,
+      responseType: "success",
+      status: 200,
+      headers: { "content-type": "application/json" },
+      bodyJsonString: JSON.stringify(body),
+    });
+  }
+
+  function webPickerFetchMessage(endpoint, params) {
+    return {
+      type: "fetch",
+      requestId: `codex-web-picker-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      url: `vscode://codex/${endpoint}`,
+      body: JSON.stringify({ params }),
+    };
+  }
+
+  async function sendWebPickerFetch(endpoint, params) {
+    const message = webPickerFetchMessage(endpoint, params);
+    const payload = await sendBridgeRequest(message);
+    const response = (payload.messages || []).find(
+      (item) => item?.type === "fetch-response" && item.requestId === message.requestId,
+    );
+    if (response?.responseType === "error") {
+      throw new Error(response.error || `Fetch failed: ${endpoint}`);
+    }
+    return response;
+  }
+
+  async function maybeHandleWebFilePickerFetch(message) {
+    if (webPickerFetchEndpoint(message) !== "pick-files") {
+      return false;
+    }
+    const params = webPickerFetchParams(message);
+    const pickerTitle =
+      typeof params.pickerTitle === "string" && params.pickerTitle.trim()
+        ? params.pickerTitle
+        : "Select files";
+    const selectedPaths = await showWebFolderPicker({
+      imagesOnly: params.imagesOnly === true,
+      mode: "file",
+      multiple: true,
+      selectLabel: "Select files",
+      title: pickerTitle,
+    });
+    const files = Array.isArray(selectedPaths)
+      ? selectedPaths.map((path) => ({
+          fsPath: path,
+          label: webPickerBasename(path),
+          path,
+        }))
+      : [];
+    dispatchWebPickerFetchSuccess(message.requestId, { files });
+    return true;
+  }
+
+  function maybeHandleRemoteWorkspaceRootRequest(message) {
+    if (message?.type !== "remote-workspace-root-requested") {
+      return false;
+    }
+    void handleRemoteWorkspaceRootRequest(message).catch((error) => {
+      console.warn("[codex-web] remote workspace root picker failed", error);
+    });
+    return true;
+  }
+
+  async function handleRemoteWorkspaceRootRequest(message) {
+    const mode = message.mode === "pick" ? "pick" : "add";
+    const root = await showWebFolderPicker({
+      title: mode === "pick" ? "Choose project folder" : "Add project folder",
+    });
+    if (!root) {
+      return;
+    }
+    if (mode === "pick") {
+      dispatchHostMessage({ type: "workspace-root-option-picked", root });
+      return;
+    }
+    const setActive = message.setActive !== false;
+    await sendWebPickerFetch("add-workspace-root-option", {
+      hostId: message.hostId || "local",
+      root,
+      setActive,
+    });
+    dispatchHostMessage({ type: "workspace-root-option-added", root });
+    if (setActive) {
+      dispatchHostMessage({
+        type: "navigate-to-route",
+        path: "/",
+        state: { focusComposerNonce: Date.now() },
+      });
+    }
   }
 
   async function maybeHandleWebFolderPickerMessage(message) {
@@ -2213,6 +2421,9 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
     }
     try {
       bridgeDebug("forwardToCodexHost", bridgeMessageLabel(message));
+      if (await maybeHandleWebFilePickerFetch(message)) {
+        return;
+      }
       if (await maybeHandleWebFolderPickerMessage(message)) {
         return;
       }
