@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" href="icon.png" />
     <link rel="apple-touch-icon" href="icon.png" />
     <link rel="manifest" href="manifest.webmanifest" />
-    <link rel="stylesheet" href="styles.css?v=20260513-local-bridge-plain-v2" />
+    <link rel="stylesheet" href="styles.css?v=20260516-codex-web-registry-v2" />
   </head>
   <body>
     <div id="controlView" class="control-view">
@@ -20,6 +20,9 @@
         <div class="topbar-actions">
           <select id="remoteModeSelect" class="mode-select" aria-label="Remote mode" hidden>
             <option value="web">Web</option>
+          </select>
+          <select id="webAssetVersionSelect" class="mode-select web-asset-version-select" aria-label="Codex app web bundle version" title="Codex app web bundle version" hidden>
+            <option value="latest">Latest</option>
           </select>
           <div id="pageZoomControl" class="zoom-control">
             <button
@@ -96,7 +99,7 @@
       ></textarea>
     </div>
 
-    <script src="vendor/jsQR.js?v=20260513-local-bridge-plain-v2"></script>
-    <script src="app.js?v=20260513-local-bridge-plain-v2" type="module"></script>
+    <script src="vendor/jsQR.js?v=20260516-codex-web-registry-v2"></script>
+    <script src="app.js?v=20260516-codex-web-registry-v2" type="module"></script>
   </body>
 </html>

@@ -1,6 +1,9 @@
 use crate::{
-    config::{generated_codex_home, RemoteCloudAuthConfig},
-    ports, server, AppState,
+    config::{
+        self, generated_codex_home, AppConfig, ProviderProfile, RemoteCloudAuthConfig,
+        REMOTE_FRONTEND_MODE_CLI,
+    },
+    launcher, ports, server, AppState,
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -15,13 +18,17 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::io::{BufRead, BufReader as StdBufReader};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
@@ -49,6 +56,13 @@ const RELAY_WEB_BRIDGE_TASK_LIMIT: usize = 128;
 const RELAY_WEB_RESOURCE_TASK_LIMIT: usize = 64;
 const RELAY_WEB_BRIDGE_NOTIFICATION_PUMP_TTL_MS: u64 = 10 * 60_000;
 const FRAME_META_INTERVAL_MS: u64 = 250;
+const CLI_APP_SERVER_REQUEST_TIMEOUT_MS: u64 = 5 * 60_000;
+const CLI_APP_SERVER_FETCH_TIMEOUT_MS: u64 = 30_000;
+const CLI_APP_SERVER_RESUME_TURNS_LIMIT: u64 = 5;
+const CLI_APP_SERVER_REQUEST_ID_PREFIX: &str = "codexl-remote-cli-";
+const CLI_APP_SERVER_PROTOCOL_VERSION: &str = "2025-11-25";
+const CLI_PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
+const CLI_THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
 const DEFAULT_SCREENSHOT_MAX_HEIGHT: u64 = 900;
 const DEFAULT_SCREENSHOT_MAX_WIDTH: u64 = 1440;
 const DEFAULT_PAGE_ZOOM_SCALE: f64 = 1.0;
@@ -96,6 +110,9 @@ pub struct RemoteControlInfo {
     pub relay_url: Option<String>,
     pub relay_connected: bool,
     pub require_password: bool,
+    pub web_asset_mode: String,
+    pub web_asset_base_url: Option<String>,
+    pub web_asset_version: String,
     pub cdp_host: String,
     pub cdp_port: u16,
     pub control_client_count: usize,
@@ -139,8 +156,32 @@ struct RemoteServerConfig {
     workspace_name: String,
     workspace_path: String,
     cloud_auth: Option<RemoteCloudAuthConfig>,
+    web_asset_base_url: Option<String>,
+    web_asset_version: String,
     cdp_host: String,
     cdp_port: u16,
+}
+
+#[derive(Clone)]
+enum RemoteBackend {
+    App,
+    Cli(Arc<CliAppBridge>),
+}
+
+impl RemoteBackend {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Cli(_) => "cli",
+        }
+    }
+
+    fn cli_bridge(&self) -> Option<Arc<CliAppBridge>> {
+        match self {
+            Self::Cli(bridge) => Some(bridge.clone()),
+            Self::App => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,14 +260,21 @@ pub async fn start_remote_control(
     .await
     .ok_or_else(|| "No free remote control port found".to_string())?;
 
-    let launch = server::launch_codex_instance(
-        state,
-        server::LaunchRequest {
-            profile_name: Some(profile_name.clone()),
-            ..server::LaunchRequest::default()
-        },
-    )
-    .await?;
+    let uses_cli_backend = profile_uses_cli_remote_frontend(profile.as_ref());
+    let (backend, cdp_host, cdp_port) = if uses_cli_backend {
+        let cli_bridge = start_cli_app_server_bridge(state, &app_config, &profile_name).await?;
+        (RemoteBackend::Cli(cli_bridge), String::new(), 0)
+    } else {
+        let launch = server::launch_codex_instance(
+            state,
+            server::LaunchRequest {
+                profile_name: Some(profile_name.clone()),
+                ..server::LaunchRequest::default()
+            },
+        )
+        .await?;
+        (RemoteBackend::App, launch.cdp_host, launch.cdp_port)
+    };
 
     let token = make_token();
     let relay_connection_id = relay_url.as_ref().map(|_| make_relay_connection_id());
@@ -247,6 +295,8 @@ pub async fn start_remote_control(
         return Err("End-to-end encrypted remote control requires a password.".to_string());
     }
     let crypto = RemoteCrypto::from_password(remote_password.as_deref(), &public_token)?;
+    let web_asset_base_url = profile_web_asset_base_url(&app_config, profile.as_ref());
+    let web_asset_version = profile_web_asset_version(&app_config, profile.as_ref());
     let server_config = RemoteServerConfig {
         host: app_config.remote_control_host,
         port,
@@ -259,11 +309,14 @@ pub async fn start_remote_control(
         workspace_name: profile_name.clone(),
         workspace_path,
         cloud_auth: cloud_auth.clone(),
-        cdp_host: launch.cdp_host,
-        cdp_port: launch.cdp_port,
+        web_asset_base_url,
+        web_asset_version,
+        cdp_host,
+        cdp_port,
     };
-    let lan_url = remote_url(&server_config.host, server_config.port, &token);
-    let url = if let Some(relay_url) = relay_url.as_deref() {
+    let raw_lan_url = remote_url(&server_config.host, server_config.port, &token);
+    let lan_url = append_remote_connection_params(raw_lan_url.clone(), &server_config)?;
+    let raw_url = if let Some(relay_url) = relay_url.as_deref() {
         remote_relay_url(
             relay_url,
             relay_connection_id
@@ -272,14 +325,14 @@ pub async fn start_remote_control(
             cloud_auth.as_ref().map(|auth| auth.user_id.as_str()),
         )?
     } else {
-        lan_url.clone()
+        raw_lan_url
     };
-    let url = append_remote_crypto_params(url, server_config.crypto.is_some())?;
+    let url = append_remote_connection_params(raw_url, &server_config)?;
     let listener = TcpListener::bind((server_config.host.as_str(), server_config.port))
         .await
         .map_err(|e| format!("failed to bind remote control server: {}", e))?;
 
-    let runtime = RemoteRuntimeState::new(server_config.clone());
+    let runtime = RemoteRuntimeState::new_with_backend(server_config.clone(), backend);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_runtime = runtime.clone();
     tokio::spawn(async move {
@@ -315,6 +368,15 @@ pub async fn start_remote_control(
             relay_url,
             relay_connected: false,
             require_password: server_config.crypto.is_some(),
+            web_asset_mode: if server_config.web_asset_base_url.is_some() {
+                "registry".to_string()
+            } else if runtime.backend.mode() == "cli" {
+                "cli".to_string()
+            } else {
+                "cdp".to_string()
+            },
+            web_asset_base_url: server_config.web_asset_base_url.clone(),
+            web_asset_version: server_config.web_asset_version.clone(),
             cdp_host: server_config.cdp_host.clone(),
             cdp_port: server_config.cdp_port,
             control_client_count: 0,
@@ -494,10 +556,14 @@ async fn route_remote_request(
 
     let response = match (request.method(), path.as_str()) {
         (&Method::GET, "/api/status") => {
-            Ok(json_response(StatusCode::OK, runtime.bridge.status().await))
+            Ok(json_response(StatusCode::OK, runtime.bridge_status().await))
         }
+        (&Method::GET, "/api/remote-info") => Ok(json_response(
+            StatusCode::OK,
+            runtime.remote_connection_info()?,
+        )),
         (&Method::GET, "/api/targets") => {
-            let targets = runtime.bridge.list_targets().await?;
+            let targets = runtime.bridge_targets().await?;
             Ok(json_response(StatusCode::OK, json!({ "targets": targets })))
         }
         (&Method::POST, "/api/target") => {
@@ -512,8 +578,10 @@ async fn route_remote_request(
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing target id".to_string())?;
-            runtime.bridge.switch_target(id).await?;
-            Ok(json_response(StatusCode::OK, runtime.bridge.status().await))
+            if matches!(&runtime.backend, RemoteBackend::App) {
+                runtime.bridge.switch_target(id).await?;
+            }
+            Ok(json_response(StatusCode::OK, runtime.bridge_status().await))
         }
         (&Method::GET, "/web") => cdp_resources::web_root_redirect(request.uri().query()),
         (&Method::POST, "/web/_bridge") => {
@@ -524,22 +592,23 @@ async fn route_remote_request(
                 .map_err(|e| e.to_string())?
                 .to_bytes();
             let message = serde_json::from_slice::<Value>(&body).map_err(|e| e.to_string())?;
-            let response = cdp_resources::dispatch_web_bridge_message(
-                &runtime.config.cdp_host,
-                runtime.config.cdp_port,
-                message,
-            )
-            .await?;
+            let response = runtime.dispatch_web_bridge_message(message).await?;
             Ok(json_response(StatusCode::OK, response))
         }
-        (&Method::GET, _) if path.starts_with("/web/") => cdp_resources::get_web_resource(
-            &runtime.config.cdp_host,
-            runtime.config.cdp_port,
-            request.uri().path(),
-            request.uri().query(),
-        )
-        .await?
-        .into_response(),
+        (&Method::GET, _) if path.starts_with("/web/") => match &runtime.backend {
+            RemoteBackend::App => cdp_resources::get_web_resource(
+                &runtime.config.cdp_host,
+                runtime.config.cdp_port,
+                request.uri().path(),
+                request.uri().query(),
+            )
+            .await?
+            .into_response(),
+            RemoteBackend::Cli(_) => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                json!({ "error": "CLI remote mode serves Codex web assets from the configured registry." }),
+            )),
+        },
         (&Method::GET, _) => static_response(&path),
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
@@ -564,6 +633,7 @@ async fn web_bridge_websocket_response(
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| "missing Sec-WebSocket-Key".to_string())?
         .to_string();
+    let backend = runtime.backend.clone();
     let cdp_host = runtime.config.cdp_host.clone();
     let cdp_port = runtime.config.cdp_port;
     let on_upgrade = hyper::upgrade::on(request);
@@ -575,10 +645,18 @@ async fn web_bridge_websocket_response(
                 let websocket =
                     tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None)
                         .await;
-                if let Err(err) =
-                    cdp_resources::handle_web_bridge_websocket(websocket, cdp_host, cdp_port, None)
+                let result = match backend {
+                    RemoteBackend::Cli(cli_bridge) => {
+                        cli_bridge.handle_web_bridge_websocket(websocket).await
+                    }
+                    RemoteBackend::App => {
+                        cdp_resources::handle_web_bridge_websocket(
+                            websocket, cdp_host, cdp_port, None,
+                        )
                         .await
-                {
+                    }
+                };
+                if let Err(err) = result {
                     eprintln!("Remote Codex web bridge WebSocket failed: {}", err);
                 }
             }
@@ -609,6 +687,7 @@ async fn web_resource_websocket_response(
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| "missing Sec-WebSocket-Key".to_string())?
         .to_string();
+    let backend = runtime.backend.clone();
     let cdp_host = runtime.config.cdp_host.clone();
     let cdp_port = runtime.config.cdp_port;
     let on_upgrade = hyper::upgrade::on(request);
@@ -620,12 +699,29 @@ async fn web_resource_websocket_response(
                 let websocket =
                     tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None)
                         .await;
-                if let Err(err) = cdp_resources::handle_web_resource_websocket(
-                    websocket, cdp_host, cdp_port, None,
-                )
-                .await
-                {
-                    eprintln!("Remote Codex web resource WebSocket failed: {}", err);
+                match backend {
+                    RemoteBackend::Cli(_) => {
+                        let (mut write, _) = websocket.split();
+                        let _ = write
+                            .send(Message::Text(
+                                json!({
+                                    "error": "CLI remote mode serves Codex web assets from the configured registry.",
+                                    "messages": [],
+                                })
+                                .to_string(),
+                            ))
+                            .await;
+                        let _ = write.send(Message::Close(None)).await;
+                    }
+                    RemoteBackend::App => {
+                        if let Err(err) = cdp_resources::handle_web_resource_websocket(
+                            websocket, cdp_host, cdp_port, None,
+                        )
+                        .await
+                        {
+                            eprintln!("Remote Codex web resource WebSocket failed: {}", err);
+                        }
+                    }
                 }
             }
             Err(err) => eprintln!(
@@ -696,6 +792,7 @@ enum ControlTarget {
 }
 
 struct RemoteRuntimeState {
+    backend: RemoteBackend,
     bridge: Arc<CdpBridge>,
     config: RemoteServerConfig,
     control_clients: Mutex<HashMap<usize, mpsc::UnboundedSender<Message>>>,
@@ -714,10 +811,16 @@ struct RemoteRuntimeState {
 }
 
 impl RemoteRuntimeState {
+    #[cfg(test)]
     fn new(config: RemoteServerConfig) -> Arc<Self> {
+        Self::new_with_backend(config, RemoteBackend::App)
+    }
+
+    fn new_with_backend(config: RemoteServerConfig, backend: RemoteBackend) -> Arc<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let bridge = Arc::new(CdpBridge::new(config.clone(), event_tx));
         let runtime = Arc::new(Self {
+            backend,
             bridge,
             config,
             control_clients: Mutex::new(HashMap::new()),
@@ -742,7 +845,9 @@ impl RemoteRuntimeState {
     }
 
     fn start(self: &Arc<Self>) {
-        self.bridge.clone().start();
+        if matches!(&self.backend, RemoteBackend::App) {
+            self.bridge.clone().start();
+        }
         if self.config.relay_url.is_some() {
             self.clone().start_relay_loop();
         }
@@ -765,6 +870,9 @@ impl RemoteRuntimeState {
             .await;
         self.stopped.store(true, Ordering::Relaxed);
         self.bridge.stop().await;
+        if let Some(cli_bridge) = self.backend.cli_bridge() {
+            cli_bridge.stop().await;
+        }
         self.close_clients().await;
     }
 
@@ -829,6 +937,115 @@ impl RemoteRuntimeState {
         response
     }
 
+    async fn bridge_status(&self) -> Value {
+        match self.backend.cli_bridge() {
+            Some(cli_bridge) => cli_bridge.status().await,
+            None => self.bridge.status().await,
+        }
+    }
+
+    fn remote_connection_info(&self) -> Result<Value, String> {
+        let raw_lan_url = remote_url(&self.config.host, self.config.port, &self.config.token);
+        let lan_url = append_remote_connection_params(raw_lan_url.clone(), &self.config)?;
+        let raw_url = if let Some(relay_url) = self.config.relay_url.as_deref() {
+            remote_relay_url(
+                relay_url,
+                self.config
+                    .relay_connection_id
+                    .as_deref()
+                    .ok_or_else(|| "missing relay connection id".to_string())?,
+                self.config
+                    .cloud_auth
+                    .as_ref()
+                    .map(|auth| auth.user_id.as_str()),
+            )?
+        } else {
+            raw_lan_url
+        };
+        let url = append_remote_connection_params(raw_url, &self.config)?;
+        let web_asset_mode = if self.config.web_asset_base_url.is_some() {
+            "registry"
+        } else {
+            self.backend.mode()
+        };
+        let connection_mode = if self.config.relay_url.is_some() {
+            "cloud"
+        } else {
+            "lan"
+        };
+        let auth_mode = if self.config.relay_url.is_some() {
+            "cloud_identity"
+        } else {
+            "token"
+        };
+        let cloud_user_id = self
+            .config
+            .cloud_auth
+            .as_ref()
+            .map(|auth| auth.user_id.clone());
+        let cloud_user_label = self
+            .config
+            .cloud_auth
+            .as_ref()
+            .map(RemoteCloudAuthConfig::display_label);
+
+        Ok(json!({
+            "url": url,
+            "lanUrl": lan_url.clone(),
+            "lan_url": lan_url,
+            "token": self.config.token.clone(),
+            "connectionMode": connection_mode,
+            "connection_mode": connection_mode,
+            "authMode": auth_mode,
+            "auth_mode": auth_mode,
+            "cloudUserId": cloud_user_id.clone(),
+            "cloud_user_id": cloud_user_id,
+            "cloudUserLabel": cloud_user_label.clone(),
+            "cloud_user_label": cloud_user_label,
+            "host": self.config.host.clone(),
+            "port": self.config.port,
+            "relayUrl": self.config.relay_url.clone(),
+            "relay_url": self.config.relay_url.clone(),
+            "requirePassword": self.config.crypto.is_some(),
+            "require_password": self.config.crypto.is_some(),
+            "remoteMode": "web",
+            "remote_mode": "web",
+            "webAssetMode": web_asset_mode,
+            "web_asset_mode": web_asset_mode,
+            "webAssetBaseUrl": self.config.web_asset_base_url.clone(),
+            "web_asset_base_url": self.config.web_asset_base_url.clone(),
+            "webAssetVersion": self.config.web_asset_version.clone(),
+            "web_asset_version": self.config.web_asset_version.clone(),
+            "workspaceId": self.config.workspace_id.clone(),
+            "workspace_id": self.config.workspace_id.clone(),
+            "workspaceName": self.config.workspace_name.clone(),
+            "workspace_name": self.config.workspace_name.clone(),
+            "workspacePath": self.config.workspace_path.clone(),
+            "workspace_path": self.config.workspace_path.clone(),
+        }))
+    }
+
+    async fn bridge_targets(&self) -> Result<Vec<CdpTarget>, String> {
+        match &self.backend {
+            RemoteBackend::Cli(_) => Ok(Vec::new()),
+            RemoteBackend::App => self.bridge.list_targets().await,
+        }
+    }
+
+    async fn dispatch_web_bridge_message(&self, message: Value) -> Result<Value, String> {
+        match self.backend.cli_bridge() {
+            Some(cli_bridge) => cli_bridge.dispatch_message(message).await,
+            None => {
+                cdp_resources::dispatch_web_bridge_message(
+                    &self.config.cdp_host,
+                    self.config.cdp_port,
+                    message,
+                )
+                .await
+            }
+        }
+    }
+
     async fn handle_client(
         self: Arc<Self>,
         websocket: tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
@@ -841,7 +1058,7 @@ impl RemoteRuntimeState {
                 self.control_clients.lock().await.insert(id, tx);
                 self.send_control(
                     ControlTarget::Local(id),
-                    json!({ "type": "status", "status": self.bridge.status().await }),
+                    json!({ "type": "status", "status": self.bridge_status().await }),
                 )
                 .await;
             }
@@ -905,7 +1122,7 @@ impl RemoteRuntimeState {
             "pong" => Ok(None),
             "viewport" => match self.bridge.set_client_viewport(&message).await {
                 Ok(()) => Ok(Some(
-                    json!({ "type": "status", "status": self.bridge.status().await }),
+                    json!({ "type": "status", "status": self.bridge_status().await }),
                 )),
                 Err(err) => Err(err),
             },
@@ -922,7 +1139,7 @@ impl RemoteRuntimeState {
                     .await
                 {
                     Ok(()) => Ok(Some(
-                        json!({ "type": "status", "status": self.bridge.status().await }),
+                        json!({ "type": "status", "status": self.bridge_status().await }),
                     )),
                     Err(err) => Err(err),
                 }
@@ -934,7 +1151,7 @@ impl RemoteRuntimeState {
                     .await
                 {
                     Ok(()) => Ok(Some(
-                        json!({ "type": "status", "status": self.bridge.status().await }),
+                        json!({ "type": "status", "status": self.bridge_status().await }),
                     )),
                     Err(err) => Err(err),
                 }
@@ -1164,7 +1381,7 @@ impl RemoteRuntimeState {
                         .insert(client_id.to_string());
                     self.send_control(
                         ControlTarget::Relay(client_id.to_string()),
-                        json!({ "type": "status", "status": self.bridge.status().await }),
+                        json!({ "type": "status", "status": self.bridge_status().await }),
                     )
                     .await;
                     self.update_screencast_streaming().await;
@@ -1238,6 +1455,42 @@ impl RemoteRuntimeState {
             if !pumps.insert(client_id.to_string()) {
                 return;
             }
+        }
+
+        if let Some(cli_bridge) = self.backend.cli_bridge() {
+            let relay_sender = self.relay_control_tx.lock().await.clone();
+            let stream_client_id = client_id.to_string();
+            let cleanup_client_id = stream_client_id.clone();
+            let runtime_for_notification = self.clone();
+            let runtime = self.clone();
+            cli_bridge.spawn_notification_pump(move |partial| {
+                if let Some(sender) = relay_sender.as_ref() {
+                    if let Some(payload) =
+                        runtime_for_notification.encrypt_relay_socket_text(partial.to_string())
+                    {
+                        let _ = sender.send(
+                            json!({
+                                "clientId": stream_client_id.as_str(),
+                                "payload": payload,
+                                "type": "webBridgeToClient",
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(
+                    RELAY_WEB_BRIDGE_NOTIFICATION_PUMP_TTL_MS,
+                ))
+                .await;
+                runtime
+                    .relay_web_bridge_notification_pumps
+                    .lock()
+                    .await
+                    .remove(&cleanup_client_id);
+            });
+            return;
         }
 
         let cdp_host = self.config.cdp_host.clone();
@@ -1319,36 +1572,64 @@ impl RemoteRuntimeState {
                 let relay_sender = self.relay_control_tx.lock().await.clone();
                 let stream_client_id = client_id.clone();
                 let runtime_for_stream = self.clone();
-                cdp_resources::dispatch_web_bridge_socket_payload_with_emitter(
-                    &self.config.cdp_host,
-                    self.config.cdp_port,
-                    &payload,
-                    move |partial| {
-                        if let Some(sender) = relay_sender.as_ref() {
-                            if let Some(payload) =
-                                runtime_for_stream.encrypt_relay_socket_text(partial.to_string())
-                            {
-                                let _ = sender.send(
-                                    json!({
-                                        "clientId": stream_client_id.as_str(),
-                                        "payload": payload,
-                                        "type": "webBridgeToClient",
-                                    })
-                                    .to_string(),
-                                );
+                if let Some(cli_bridge) = self.backend.cli_bridge() {
+                    cli_bridge
+                        .dispatch_socket_payload_with_emitter(&payload, move |partial| {
+                            if let Some(sender) = relay_sender.as_ref() {
+                                if let Some(payload) = runtime_for_stream
+                                    .encrypt_relay_socket_text(partial.to_string())
+                                {
+                                    let _ = sender.send(
+                                        json!({
+                                            "clientId": stream_client_id.as_str(),
+                                            "payload": payload,
+                                            "type": "webBridgeToClient",
+                                        })
+                                        .to_string(),
+                                    );
+                                }
                             }
-                        }
-                    },
-                )
-                .await
+                        })
+                        .await
+                } else {
+                    cdp_resources::dispatch_web_bridge_socket_payload_with_emitter(
+                        &self.config.cdp_host,
+                        self.config.cdp_port,
+                        &payload,
+                        move |partial| {
+                            if let Some(sender) = relay_sender.as_ref() {
+                                if let Some(payload) = runtime_for_stream
+                                    .encrypt_relay_socket_text(partial.to_string())
+                                {
+                                    let _ = sender.send(
+                                        json!({
+                                            "clientId": stream_client_id.as_str(),
+                                            "payload": payload,
+                                            "type": "webBridgeToClient",
+                                        })
+                                        .to_string(),
+                                    );
+                                }
+                            }
+                        },
+                    )
+                    .await
+                }
             }
             "webResourceFromClient" => {
-                cdp_resources::dispatch_web_resource_socket_payload(
-                    &self.config.cdp_host,
-                    self.config.cdp_port,
-                    &payload,
-                )
-                .await
+                if self.backend.cli_bridge().is_some() {
+                    json!({
+                        "error": "CLI remote mode serves Codex web assets from the configured registry.",
+                        "messages": [],
+                    })
+                } else {
+                    cdp_resources::dispatch_web_resource_socket_payload(
+                        &self.config.cdp_host,
+                        self.config.cdp_port,
+                        &payload,
+                    )
+                    .await
+                }
             }
             _ => return,
         };
@@ -1439,6 +1720,9 @@ impl RemoteRuntimeState {
     }
 
     async fn update_screencast_streaming(&self) {
+        if matches!(&self.backend, RemoteBackend::Cli(_)) {
+            return;
+        }
         let enabled = self.frame_client_count().await > 0;
         eprintln!("Remote screencast streaming requested: {}", enabled);
         if let Err(err) = self.bridge.set_screencast_enabled(enabled).await {
@@ -1652,6 +1936,2837 @@ fn append_remote_crypto_params(
         .append_pair("requirePassword", "1")
         .append_pair("e2ee", "v1");
     Ok(url.to_string())
+}
+
+fn append_remote_web_asset_params(
+    remote_url: String,
+    config: &RemoteServerConfig,
+) -> Result<String, String> {
+    let Some(base_url) = config.web_asset_base_url.as_deref() else {
+        return Ok(remote_url);
+    };
+    let mut url = reqwest::Url::parse(&remote_url).map_err(|e| e.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("webAssetMode", "registry")
+        .append_pair("webAssetBaseUrl", base_url)
+        .append_pair("webAssetVersion", &config.web_asset_version);
+    Ok(url.to_string())
+}
+
+fn append_remote_connection_params(
+    remote_url: String,
+    config: &RemoteServerConfig,
+) -> Result<String, String> {
+    let remote_url = append_remote_web_asset_params(remote_url, config)?;
+    append_remote_crypto_params(remote_url, config.crypto.is_some())
+}
+
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let value = value.trim().trim_end_matches('/').to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalized_web_asset_version(value: String) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "latest".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn profile_web_asset_base_url(
+    app_config: &AppConfig,
+    profile: Option<&ProviderProfile>,
+) -> Option<String> {
+    if !profile_uses_cli_remote_frontend(profile) {
+        return None;
+    }
+
+    profile
+        .and_then(|profile| non_empty_trimmed(profile.remote_web_asset_registry_url.clone()))
+        .or_else(|| non_empty_trimmed(app_config.remote_web_asset_registry_url.clone()))
+}
+
+fn profile_web_asset_version(app_config: &AppConfig, profile: Option<&ProviderProfile>) -> String {
+    if !profile_uses_cli_remote_frontend(profile) {
+        return "latest".to_string();
+    }
+
+    let version = profile
+        .map(|profile| profile.remote_web_asset_version.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| app_config.remote_web_asset_version.clone());
+    normalized_web_asset_version(version)
+}
+
+fn profile_uses_cli_remote_frontend(profile: Option<&ProviderProfile>) -> bool {
+    profile
+        .map(|profile| {
+            profile
+                .remote_frontend_mode
+                .trim()
+                .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLI)
+        })
+        .unwrap_or(false)
+}
+
+async fn start_cli_app_server_bridge(
+    state: &AppState,
+    app_config: &AppConfig,
+    profile_name: &str,
+) -> Result<Arc<CliAppBridge>, String> {
+    let mut requested_config = app_config.clone();
+    let profile = requested_config
+        .provider_profile(profile_name)
+        .ok_or_else(|| format!("Provider profile not found: {}", profile_name))?;
+    requested_config.codex_home = config::ensure_provider_codex_home(&profile)?;
+    requested_config.active_provider = profile.name.clone();
+    requested_config.normalize();
+
+    let active_provider_profile =
+        requested_config.provider_profile(&requested_config.active_provider);
+    if requested_config.extensions.enabled
+        && requested_config.extensions.next_ai_gateway_enabled
+        && active_provider_profile
+            .as_ref()
+            .map(|profile| {
+                profile.provider_name
+                    == crate::extensions::builtins::gateway::config::NEXT_AI_GATEWAY_PROVIDER_NAME
+            })
+            .unwrap_or(false)
+    {
+        crate::extensions::builtins::gateway::service::ensure_running(state).await?;
+    }
+
+    if let Some(profile) = active_provider_profile.as_ref() {
+        config::sync_provider_bot_media_mcp_config_for_launch(
+            profile,
+            &requested_config.codex_home,
+            false,
+        )?;
+    }
+
+    let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
+    let active_cli_profile = requested_config.active_cli_profile();
+    let active_cli_model_provider = requested_config.active_cli_model_provider();
+    let proxy_url = active_provider_profile
+        .as_ref()
+        .map(|profile| profile.proxy_url.clone())
+        .unwrap_or_default();
+    let bridge = CliAppBridge::spawn(
+        executable,
+        requested_config.codex_home.clone(),
+        requested_config.active_provider.clone(),
+        active_cli_profile,
+        active_cli_model_provider,
+        proxy_url,
+    )
+    .await?;
+
+    let mut config = state.config.lock().await;
+    config.codex_home = requested_config.codex_home;
+    config.active_provider = requested_config.active_provider;
+    Ok(bridge)
+}
+
+struct CliAppBridge {
+    child: Mutex<Option<Child>>,
+    codex_home: String,
+    connected: AtomicBool,
+    global_state: Mutex<HashMap<String, Value>>,
+    initialize_result: Mutex<Option<Value>>,
+    next_notification_seq: AtomicU64,
+    next_request_id: AtomicU64,
+    next_subscription_id: AtomicUsize,
+    pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
+    subscribers: Mutex<HashMap<usize, mpsc::UnboundedSender<Value>>>,
+    writer: Mutex<ChildStdin>,
+}
+
+impl CliAppBridge {
+    async fn spawn(
+        executable: String,
+        codex_home: String,
+        workspace_name: String,
+        cli_profile: Option<String>,
+        cli_model_provider: Option<String>,
+        proxy_url: String,
+    ) -> Result<Arc<Self>, String> {
+        let mut command = TokioCommand::new(&executable);
+        if let Some(profile) = cli_profile.as_deref() {
+            command.arg("-c").arg(cli_config_string("profile", profile));
+        }
+        if let Some(model_provider) = cli_model_provider.as_deref() {
+            command
+                .arg("-c")
+                .arg(cli_config_string("model_provider", model_provider));
+        }
+        command
+            .arg("app-server")
+            .arg("--analytics-default-enabled")
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEXL_WORKSPACE_NAME", workspace_name)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        configure_tokio_proxy_env(&mut command, &proxy_url);
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Failed to launch Codex CLI app-server: {}", e))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open Codex CLI app-server stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to open Codex CLI app-server stdout".to_string())?;
+
+        let bridge = Arc::new(Self {
+            child: Mutex::new(Some(child)),
+            codex_home,
+            connected: AtomicBool::new(true),
+            global_state: Mutex::new(HashMap::new()),
+            initialize_result: Mutex::new(None),
+            next_notification_seq: AtomicU64::new(1),
+            next_request_id: AtomicU64::new(1),
+            next_subscription_id: AtomicUsize::new(1),
+            pending: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(HashMap::new()),
+            writer: Mutex::new(stdin),
+        });
+        bridge.clone().spawn_stdout_reader(stdout);
+        if let Err(err) = bridge.initialize_app_server().await {
+            bridge.stop().await;
+            return Err(err);
+        }
+        Ok(bridge)
+    }
+
+    fn spawn_stdout_reader(self: Arc<Self>, stdout: tokio::process::ChildStdout) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => self.handle_stdout_line(line).await,
+                    Ok(None) => break,
+                    Err(err) => {
+                        eprintln!("Codex CLI app-server stdout failed: {}", err);
+                        break;
+                    }
+                }
+            }
+            self.connected.store(false, Ordering::Relaxed);
+            self.reject_pending("Codex CLI app-server stopped").await;
+        });
+    }
+
+    async fn handle_stdout_line(&self, line: String) {
+        let value = match serde_json::from_str::<Value>(line.trim_end()) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("Codex CLI app-server emitted invalid JSON: {}", err);
+                return;
+            }
+        };
+
+        if let Some(id) = json_id_to_string(value.get("id")) {
+            if let Some(tx) = self.pending.lock().await.remove(&id) {
+                let _ = tx.send(Ok(value));
+                return;
+            }
+        }
+
+        let messages = self.app_server_value_to_bridge_messages(value);
+        if !messages.is_empty() {
+            self.publish_messages(messages).await;
+        }
+    }
+
+    fn app_server_value_to_bridge_messages(&self, value: Value) -> Vec<Value> {
+        let host_id = "local";
+        let method = value.get("method").and_then(Value::as_str);
+        let id = json_id_to_string(value.get("id"));
+        let message = if method.is_some() && id.is_some() {
+            json!({
+                "type": "mcp-request",
+                "hostId": host_id,
+                "request": value,
+            })
+        } else if let Some(method) = method {
+            json!({
+                "type": "mcp-notification",
+                "hostId": host_id,
+                "method": method,
+                "params": value.get("params").cloned().unwrap_or(Value::Null),
+            })
+        } else {
+            value
+        };
+        vec![self.decorate_notification(message)]
+    }
+
+    fn decorate_notification(&self, mut message: Value) -> Value {
+        if let Value::Object(map) = &mut message {
+            let seq = self.next_notification_seq.fetch_add(1, Ordering::Relaxed);
+            let event_method = map
+                .get("method")
+                .and_then(Value::as_str)
+                .or_else(|| map.get("type").and_then(Value::as_str))
+                .unwrap_or("message")
+                .to_string();
+            map.insert("__codexWebBridgeNotificationSeq".to_string(), json!(seq));
+            map.insert(
+                "__codexWebBridgeNotificationQueuedAt".to_string(),
+                json!(now_millis()),
+            );
+            map.insert("__codexEventSource".to_string(), json!("cli-app-server"));
+            map.insert("__codexEventChannel".to_string(), json!("cli-app-server"));
+            map.insert("__codexEventMethod".to_string(), json!(event_method));
+        }
+        message
+    }
+
+    async fn publish_messages(&self, messages: Vec<Value>) {
+        let payload = json!({ "messages": messages });
+        let mut stale = Vec::new();
+        let subscribers = self.subscribers.lock().await;
+        eprintln!(
+            "[codex-web][cli] publish messages={} subscribers={} labels={}",
+            payload
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            subscribers.len(),
+            cli_bridge_response_labels(&payload)
+        );
+        for (id, sender) in subscribers.iter() {
+            if sender.send(payload.clone()).is_err() {
+                stale.push(*id);
+            }
+        }
+        drop(subscribers);
+        if !stale.is_empty() {
+            let mut subscribers = self.subscribers.lock().await;
+            for id in stale {
+                subscribers.remove(&id);
+            }
+        }
+    }
+
+    async fn request_raw(&self, mut request: Value, timeout_ms: u64) -> Result<Value, String> {
+        let id = json_id_to_string(request.get("id")).unwrap_or_else(|| {
+            format!(
+                "{}{}",
+                CLI_APP_SERVER_REQUEST_ID_PREFIX,
+                self.next_request_id.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+        if let Value::Object(map) = &mut request {
+            map.insert("id".to_string(), Value::String(id.clone()));
+        } else {
+            return Err("Codex CLI app-server request must be a JSON object".to_string());
+        }
+        normalize_cli_app_server_request(&mut request);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
+        if let Err(err) = self.write_json_line(&request).await {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
+
+        tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .map_err(|_| "Timed out waiting for Codex CLI app-server response".to_string())?
+            .map_err(|_| "Codex CLI app-server response channel closed".to_string())?
+    }
+
+    async fn initialize_app_server(&self) -> Result<(), String> {
+        let response = self
+            .request_raw(
+                cli_app_server_initialize_request(),
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await
+            .map_err(|err| format!("Failed to initialize Codex CLI app-server: {}", err))?;
+        if let Some(error) = response.get("error") {
+            return Err(format!(
+                "Failed to initialize Codex CLI app-server: {}",
+                json_error_message(error)
+            ));
+        }
+        let result = response
+            .get("result")
+            .cloned()
+            .unwrap_or_else(default_cli_initialize_result);
+        *self.initialize_result.lock().await = Some(result);
+        self.write_json_line(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }))
+        .await
+        .map_err(|err| {
+            format!(
+                "Failed to finish Codex CLI app-server initialization: {}",
+                err
+            )
+        })
+    }
+
+    async fn cached_initialize_result(&self) -> Value {
+        self.initialize_result
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(default_cli_initialize_result)
+    }
+
+    async fn write_json_line(&self, value: &Value) -> Result<(), String> {
+        let line = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(&line)
+            .await
+            .map_err(|err| format!("failed to write Codex CLI app-server request: {}", err))?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|err| format!("failed to write Codex CLI app-server request: {}", err))?;
+        writer
+            .flush()
+            .await
+            .map_err(|err| format!("failed to write Codex CLI app-server request: {}", err))
+    }
+
+    async fn reject_pending(&self, message: &str) {
+        let pending = std::mem::take(&mut *self.pending.lock().await);
+        for tx in pending.into_values() {
+            let _ = tx.send(Err(message.to_string()));
+        }
+    }
+
+    async fn dispatch_message(&self, message: Value) -> Result<Value, String> {
+        match message.get("type").and_then(Value::as_str).unwrap_or("") {
+            "mcp-request" => self.dispatch_mcp_request(message).await,
+            "mcp-response" => self.dispatch_mcp_response(message).await,
+            "fetch" => self.dispatch_fetch_request(message).await,
+            "fetch-stream" => Ok(json!({
+                "messages": [{
+                    "type": "fetch-stream-error",
+                    "requestId": message.get("requestId").and_then(Value::as_str).unwrap_or(""),
+                    "error": "CLI remote mode does not support this fetch stream endpoint yet.",
+                }],
+            })),
+            "persisted-atom-sync-request" => Ok(json!({
+                "messages": [{ "type": "persisted-atom-sync", "state": {} }],
+            })),
+            "shared-object-subscribe" => Ok(json!({
+                "messages": [{
+                    "type": "shared-object-updated",
+                    "key": message.get("key").cloned().unwrap_or(Value::Null),
+                    "value": Value::Null,
+                }],
+            })),
+            "codex-web-bridge-request-snapshot"
+            | "desktop-notification-hide"
+            | "electron-add-new-workspace-root-option"
+            | "electron-set-active-workspace-root"
+            | "electron-update-workspace-root-options"
+            | "thread-stream-state-changed" => Ok(json!({ "messages": [] })),
+            _ => Ok(json!({ "messages": [] })),
+        }
+    }
+
+    async fn dispatch_mcp_request(&self, message: Value) -> Result<Value, String> {
+        let host_id = message
+            .get("hostId")
+            .and_then(Value::as_str)
+            .unwrap_or("local")
+            .to_string();
+        let request = message
+            .get("request")
+            .cloned()
+            .ok_or_else(|| "missing MCP request".to_string())?;
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        if method == "notifications/initialized" {
+            return Ok(json!({ "messages": [] }));
+        }
+        if method == "initialize" {
+            let Some(id) = request.get("id").cloned() else {
+                return Ok(json!({ "messages": [] }));
+            };
+            return Ok(json!({
+                "messages": [{
+                    "type": "mcp-response",
+                    "hostId": host_id,
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": self.cached_initialize_result().await,
+                    },
+                }],
+            }));
+        }
+        let mut response = self
+            .request_raw(request.clone(), CLI_APP_SERVER_REQUEST_TIMEOUT_MS)
+            .await?;
+        decorate_cli_app_server_response(method, &mut response);
+        let mut messages = Vec::new();
+        if matches!(
+            request.get("method").and_then(Value::as_str),
+            Some("thread/start" | "thread/resume")
+        ) {
+            if let Some(thread) = response
+                .get("result")
+                .and_then(|result| result.get("thread"))
+                .cloned()
+            {
+                messages.push(self.decorate_notification(json!({
+                    "type": "mcp-notification",
+                    "hostId": host_id,
+                    "method": "thread/started",
+                    "params": { "thread": thread },
+                })));
+            }
+        }
+        if method == "thread/resume" {
+            match self
+                .thread_resume_snapshot_message_from_response(&request, &response)
+                .await
+            {
+                Ok(Some(message)) => messages.push(message),
+                Ok(None) => {}
+                Err(err) => eprintln!(
+                    "[codex-web][cli] mcp thread/resume snapshot failed error={}",
+                    err
+                ),
+            }
+        }
+        messages.push(json!({
+            "type": "mcp-response",
+            "hostId": host_id,
+            "message": response,
+        }));
+        Ok(json!({ "messages": messages }))
+    }
+
+    async fn dispatch_mcp_response(&self, message: Value) -> Result<Value, String> {
+        let response = message
+            .get("message")
+            .or_else(|| message.get("response"))
+            .cloned()
+            .ok_or_else(|| "missing MCP response message".to_string())?;
+        self.write_json_line(&response).await?;
+        Ok(json!({ "messages": [] }))
+    }
+
+    async fn dispatch_fetch_request(&self, message: Value) -> Result<Value, String> {
+        let request_id = message
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let Some(fetch_request) = bridge_fetch_request(&message) else {
+            let url = message
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            eprintln!(
+                "[codex-web][cli] fetch unsupported requestId={} url={}",
+                request_id, url
+            );
+            if let Some(response) = cli_external_fetch_response(url) {
+                return Ok(json!({
+                    "messages": [fetch_response_body_success(&request_id, response)],
+                }));
+            }
+            return Ok(json!({
+                "messages": [fetch_response_error(
+                    &request_id,
+                    &format!("Unsupported fetch endpoint in CLI remote mode: {}", url),
+                )],
+            }));
+        };
+        if fetch_request.endpoint != "ipc-request" {
+            eprintln!(
+                "[codex-web][cli] fetch endpoint={} requestId={}",
+                fetch_request.endpoint, request_id
+            );
+            let response = self
+                .dispatch_cli_fetch_endpoint(&fetch_request.endpoint, fetch_request.body)
+                .await;
+            let messages = match response {
+                Ok((result, mut messages)) => {
+                    messages.push(fetch_response_body_success(&request_id, result));
+                    messages
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[codex-web][cli] fetch endpoint={} requestId={} error={}",
+                        fetch_request.endpoint, request_id, err
+                    );
+                    vec![fetch_response_error(&request_id, &err)]
+                }
+            };
+            eprintln!(
+                "[codex-web][cli] fetch endpoint={} requestId={} response labels={}",
+                fetch_request.endpoint,
+                request_id,
+                cli_bridge_message_labels(&messages)
+            );
+            return Ok(json!({ "messages": messages }));
+        }
+        let ipc_request = fetch_request.body;
+        let method = ipc_request
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "IPC request missing method".to_string())?;
+        let params = ipc_request
+            .get("params")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let app_request_id = json_id_to_string(ipc_request.get("requestId"))
+            .or_else(|| json_id_to_string(ipc_request.get("id")))
+            .unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    CLI_APP_SERVER_REQUEST_ID_PREFIX,
+                    self.next_request_id.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+        eprintln!(
+            "[codex-web][cli] ipc-request method={} requestId={} appRequestId={}",
+            method, request_id, app_request_id
+        );
+        if method == "notifications/initialized" {
+            return Ok(json!({
+                "messages": [fetch_response_success(
+                    &request_id,
+                    &app_request_id,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": app_request_id,
+                        "result": Value::Null,
+                    }),
+                )],
+            }));
+        }
+        if method == "initialize" {
+            return Ok(json!({
+                "messages": [fetch_response_success(
+                    &request_id,
+                    &app_request_id,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": app_request_id,
+                        "result": self.cached_initialize_result().await,
+                    }),
+                )],
+            }));
+        }
+        let app_request_params = cli_app_server_method_params(method, params);
+        let app_request = json!({
+            "id": app_request_id,
+            "method": method,
+            "params": app_request_params,
+        });
+        let response = self
+            .request_raw(app_request, CLI_APP_SERVER_FETCH_TIMEOUT_MS)
+            .await;
+        let messages = match response {
+            Ok(mut response) => {
+                decorate_cli_app_server_response(method, &mut response);
+                let mut messages = Vec::new();
+                if matches!(method, "thread/start" | "thread/resume") {
+                    messages.extend(self.thread_started_messages_from_response(&response));
+                }
+                messages.push(fetch_response_success(
+                    &request_id,
+                    &app_request_id,
+                    response,
+                ));
+                messages
+            }
+            Err(err) => vec![fetch_response_error(&request_id, &err)],
+        };
+        eprintln!(
+            "[codex-web][cli] ipc-request method={} requestId={} response labels={}",
+            method,
+            request_id,
+            cli_bridge_message_labels(&messages)
+        );
+        Ok(json!({ "messages": messages }))
+    }
+
+    async fn dispatch_cli_fetch_endpoint(
+        &self,
+        endpoint: &str,
+        params: Value,
+    ) -> Result<(Value, Vec<Value>), String> {
+        match endpoint {
+            "get-global-state" => {
+                let key = cli_global_state_key(&params)?;
+                let store = self.global_state.lock().await;
+                return Ok((
+                    cli_global_state_get_response_for_key(&store, &key, &params, &self.codex_home)?,
+                    Vec::new(),
+                ));
+            }
+            "set-global-state" => {
+                let mut store = self.global_state.lock().await;
+                return Ok((
+                    cli_global_state_set_response(&mut store, &params)?,
+                    Vec::new(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(response) =
+            cli_frontend_compat_endpoint_response(endpoint, &params, &self.codex_home)
+        {
+            return Ok((response, Vec::new()));
+        }
+        match endpoint {
+            "read-config" | "read-config-for-host" => {
+                let response = self
+                    .request_cli_method_response(
+                        "config/read",
+                        strip_host_id(params),
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                if response_error_is_method_not_found(&response) {
+                    return Ok((json!({ "config": {} }), Vec::new()));
+                }
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "send-cli-request-for-host" => {
+                let method = params
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "send-cli-request-for-host missing method".to_string())?;
+                let request_params = cli_app_server_method_params(
+                    method,
+                    params.get("params").cloned().unwrap_or(Value::Null),
+                );
+                let timeout_ms = params
+                    .get("timeoutMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(CLI_APP_SERVER_REQUEST_TIMEOUT_MS);
+                let response = self
+                    .request_cli_method_response(method, request_params, timeout_ms)
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "start-thread-for-host" => {
+                let response = self
+                    .request_cli_method_response(
+                        "thread/start",
+                        cli_thread_start_params(strip_host_id(params)),
+                        CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+                    )
+                    .await?;
+                let messages = self.thread_started_messages_from_response(&response);
+                Ok((json_response_result(response)?, messages))
+            }
+            "prewarm-thread-start-for-host"
+            | "prewarm-conversation-for-host"
+            | "clear-prewarmed-threads-for-host" => Ok((Value::Null, Vec::new())),
+            "projectless-thread-cwd" => {
+                let endpoint_params = codex_fetch_endpoint_params(&params);
+                let prompt = endpoint_params
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let directory_name = endpoint_params
+                    .get("directoryName")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                Ok((
+                    create_cli_projectless_thread_cwd(directory_name, prompt)?,
+                    Vec::new(),
+                ))
+            }
+            "start-turn-for-host" => {
+                let conversation_id = params
+                    .get("conversationId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "start-turn-for-host missing conversationId".to_string())?;
+                let turn_params = cli_turn_start_params(
+                    conversation_id,
+                    params.get("params").cloned().unwrap_or_else(|| json!({})),
+                    None,
+                );
+                let response = self
+                    .request_cli_method_response(
+                        "turn/start",
+                        turn_params,
+                        CLI_APP_SERVER_REQUEST_TIMEOUT_MS,
+                    )
+                    .await?;
+                Ok((json_response_result(response)?, Vec::new()))
+            }
+            "start-conversation" => self.start_cli_conversation(params).await,
+            "maybe-resume-conversation" => self.maybe_resume_cli_conversation(params).await,
+            _ => Err(format!(
+                "Unsupported fetch endpoint in CLI remote mode: vscode://codex/{}",
+                endpoint
+            )),
+        }
+    }
+
+    async fn start_cli_conversation(&self, params: Value) -> Result<(Value, Vec<Value>), String> {
+        let response = self
+            .request_cli_method_response(
+                "thread/start",
+                cli_thread_start_params(params.clone()),
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await?;
+        let _ = json_response_result(response.clone())?;
+        let thread_id = thread_id_from_thread_start_response(&response)
+            .ok_or_else(|| "thread/start response missing thread.id".to_string())?;
+        let messages = self.thread_started_messages_from_response(&response);
+        if !messages.is_empty() {
+            self.publish_messages(messages.clone()).await;
+        }
+        if cli_start_conversation_has_first_turn(&params) {
+            let turn_params = cli_turn_start_params(
+                &thread_id,
+                params.clone(),
+                thread_start_response_model(&response),
+            );
+            let turn_response = self
+                .request_cli_method_response(
+                    "turn/start",
+                    turn_params,
+                    CLI_APP_SERVER_REQUEST_TIMEOUT_MS,
+                )
+                .await?;
+            let _ = json_response_result(turn_response)?;
+        }
+        Ok((Value::String(thread_id), messages))
+    }
+
+    async fn maybe_resume_cli_conversation(
+        &self,
+        params: Value,
+    ) -> Result<(Value, Vec<Value>), String> {
+        let endpoint_params = codex_fetch_endpoint_params(&params).clone();
+        let conversation_id = cli_conversation_id_from_params(&endpoint_params)?;
+        eprintln!(
+            "[codex-web][cli] maybe-resume start conversationId={}",
+            conversation_id
+        );
+        let thread_metadata = self
+            .request_cli_method_response(
+                "thread/read",
+                json!({
+                    "threadId": conversation_id,
+                    "includeTurns": false,
+                }),
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await
+            .and_then(json_response_result)
+            .ok()
+            .and_then(|result| result.get("thread").cloned());
+        eprintln!(
+            "[codex-web][cli] maybe-resume metadata conversationId={} found={} path={} cwd={}",
+            conversation_id,
+            thread_metadata.is_some(),
+            thread_metadata
+                .as_ref()
+                .and_then(|thread| thread.get("path"))
+                .and_then(Value::as_str)
+                .map(|_| "yes")
+                .unwrap_or("no"),
+            thread_metadata
+                .as_ref()
+                .and_then(|thread| thread.get("cwd"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        );
+
+        let turns_page = self.read_cli_thread_turns_tail(&conversation_id).await?;
+        eprintln!(
+            "[codex-web][cli] maybe-resume turns conversationId={} count={} nextCursor={}",
+            conversation_id,
+            turns_page.turns.len(),
+            if turns_page.next_cursor.is_null() {
+                "none"
+            } else {
+                "present"
+            }
+        );
+        let resume_params =
+            cli_maybe_resume_params(&endpoint_params, thread_metadata.as_ref(), &conversation_id);
+        let response = self
+            .request_cli_method_response(
+                "thread/resume",
+                cli_thread_resume_params(Value::Object(resume_params)),
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await?;
+        let resume_result = json_response_result(response.clone())?;
+        let mut messages = self.thread_started_messages_from_response(&response);
+        messages.push(
+            self.decorate_notification(cli_conversation_snapshot_message(
+                &conversation_id,
+                &resume_result,
+                &turns_page,
+                &endpoint_params,
+            )?),
+        );
+        eprintln!(
+            "[codex-web][cli] maybe-resume done conversationId={} responseThread={} messages={}",
+            conversation_id,
+            resume_result
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            cli_bridge_message_labels(&messages)
+        );
+        Ok((Value::Null, messages))
+    }
+
+    async fn thread_resume_snapshot_message_from_response(
+        &self,
+        request: &Value,
+        response: &Value,
+    ) -> Result<Option<Value>, String> {
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let endpoint_params = codex_fetch_endpoint_params(&params).clone();
+        let conversation_id = cli_conversation_id_from_params(&endpoint_params).or_else(|_| {
+            thread_id_from_thread_start_response(response)
+                .ok_or_else(|| "thread/resume response missing thread.id".to_string())
+        })?;
+        let resume_result = json_response_result(response.clone())?;
+        let turns_page = self.read_cli_thread_turns_tail(&conversation_id).await?;
+        let message = self.decorate_notification(cli_conversation_snapshot_message(
+            &conversation_id,
+            &resume_result,
+            &turns_page,
+            &endpoint_params,
+        )?);
+        eprintln!(
+            "[codex-web][cli] mcp thread/resume snapshot conversationId={} messages={}",
+            conversation_id,
+            cli_bridge_message_label(&message)
+        );
+        Ok(Some(message))
+    }
+
+    async fn read_cli_thread_turns_tail(
+        &self,
+        thread_id: &str,
+    ) -> Result<CliThreadTurnsPage, String> {
+        let paged_response = self
+            .request_cli_method_response(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": Value::Null,
+                    "limit": CLI_APP_SERVER_RESUME_TURNS_LIMIT,
+                }),
+                CLI_APP_SERVER_FETCH_TIMEOUT_MS,
+            )
+            .await
+            .and_then(json_response_result);
+
+        match paged_response {
+            Ok(result) => {
+                let page = CliThreadTurnsPage {
+                    next_cursor: result.get("nextCursor").cloned().unwrap_or(Value::Null),
+                    turns: result
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                eprintln!(
+                    "[codex-web][cli] thread/turns/list threadId={} count={} nextCursor={}",
+                    thread_id,
+                    page.turns.len(),
+                    if page.next_cursor.is_null() {
+                        "none"
+                    } else {
+                        "present"
+                    }
+                );
+                Ok(page)
+            }
+            Err(paged_error) => {
+                eprintln!(
+                    "[codex-web][cli] thread/turns/list threadId={} failed={}, falling back to thread/read includeTurns=true",
+                    thread_id, paged_error
+                );
+                let legacy_response = self
+                    .request_cli_method_response(
+                        "thread/read",
+                        json!({
+                            "threadId": thread_id,
+                            "includeTurns": true,
+                        }),
+                        CLI_APP_SERVER_REQUEST_TIMEOUT_MS,
+                    )
+                    .await
+                    .and_then(json_response_result)
+                    .map_err(|legacy_error| {
+                        format!(
+                            "Failed to load thread turns: {}; fallback thread/read failed: {}",
+                            paged_error, legacy_error
+                        )
+                    })?;
+                let turns = legacy_response
+                    .get("thread")
+                    .and_then(|thread| thread.get("turns"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                eprintln!(
+                    "[codex-web][cli] thread/read includeTurns fallback threadId={} count={}",
+                    thread_id,
+                    turns.len()
+                );
+                Ok(CliThreadTurnsPage {
+                    next_cursor: Value::Null,
+                    turns,
+                })
+            }
+        }
+    }
+
+    async fn request_cli_method_response(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_ms: u64,
+    ) -> Result<Value, String> {
+        let mut response = self
+            .request_raw(
+                json!({
+                    "method": method,
+                    "params": params,
+                }),
+                timeout_ms,
+            )
+            .await?;
+        decorate_cli_app_server_response(method, &mut response);
+        Ok(response)
+    }
+
+    fn thread_started_messages_from_response(&self, response: &Value) -> Vec<Value> {
+        response
+            .get("result")
+            .and_then(|result| result.get("thread"))
+            .cloned()
+            .map(|thread| {
+                self.decorate_notification(json!({
+                    "type": "mcp-notification",
+                    "hostId": "local",
+                    "method": "thread/started",
+                    "params": { "thread": thread },
+                }))
+            })
+            .into_iter()
+            .collect()
+    }
+
+    async fn dispatch_socket_payload_with_emitter<F>(&self, raw: &str, emit: F) -> Value
+    where
+        F: Fn(Value) + Send + Sync,
+    {
+        let _ = &emit;
+        let (id, message) = cdp_resources::parse_web_bridge_socket_message(raw);
+        let is_heartbeat = matches!(&message, Ok(message) if cdp_resources::is_web_bridge_socket_heartbeat(message));
+        match &message {
+            Ok(message) if !is_heartbeat => {
+                eprintln!(
+                    "[codex-web][cli] socket request id={} message={}",
+                    id.as_deref().unwrap_or(""),
+                    cli_bridge_message_label(message)
+                );
+                if message.get("type").and_then(Value::as_str) == Some("log-message") {
+                    eprintln!(
+                        "[codex-web][cli] frontend log id={} {}",
+                        id.as_deref().unwrap_or(""),
+                        cli_log_message_preview(message)
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[codex-web][cli] socket request parse failed id={} error={}",
+                    id.as_deref().unwrap_or(""),
+                    err
+                );
+            }
+            _ => {}
+        }
+        let result = match message {
+            Ok(message) if cdp_resources::is_web_bridge_socket_heartbeat(&message) => {
+                Ok(json!({ "type": "bridge-heartbeat-ack" }))
+            }
+            Ok(message) => self.dispatch_message(message).await,
+            Err(err) => Err(err),
+        };
+        if !is_heartbeat {
+            match &result {
+                Ok(value) => eprintln!(
+                    "[codex-web][cli] socket response id={} labels={}",
+                    id.as_deref().unwrap_or(""),
+                    cli_bridge_response_labels(value)
+                ),
+                Err(err) => eprintln!(
+                    "[codex-web][cli] socket response id={} error={}",
+                    id.as_deref().unwrap_or(""),
+                    err
+                ),
+            }
+        }
+        cdp_resources::web_bridge_socket_response(id, result)
+    }
+
+    async fn handle_web_bridge_websocket<S>(
+        self: Arc<Self>,
+        websocket: tokio_tungstenite::WebSocketStream<S>,
+    ) -> Result<(), String>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        eprintln!("[codex-web] CLI bridge websocket opened");
+        let (mut write, mut read) = websocket.split();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (subscription_id, mut notification_rx) = self.subscribe().await;
+        let notification_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(partial) = notification_rx.recv().await {
+                let _ = notification_tx.send(Message::Text(partial.to_string()));
+            }
+        });
+
+        let writer = async {
+            while let Some(message) = rx.recv().await {
+                write.send(message).await.map_err(|e| e.to_string())?;
+            }
+            Ok::<(), String>(())
+        };
+
+        let bridge = self.clone();
+        let reader = async {
+            while let Some(message) = read.next().await {
+                match message.map_err(|e| e.to_string())? {
+                    Message::Text(raw) => {
+                        let tx = tx.clone();
+                        let bridge = bridge.clone();
+                        tokio::spawn(async move {
+                            let response = bridge
+                                .dispatch_socket_payload_with_emitter(&raw, {
+                                    let tx = tx.clone();
+                                    move |partial| {
+                                        let _ = tx.send(Message::Text(partial.to_string()));
+                                    }
+                                })
+                                .await;
+                            let _ = tx.send(Message::Text(response.to_string()));
+                        });
+                    }
+                    Message::Binary(bytes) => match String::from_utf8(bytes) {
+                        Ok(raw) => {
+                            let tx = tx.clone();
+                            let bridge = bridge.clone();
+                            tokio::spawn(async move {
+                                let response = bridge
+                                    .dispatch_socket_payload_with_emitter(&raw, {
+                                        let tx = tx.clone();
+                                        move |partial| {
+                                            let _ = tx.send(Message::Text(partial.to_string()));
+                                        }
+                                    })
+                                    .await;
+                                let _ = tx.send(Message::Text(response.to_string()));
+                            });
+                        }
+                        Err(err) => {
+                            let response = cdp_resources::web_bridge_socket_response(
+                                None,
+                                Err(err.to_string()),
+                            );
+                            let _ = tx.send(Message::Text(response.to_string()));
+                        }
+                    },
+                    Message::Ping(payload) => {
+                        let _ = tx.send(Message::Pong(payload));
+                    }
+                    Message::Close(frame) => {
+                        let _ = tx.send(Message::Close(frame));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<(), String>(())
+        };
+
+        let result = tokio::select! {
+            result = writer => result,
+            result = reader => result,
+        };
+        self.unsubscribe(subscription_id).await;
+        eprintln!("[codex-web] CLI bridge websocket closed");
+        result
+    }
+
+    async fn subscribe(&self) -> (usize, mpsc::UnboundedReceiver<Value>) {
+        let id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscribers.lock().await.insert(id, tx);
+        (id, rx)
+    }
+
+    async fn unsubscribe(&self, id: usize) {
+        self.subscribers.lock().await.remove(&id);
+    }
+
+    fn spawn_notification_pump<F>(self: Arc<Self>, emit: F)
+    where
+        F: Fn(Value) + Send + Sync + 'static,
+    {
+        tokio::spawn(async move {
+            let (subscription_id, mut rx) = self.subscribe().await;
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_millis(RELAY_WEB_BRIDGE_NOTIFICATION_PUMP_TTL_MS),
+                    rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(partial)) => emit(partial),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            self.unsubscribe(subscription_id).await;
+        });
+    }
+
+    async fn status(&self) -> Value {
+        let running = {
+            let mut child = self.child.lock().await;
+            match child.as_mut().and_then(|child| child.try_wait().ok()) {
+                Some(_status) => {
+                    self.connected.store(false, Ordering::Relaxed);
+                    false
+                }
+                None => self.connected.load(Ordering::Relaxed),
+            }
+        };
+        json!({
+            "backend": "cli",
+            "cdpUrl": Value::Null,
+            "captureViewport": Value::Null,
+            "clientViewport": Value::Null,
+            "connected": running,
+            "network": {
+                "bufferedAmount": 0,
+                "droppedFramesInLast5s": 0,
+                "frameClientCount": 0,
+                "rtt": null,
+            },
+            "pageZoomScale": DEFAULT_PAGE_ZOOM_SCALE,
+            "screencastActive": false,
+            "screencastProfile": "none",
+            "screencastProfileMode": "off",
+            "screencastProfileSettings": Value::Null,
+            "streamingEnabled": false,
+            "target": Value::Null,
+            "viewportOverrideSuspended": true,
+        })
+    }
+
+    async fn stop(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+        self.reject_pending("Codex CLI app-server stopped").await;
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+}
+
+fn cli_config_string(key: &str, value: &str) -> String {
+    format!("{}=\"{}\"", key, toml_string_escape(value))
+}
+
+fn toml_string_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn configure_tokio_proxy_env(command: &mut TokioCommand, proxy_url: &str) {
+    let proxy_url = proxy_url.trim();
+    if proxy_url.is_empty() {
+        return;
+    }
+    for key in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ] {
+        command.env(key, proxy_url);
+    }
+}
+
+fn json_id_to_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn default_cli_initialize_result() -> Value {
+    json!({
+        "protocolVersion": CLI_APP_SERVER_PROTOCOL_VERSION,
+        "capabilities": {},
+        "serverInfo": {
+            "name": "codex-cli-app-server",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+fn cli_app_server_initialize_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("{}initialize", CLI_APP_SERVER_REQUEST_ID_PREFIX),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": CLI_APP_SERVER_PROTOCOL_VERSION,
+            "capabilities": {
+                "experimentalApi": true,
+            },
+            "clientInfo": {
+                "name": "codexl-remote-cli",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+        },
+    })
+}
+
+fn json_error_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+struct BridgeFetchRequest {
+    endpoint: String,
+    body: Value,
+}
+
+struct CliThreadTurnsPage {
+    turns: Vec<Value>,
+    next_cursor: Value,
+}
+
+fn bridge_fetch_request(message: &Value) -> Option<BridgeFetchRequest> {
+    if message.get("type").and_then(Value::as_str) != Some("fetch") {
+        return None;
+    }
+    let url = message.get("url").and_then(Value::as_str)?;
+    let url = reqwest::Url::parse(url).ok()?;
+    if url.scheme() != "vscode" || url.host_str() != Some("codex") {
+        return None;
+    }
+    let endpoint = url.path().trim_start_matches('/').trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+    let body = match message.get("body") {
+        Some(Value::String(raw)) if raw.trim().is_empty() => Value::Null,
+        Some(Value::String(raw)) => serde_json::from_str(raw).ok()?,
+        Some(Value::Object(_)) => message.get("body")?.clone(),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => other.clone(),
+    };
+    Some(BridgeFetchRequest {
+        endpoint: endpoint.to_string(),
+        body,
+    })
+}
+
+fn strip_host_id(value: Value) -> Value {
+    match value {
+        Value::Object(mut map) => {
+            map.remove("hostId");
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+fn codex_fetch_endpoint_params(value: &Value) -> &Value {
+    value
+        .get("params")
+        .filter(|params| params.is_object())
+        .unwrap_or(value)
+}
+
+fn cli_frontend_compat_endpoint_response(
+    endpoint: &str,
+    params: &Value,
+    codex_home: &str,
+) -> Option<Value> {
+    let params = codex_fetch_endpoint_params(params);
+    match endpoint {
+        "active-workspace-roots" => Some(json!({ "roots": [] })),
+        "ambient-suggestions" => Some(json!({
+            "file": {
+                "currentSuggestionIds": [],
+                "suggestions": [],
+            },
+        })),
+        "codex-command-keymap-state" => Some(Value::Null),
+        "codex-home" => Some(json!({ "codexHome": codex_home })),
+        "extension-info" => Some(json!({
+            "name": "CodexL",
+            "version": env!("CARGO_PKG_VERSION"),
+            "buildFlavor": "cli-remote",
+        })),
+        "get-configuration" => Some(json!({ "value": Value::Null })),
+        "get-copilot-api-proxy-info" => Some(Value::Null),
+        "home-directory" => Some(json!({
+            "homeDirectory": std::env::var("HOME").unwrap_or_default(),
+        })),
+        "inbox-items" => Some(json!({ "items": [] })),
+        "is-copilot-api-available" => Some(json!(false)),
+        "list-automations" => Some(json!({ "items": [] })),
+        "list-pending-automation-run-threads" => Some(json!({ "threadIds": [] })),
+        "list-pinned-threads" => Some(json!({ "threadIds": [] })),
+        "locale-info" => Some(cli_locale_info_response()),
+        "mcp-codex-config" => Some(json!({ "config": {} })),
+        "os-info" => Some(json!({
+            "platform": codex_platform(),
+            "arch": std::env::consts::ARCH,
+        })),
+        "paths-exist" => Some(cli_paths_exist_response(params)),
+        "projectless-workspace-root" => Some(json!({
+            "workspaceRoot": Value::Null,
+        })),
+        "set-configuration" => Some(json!({
+            "value": params.get("value").cloned().unwrap_or(Value::Null),
+        })),
+        "set-remote-control-connections-enabled" => Some(Value::Null),
+        "workspace-root-options" => Some(json!({
+            "roots": [],
+            "labels": {},
+        })),
+        "worktree-shell-environment-config" => Some(json!({ "shellEnvironment": Value::Null })),
+        "git-origins" => Some(json!({ "origins": [] })),
+        "developer-instructions" => {
+            let instructions = params
+                .get("baseInstructions")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(json!({ "instructions": instructions }))
+        }
+        _ => None,
+    }
+}
+
+fn cli_external_fetch_response(url: &str) -> Option<Value> {
+    if url.starts_with("/wham/tasks/list") {
+        return Some(json!({ "items": [] }));
+    }
+    if url.starts_with("/wham/usage") {
+        return Some(Value::Null);
+    }
+    if url.starts_with("https://ab.chatgpt.com/") || url.starts_with("https://chatgpt.com/ces/") {
+        return Some(json!({}));
+    }
+    None
+}
+
+fn cli_paths_exist_response(params: &Value) -> Value {
+    let paths = params
+        .get("paths")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| {
+            params
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| vec![json!(path)])
+        })
+        .unwrap_or_default();
+    let mut by_path = Map::new();
+    let mut exists = Vec::new();
+    let mut existing_paths = Vec::new();
+    for path in paths {
+        let Some(path) = path.as_str() else {
+            continue;
+        };
+        let exists_value = Path::new(path).exists();
+        by_path.insert(path.to_string(), json!(exists_value));
+        exists.push(json!(exists_value));
+        if exists_value {
+            existing_paths.push(json!(path));
+        }
+    }
+    json!({
+        "existingPaths": existing_paths,
+        "paths": by_path,
+        "exists": exists,
+        "allExist": exists.iter().all(|value| value.as_bool().unwrap_or(false)),
+    })
+}
+
+fn cli_locale_info_response() -> Value {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| cli_normalize_locale_tag(&value))
+        })
+        .unwrap_or_else(|| "en-US".to_string());
+    json!({
+        "ideLocale": locale,
+        "systemLocale": locale,
+    })
+}
+
+fn cli_normalize_locale_tag(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let base = raw
+        .split(':')
+        .next()
+        .unwrap_or(raw)
+        .split('.')
+        .next()
+        .unwrap_or(raw)
+        .split('@')
+        .next()
+        .unwrap_or(raw)
+        .trim();
+    if base.is_empty() {
+        return None;
+    }
+    let lower = base.to_ascii_lowercase();
+    if lower == "c" || lower == "posix" {
+        return None;
+    }
+    let tag = base.replace('_', "-");
+    if !tag
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return None;
+    }
+    let parts = tag
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let language = parts.first()?;
+    if !(2..=8).contains(&language.len()) || !language.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    let normalized = parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            if index == 0 {
+                part.to_ascii_lowercase()
+            } else if part.len() == 2 && part.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                part.to_ascii_uppercase()
+            } else if part.len() == 3 && part.chars().all(|ch| ch.is_ascii_digit()) {
+                part.to_string()
+            } else if part.len() == 4 && part.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        format!(
+                            "{}{}",
+                            first.to_ascii_uppercase(),
+                            chars.as_str().to_ascii_lowercase()
+                        )
+                    }
+                    None => String::new(),
+                }
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    Some(normalized)
+}
+
+fn codex_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        "linux" => "linux",
+        other => other,
+    }
+}
+
+fn cli_global_state_key(params: &Value) -> Result<String, String> {
+    codex_fetch_endpoint_params(params)
+        .get("key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "global state request missing key".to_string())
+}
+
+fn cli_global_state_get_response(
+    store: &HashMap<String, Value>,
+    params: &Value,
+) -> Result<Value, String> {
+    let key = cli_global_state_key(params)?;
+    Ok(json!({ "value": store.get(&key).cloned().unwrap_or(Value::Null) }))
+}
+
+fn cli_global_state_get_response_for_key(
+    store: &HashMap<String, Value>,
+    key: &str,
+    params: &Value,
+    codex_home: &str,
+) -> Result<Value, String> {
+    let parsed_key = cli_global_state_key(params)?;
+    if parsed_key != key {
+        return Err("global state key mismatch".to_string());
+    }
+    let stored = store.get(key).cloned().unwrap_or(Value::Null);
+    let value = match key {
+        CLI_PROJECTLESS_THREAD_IDS_KEY => cli_projectless_thread_ids_global_value(
+            stored,
+            cli_projectless_threads_from_sessions(codex_home)
+                .into_iter()
+                .map(|thread| thread.conversation_id),
+        ),
+        CLI_THREAD_WORKSPACE_ROOT_HINTS_KEY => cli_thread_workspace_root_hints_global_value(
+            stored,
+            cli_projectless_threads_from_sessions(codex_home),
+        ),
+        _ => return cli_global_state_get_response(store, params),
+    };
+    Ok(json!({ "value": value }))
+}
+
+fn cli_global_state_set_response(
+    store: &mut HashMap<String, Value>,
+    params: &Value,
+) -> Result<Value, String> {
+    let endpoint_params = codex_fetch_endpoint_params(params);
+    let key = cli_global_state_key(endpoint_params)?;
+    match endpoint_params.get("value").cloned() {
+        Some(value) if !value.is_null() => {
+            store.insert(key, value.clone());
+            Ok(json!({ "value": value }))
+        }
+        _ => {
+            store.remove(&key);
+            Ok(json!({ "value": Value::Null }))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliProjectlessThreadMetadata {
+    conversation_id: String,
+    cwd: String,
+    workspace_root: String,
+}
+
+fn decorate_cli_app_server_response(method: &str, response: &mut Value) {
+    match method {
+        "thread/list" => {
+            if let Some(threads) = response
+                .get_mut("result")
+                .and_then(|result| result.get_mut("data"))
+                .and_then(Value::as_array_mut)
+            {
+                for thread in threads {
+                    decorate_cli_thread_metadata(thread);
+                }
+            }
+        }
+        "thread/read" | "thread/resume" | "thread/start" => {
+            if let Some(thread) = response
+                .get_mut("result")
+                .and_then(|result| result.get_mut("thread"))
+            {
+                decorate_cli_thread_metadata(thread);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn decorate_cli_thread_metadata(thread: &mut Value) {
+    let Some(cwd) = thread
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(workspace_root) = cli_projectless_workspace_root_for_cwd(&cwd) else {
+        return;
+    };
+    let Some(object) = thread.as_object_mut() else {
+        return;
+    };
+    let workspace_root = workspace_root.to_string_lossy().to_string();
+    object.insert("workspaceKind".to_string(), json!("projectless"));
+    object
+        .entry("workspaceBrowserRoot".to_string())
+        .or_insert_with(|| json!(workspace_root.clone()));
+    object
+        .entry("workspaceRoot".to_string())
+        .or_insert_with(|| json!(workspace_root));
+    object
+        .entry("projectlessOutputDirectory".to_string())
+        .or_insert_with(|| json!(cwd));
+}
+
+fn cli_projectless_thread_ids_global_value<I>(stored: Value, discovered_ids: I) -> Value
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    if let Value::Array(values) = stored {
+        for value in values {
+            let Some(id) = value.as_str().and_then(normalize_cli_conversation_id) else {
+                continue;
+            };
+            if seen.insert(id.clone()) {
+                ids.push(Value::String(id));
+            }
+        }
+    }
+    for id in discovered_ids {
+        let Some(id) = normalize_cli_conversation_id(&id) else {
+            continue;
+        };
+        if seen.insert(id.clone()) {
+            ids.push(Value::String(id));
+        }
+    }
+    Value::Array(ids)
+}
+
+fn cli_thread_workspace_root_hints_global_value(
+    stored: Value,
+    discovered_threads: Vec<CliProjectlessThreadMetadata>,
+) -> Value {
+    let mut hints = stored.as_object().cloned().unwrap_or_default();
+    for thread in discovered_threads {
+        hints
+            .entry(thread.conversation_id)
+            .or_insert_with(|| Value::String(thread.workspace_root));
+    }
+    Value::Object(hints)
+}
+
+fn normalize_cli_conversation_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    if id.starts_with("local:") {
+        Some(id.to_string())
+    } else {
+        Some(format!("local:{}", id))
+    }
+}
+
+fn cli_projectless_threads_from_sessions(codex_home: &str) -> Vec<CliProjectlessThreadMetadata> {
+    let sessions_dir = Path::new(codex_home).join("sessions");
+    let mut files = Vec::new();
+    collect_cli_jsonl_files(&sessions_dir, &mut files);
+    files.sort();
+
+    let mut threads = Vec::new();
+    let mut seen = HashSet::new();
+    for file in files {
+        let Some(thread) = cli_projectless_thread_from_session_file(&file) else {
+            continue;
+        };
+        if seen.insert(thread.conversation_id.clone()) {
+            threads.push(thread);
+        }
+    }
+    threads
+}
+
+fn collect_cli_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cli_jsonl_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn cli_projectless_thread_from_session_file(path: &Path) -> Option<CliProjectlessThreadMetadata> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = StdBufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    cli_projectless_thread_from_session_meta_line(&line)
+}
+
+fn cli_projectless_thread_from_session_meta_line(
+    line: &str,
+) -> Option<CliProjectlessThreadMetadata> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let id = payload.get("id").and_then(Value::as_str)?;
+    let cwd = payload.get("cwd").and_then(Value::as_str)?.trim();
+    let workspace_root = cli_projectless_workspace_root_for_cwd(cwd)?;
+    Some(CliProjectlessThreadMetadata {
+        conversation_id: normalize_cli_conversation_id(id)?,
+        cwd: cwd.to_string(),
+        workspace_root: workspace_root.to_string_lossy().to_string(),
+    })
+}
+
+fn cli_projectless_workspace_root_for_cwd(cwd: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let workspace_root = Path::new(&home).join("Documents").join("Codex");
+    if cli_is_projectless_cwd_under_root(Path::new(cwd.trim()), &workspace_root) {
+        Some(workspace_root)
+    } else {
+        None
+    }
+}
+
+fn cli_is_projectless_cwd_under_root(cwd: &Path, workspace_root: &Path) -> bool {
+    let Ok(relative) = cwd.strip_prefix(workspace_root) else {
+        return false;
+    };
+    let segments = relative
+        .iter()
+        .map(|segment| segment.to_string_lossy())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [date_slug] => cli_is_projectless_date_slug_segment(date_slug),
+        [date, slug] => cli_is_projectless_date_segment(date) && !slug.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn cli_is_projectless_date_slug_segment(segment: &str) -> bool {
+    let Some(date) = segment.get(..10) else {
+        return false;
+    };
+    segment.as_bytes().get(10).is_some_and(|byte| *byte == b'-')
+        && cli_is_projectless_date_segment(date)
+        && segment.len() > 11
+}
+
+fn cli_is_projectless_date_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn json_response_result(response: Value) -> Result<Value, String> {
+    if let Some(error) = response.get("error") {
+        return Err(json_error_message(error));
+    }
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn response_error_is_method_not_found(response: &Value) -> bool {
+    let Some(error) = response.get("error") else {
+        return false;
+    };
+    if error.get("code").and_then(Value::as_i64) == Some(-32601) {
+        return true;
+    }
+    json_error_message(error)
+        .to_ascii_lowercase()
+        .contains("method not found")
+}
+
+fn create_cli_projectless_thread_cwd(
+    directory_name: Option<&str>,
+    prompt: &str,
+) -> Result<Value, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let seconds = now_millis() / 1000;
+    let slug_source = directory_name.unwrap_or(prompt);
+    let (cwd, workspace_root) =
+        projectless_thread_paths_for_home(Path::new(&home), slug_source, seconds);
+    std::fs::create_dir_all(&cwd).map_err(|err| {
+        format!(
+            "failed to create projectless Codex session directory {}: {}",
+            cwd.to_string_lossy(),
+            err
+        )
+    })?;
+    Ok(projectless_thread_cwd_response(&cwd, &workspace_root))
+}
+
+fn projectless_thread_cwd_response(cwd: &Path, workspace_root: &Path) -> Value {
+    let cwd = cwd.to_string_lossy().to_string();
+    let workspace_root = workspace_root.to_string_lossy().to_string();
+    json!({
+        "cwd": cwd.clone(),
+        "workspaceRoot": workspace_root,
+        "projectlessOutputDirectory": cwd.clone(),
+        "outputDirectory": cwd,
+    })
+}
+
+fn projectless_thread_paths_for_home(
+    home: &Path,
+    prompt: &str,
+    seconds: u64,
+) -> (PathBuf, PathBuf) {
+    let (year, month, day) = utc_date_from_unix_seconds(seconds);
+    let date = format!("{:04}-{:02}-{:02}", year, month, day);
+    let mut slug = sanitize_projectless_path_segment(prompt);
+    if slug.is_empty() {
+        slug = "chat".to_string();
+    }
+    let workspace_root = home.join("Documents").join("Codex");
+    let cwd = workspace_root
+        .join(date)
+        .join(format!("{}-{}", slug, seconds));
+    (cwd, workspace_root)
+}
+
+fn sanitize_projectless_path_segment(text: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in text.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch.is_ascii_whitespace() || matches!(ch, '-' | '_' | '.' | ':' | '/') {
+            Some('-')
+        } else {
+            None
+        };
+
+        let Some(next) = next else {
+            continue;
+        };
+        if next == '-' {
+            if slug.is_empty() || last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        slug.push(next);
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn utc_date_from_unix_seconds(seconds: u64) -> (i64, i64, i64) {
+    let days = (seconds / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m, d)
+}
+
+fn cli_thread_start_params(params: Value) -> Value {
+    let source = strip_host_id(params);
+    let source = source.as_object().cloned().unwrap_or_default();
+    let mut output = Map::new();
+
+    copy_json_field(&source, &mut output, "cwd");
+    copy_json_field(&source, &mut output, "serviceTier");
+    copy_json_field(&source, &mut output, "config");
+    copy_json_field(&source, &mut output, "threadSource");
+    copy_json_field(&source, &mut output, "model");
+    copy_json_field(&source, &mut output, "modelProvider");
+    copy_json_field(&source, &mut output, "reasoningEffort");
+    copy_json_field(&source, &mut output, "workspaceKind");
+    copy_json_field(&source, &mut output, "workspaceRoots");
+    copy_json_field(&source, &mut output, "projectlessOutputDirectory");
+    copy_json_field(&source, &mut output, "sandbox");
+    copy_json_field(&source, &mut output, "baseInstructions");
+    copy_json_field(&source, &mut output, "developerInstructions");
+    copy_json_field(&source, &mut output, "personality");
+    copy_json_field(&source, &mut output, "ephemeral");
+    copy_json_field(&source, &mut output, "persistExtendedHistory");
+
+    if let Some(additional) = source.get("additionalDeveloperInstructions") {
+        output.insert("developerInstructions".to_string(), additional.clone());
+    }
+
+    ensure_cli_projectless_output_directory(&source, &mut output);
+
+    copy_permission_fields(&source, &mut output);
+    copy_collaboration_model_fields(&source, &mut output);
+
+    output
+        .entry("threadSource".to_string())
+        .or_insert_with(|| json!("user"));
+    output
+        .entry("serviceName".to_string())
+        .or_insert_with(|| json!("codexl_remote_cli"));
+    output
+        .entry("ephemeral".to_string())
+        .or_insert_with(|| json!(false));
+    output
+        .entry("personality".to_string())
+        .or_insert_with(|| json!("pragmatic"));
+
+    Value::Object(output)
+}
+
+fn cli_app_server_method_params(method: &str, params: Value) -> Value {
+    match method {
+        "thread/start" => cli_thread_start_params(params),
+        "thread/resume" => cli_thread_resume_params(params),
+        "turn/start" => cli_turn_start_params_for_app_server(params),
+        _ => params,
+    }
+}
+
+fn normalize_cli_app_server_request(request: &mut Value) {
+    let Value::Object(map) = request else {
+        return;
+    };
+    let Some(method) = map
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if !matches!(
+        method.as_str(),
+        "thread/start" | "thread/resume" | "turn/start"
+    ) {
+        return;
+    }
+    let params = map.remove("params").unwrap_or(Value::Null);
+    map.insert(
+        "params".to_string(),
+        cli_app_server_method_params(&method, params),
+    );
+}
+
+fn ensure_cli_projectless_output_directory(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+) {
+    if source.get("workspaceKind").and_then(Value::as_str) != Some("projectless") {
+        return;
+    }
+
+    let output_directory = target
+        .get("projectlessOutputDirectory")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            source
+                .get("projectlessOutputDirectory")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| source.get("outputDirectory").and_then(Value::as_str))
+        .or_else(|| source.get("cwd").and_then(Value::as_str))
+        .or_else(|| {
+            source
+                .get("workspaceRoots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+
+    let Some(output_directory) = output_directory else {
+        return;
+    };
+
+    target.insert(
+        "projectlessOutputDirectory".to_string(),
+        json!(output_directory),
+    );
+    target
+        .entry("cwd".to_string())
+        .or_insert_with(|| json!(output_directory));
+    append_developer_instruction(
+        target,
+        format!(
+            "When using local files for this projectless thread, write scratch files, drafts, generated assets, and other outputs under {}. Do not write directly in the home directory unless the user explicitly asks.",
+            output_directory
+        ),
+    );
+}
+
+fn append_developer_instruction(target: &mut Map<String, Value>, instruction: String) {
+    let next = match target.get("developerInstructions").and_then(Value::as_str) {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{}\n\n{}", existing, instruction)
+        }
+        _ => instruction,
+    };
+    target.insert("developerInstructions".to_string(), json!(next));
+}
+
+fn cli_thread_resume_params(params: Value) -> Value {
+    let source = strip_host_id(params);
+    let source = source.as_object().cloned().unwrap_or_default();
+    let mut output = Map::new();
+
+    copy_json_field(&source, &mut output, "threadId");
+    if !output.contains_key("threadId") {
+        if let Some(conversation_id) = source
+            .get("conversationId")
+            .filter(|value| !value.is_null())
+        {
+            output.insert("threadId".to_string(), conversation_id.clone());
+        }
+    }
+    copy_json_field(&source, &mut output, "cwd");
+    copy_json_field(&source, &mut output, "path");
+    copy_json_field(&source, &mut output, "history");
+    copy_json_field(&source, &mut output, "serviceTier");
+    copy_json_field(&source, &mut output, "config");
+    copy_json_field(&source, &mut output, "model");
+    copy_json_field(&source, &mut output, "modelProvider");
+    copy_json_field(&source, &mut output, "reasoningEffort");
+    copy_json_field(&source, &mut output, "workspaceKind");
+    copy_json_field(&source, &mut output, "workspaceRoots");
+    copy_json_field(&source, &mut output, "projectlessOutputDirectory");
+    copy_json_field(&source, &mut output, "sandbox");
+    copy_json_field(&source, &mut output, "baseInstructions");
+    copy_json_field(&source, &mut output, "developerInstructions");
+    copy_json_field(&source, &mut output, "personality");
+    copy_json_field(&source, &mut output, "excludeTurns");
+    copy_json_field(&source, &mut output, "persistExtendedHistory");
+    copy_permission_fields(&source, &mut output);
+    copy_collaboration_model_fields(&source, &mut output);
+
+    Value::Object(output)
+}
+
+fn cli_turn_start_params(thread_id: &str, params: Value, fallback_model: Option<Value>) -> Value {
+    let source = strip_host_id(params);
+    let mut source = source.as_object().cloned().unwrap_or_default();
+    source.insert("threadId".to_string(), json!(thread_id));
+    cli_turn_start_params_from_source(source, fallback_model)
+}
+
+fn cli_turn_start_params_for_app_server(params: Value) -> Value {
+    let source = strip_host_id(params);
+    let source = source.as_object().cloned().unwrap_or_default();
+    cli_turn_start_params_from_source(source, None)
+}
+
+fn cli_turn_start_params_from_source(
+    source: Map<String, Value>,
+    fallback_model: Option<Value>,
+) -> Value {
+    let mut output = Map::new();
+
+    copy_json_field(&source, &mut output, "threadId");
+    copy_json_field(&source, &mut output, "cwd");
+    copy_json_field(&source, &mut output, "input");
+    copy_json_field(&source, &mut output, "attachments");
+    copy_json_field(&source, &mut output, "commentAttachments");
+    copy_json_field(&source, &mut output, "serviceTier");
+    copy_json_field(&source, &mut output, "model");
+    copy_json_field(&source, &mut output, "effort");
+    copy_json_field(&source, &mut output, "reasoningEffort");
+    copy_json_field(&source, &mut output, "workspaceKind");
+    copy_json_field(&source, &mut output, "projectlessOutputDirectory");
+    copy_permission_fields(&source, &mut output);
+    copy_collaboration_model_fields(&source, &mut output);
+
+    if !output.contains_key("model") {
+        if let Some(model) = fallback_model {
+            output.insert("model".to_string(), model);
+        }
+    }
+
+    Value::Object(output)
+}
+
+fn cli_start_conversation_has_first_turn(params: &Value) -> bool {
+    let input_len = params
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let attachments_len = params
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let comment_attachments_len = params
+        .get("commentAttachments")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    input_len > 0 || attachments_len > 0 || comment_attachments_len > 0
+}
+
+fn cli_conversation_id_from_params(params: &Value) -> Result<String, String> {
+    let params = codex_fetch_endpoint_params(params);
+    ["conversationId", "threadId"]
+        .iter()
+        .find_map(|key| non_empty_json_string(params.get(*key)))
+        .ok_or_else(|| "maybe-resume-conversation missing conversationId".to_string())
+}
+
+fn cli_maybe_resume_params(
+    params: &Value,
+    thread_metadata: Option<&Value>,
+    conversation_id: &str,
+) -> Map<String, Value> {
+    let mut output = codex_fetch_endpoint_params(params)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    output.remove("hostId");
+    output.remove("conversationId");
+    output.insert("threadId".to_string(), json!(conversation_id));
+    output.insert("excludeTurns".to_string(), json!(true));
+
+    if !output.contains_key("path") {
+        if let Some(path) = thread_metadata
+            .and_then(|thread| non_empty_json_string(thread.get("path")))
+            .or_else(|| non_empty_json_string(params.get("rolloutPath")))
+        {
+            output.insert("path".to_string(), json!(path));
+        }
+    }
+
+    if !output.contains_key("cwd") {
+        if let Some(cwd) = thread_metadata
+            .and_then(|thread| non_empty_json_string(thread.get("cwd")))
+            .or_else(|| first_workspace_root(params))
+        {
+            output.insert("cwd".to_string(), json!(cwd));
+        }
+    }
+
+    if !output.contains_key("workspaceRoots") {
+        if let Some(cwd) = non_empty_json_string(output.get("cwd")) {
+            output.insert("workspaceRoots".to_string(), json!([cwd]));
+        }
+    }
+
+    output
+}
+
+fn cli_conversation_snapshot_message(
+    conversation_id: &str,
+    resume_result: &Value,
+    turns_page: &CliThreadTurnsPage,
+    endpoint_params: &Value,
+) -> Result<Value, String> {
+    let thread = resume_result
+        .get("thread")
+        .ok_or_else(|| "thread/resume response missing thread".to_string())?;
+    let model = non_empty_json_string(resume_result.get("model"))
+        .or_else(|| non_empty_json_string(endpoint_params.get("model")))
+        .or_else(|| {
+            endpoint_params
+                .get("collaborationMode")
+                .and_then(|value| value.get("settings"))
+                .and_then(|settings| non_empty_json_string(settings.get("model")))
+        })
+        .unwrap_or_default();
+    let reasoning_effort = resume_result
+        .get("reasoningEffort")
+        .cloned()
+        .or_else(|| endpoint_params.get("reasoningEffort").cloned())
+        .or_else(|| {
+            endpoint_params
+                .get("collaborationMode")
+                .and_then(|value| value.get("settings"))
+                .and_then(|settings| settings.get("reasoning_effort"))
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    let cwd = non_empty_json_string(resume_result.get("cwd"))
+        .or_else(|| non_empty_json_string(thread.get("cwd")))
+        .or_else(|| non_empty_json_string(endpoint_params.get("cwd")))
+        .or_else(|| first_workspace_root(endpoint_params))
+        .unwrap_or_else(|| "/".to_string());
+    let approval_policy = cli_permission_value(resume_result, endpoint_params, "approvalPolicy")
+        .unwrap_or_else(|| json!("on-request"));
+    let approvals_reviewer =
+        cli_permission_value(resume_result, endpoint_params, "approvalsReviewer")
+            .unwrap_or_else(|| json!("user"));
+    let sandbox_policy = resume_result
+        .get("sandbox")
+        .cloned()
+        .or_else(|| cli_permission_value(resume_result, endpoint_params, "sandboxPolicy"))
+        .unwrap_or_else(|| cli_default_sandbox_policy(&cwd));
+    let turns = cli_conversation_turns_from_thread_turns(
+        conversation_id,
+        &turns_page.turns,
+        &model,
+        &reasoning_effort,
+        &cwd,
+        &approval_policy,
+        &approvals_reviewer,
+        &sandbox_policy,
+    );
+    let created_at = json_seconds_to_millis(thread.get("createdAt")).unwrap_or_else(now_millis);
+    let updated_at = json_seconds_to_millis(thread.get("updatedAt")).unwrap_or(created_at);
+    let title = non_empty_json_string(thread.get("name"))
+        .or_else(|| non_empty_json_string(thread.get("preview")))
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let rollout_path = non_empty_json_string(thread.get("path"))
+        .or_else(|| non_empty_json_string(endpoint_params.get("path")))
+        .or_else(|| non_empty_json_string(endpoint_params.get("rolloutPath")))
+        .unwrap_or_default();
+    let inferred_projectless_workspace_root =
+        cli_projectless_workspace_root_for_cwd(&cwd).map(|path| path.to_string_lossy().to_string());
+    let workspace_kind = non_empty_json_string(endpoint_params.get("workspaceKind"))
+        .or_else(|| non_empty_json_string(thread.get("workspaceKind")))
+        .or_else(|| {
+            inferred_projectless_workspace_root
+                .as_ref()
+                .map(|_| "projectless".to_string())
+        })
+        .unwrap_or_else(|| "project".to_string());
+    let workspace_browser_root = endpoint_params
+        .get("workspaceBrowserRoot")
+        .cloned()
+        .or_else(|| thread.get("workspaceBrowserRoot").cloned())
+        .or_else(|| inferred_projectless_workspace_root.map(Value::String))
+        .unwrap_or(Value::Null);
+    let collaboration_mode = endpoint_params
+        .get("collaborationMode")
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "mode": "default",
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "developer_instructions": Value::Null,
+                },
+            })
+        });
+    let latest_collaboration_mode =
+        cli_collaboration_mode_with_model(collaboration_mode, &model, &reasoning_effort);
+    let forked_from_id = thread
+        .get("forkedFromId")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or(Value::Null);
+
+    let conversation_state = json!({
+        "id": conversation_id,
+        "forkedFromId": forked_from_id,
+        "hostId": "local",
+        "turns": turns,
+        "requests": [],
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "title": title,
+        "source": thread.get("source").cloned().unwrap_or(Value::Null),
+        "modelProvider": thread
+            .get("modelProvider")
+            .cloned()
+            .or_else(|| resume_result.get("modelProvider").cloned())
+            .unwrap_or(Value::Null),
+        "latestModel": model,
+        "latestReasoningEffort": reasoning_effort,
+        "previousTurnModel": Value::Null,
+        "latestCollaborationMode": latest_collaboration_mode,
+        "hasUnreadTurn": false,
+        "threadGoal": Value::Null,
+        "threadGoalResumeConfirmation": Value::Null,
+        "completedThreadGoal": Value::Null,
+        "threadRuntimeStatus": thread.get("status").cloned().unwrap_or(Value::Null),
+        "rolloutPath": rollout_path,
+        "cwd": cwd,
+        "gitInfo": thread.get("gitInfo").cloned().unwrap_or(Value::Null),
+        "resumeState": "resumed",
+        "latestTokenUsageInfo": Value::Null,
+        "workspaceKind": workspace_kind,
+        "workspaceBrowserRoot": workspace_browser_root,
+        "turnsPagination": {
+            "olderCursor": turns_page.next_cursor.clone(),
+            "isLoadingOlder": false,
+            "hasLoadedOldest": turns_page.next_cursor.is_null(),
+        },
+    });
+
+    Ok(json!({
+        "type": "ipc-broadcast",
+        "method": "thread-stream-state-changed",
+        "sourceClientId": "codexl-remote-cli",
+        "version": 6,
+        "params": {
+            "conversationId": conversation_id,
+            "hostId": "local",
+            "version": 6,
+            "change": {
+                "type": "snapshot",
+                "conversationState": conversation_state,
+            },
+        },
+    }))
+}
+
+fn cli_conversation_turns_from_thread_turns(
+    thread_id: &str,
+    turns: &[Value],
+    model: &str,
+    reasoning_effort: &Value,
+    cwd: &str,
+    approval_policy: &Value,
+    approvals_reviewer: &Value,
+    sandbox_policy: &Value,
+) -> Value {
+    Value::Array(
+        turns
+            .iter()
+            .map(|turn| {
+                cli_conversation_turn_from_thread_turn(
+                    thread_id,
+                    turn,
+                    model,
+                    reasoning_effort,
+                    cwd,
+                    approval_policy,
+                    approvals_reviewer,
+                    sandbox_policy,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn cli_conversation_turn_from_thread_turn(
+    thread_id: &str,
+    turn: &Value,
+    model: &str,
+    reasoning_effort: &Value,
+    cwd: &str,
+    approval_policy: &Value,
+    approvals_reviewer: &Value,
+    sandbox_policy: &Value,
+) -> Value {
+    let items = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let input = items
+        .first()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
+        .and_then(|item| item.get("content"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let normalized_items: Vec<Value> = items.iter().map(cli_normalize_thread_item).collect();
+
+    json!({
+        "params": {
+            "threadId": thread_id,
+            "input": input,
+            "approvalPolicy": approval_policy.clone(),
+            "approvalsReviewer": approvals_reviewer.clone(),
+            "sandboxPolicy": sandbox_policy.clone(),
+            "model": model,
+            "cwd": cwd,
+            "attachments": [],
+            "effort": reasoning_effort.clone(),
+            "summary": "none",
+            "personality": Value::Null,
+            "outputSchema": Value::Null,
+            "collaborationMode": Value::Null,
+        },
+        "turnId": turn.get("id").cloned().unwrap_or(Value::Null),
+        "turnStartedAtMs": json_seconds_to_millis_value(turn.get("startedAt")),
+        "durationMs": turn.get("durationMs").cloned().unwrap_or(Value::Null),
+        "finalAssistantStartedAtMs": json_seconds_to_millis_value(turn.get("completedAt")),
+        "status": turn.get("status").cloned().unwrap_or_else(|| json!("completed")),
+        "error": turn.get("error").cloned().unwrap_or(Value::Null),
+        "diff": Value::Null,
+        "items": normalized_items,
+    })
+}
+
+fn cli_normalize_thread_item(item: &Value) -> Value {
+    let mut output = item.clone();
+    if output.get("type").and_then(Value::as_str) != Some("collabAgentToolCall") {
+        return output;
+    }
+    let receiver_threads = output
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            Value::Array(
+                ids.iter()
+                    .filter_map(|id| {
+                        non_empty_json_string(Some(id)).map(|thread_id| {
+                            json!({
+                                "threadId": thread_id,
+                                "thread": Value::Null,
+                            })
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_else(|| json!([]));
+    if let Value::Object(map) = &mut output {
+        map.entry("receiverThreads".to_string())
+            .or_insert(receiver_threads);
+    }
+    output
+}
+
+fn cli_permission_value(result: &Value, params: &Value, key: &str) -> Option<Value> {
+    result
+        .get(key)
+        .cloned()
+        .or_else(|| {
+            params
+                .get("permissions")
+                .and_then(|value| value.get(key))
+                .cloned()
+        })
+        .or_else(|| params.get(key).cloned())
+        .filter(|value| !value.is_null())
+}
+
+fn cli_default_sandbox_policy(cwd: &str) -> Value {
+    json!({
+        "type": "workspaceWrite",
+        "writableRoots": [cwd],
+    })
+}
+
+fn cli_collaboration_mode_with_model(
+    mut collaboration_mode: Value,
+    model: &str,
+    reasoning_effort: &Value,
+) -> Value {
+    let Value::Object(map) = &mut collaboration_mode else {
+        return json!({
+            "mode": "default",
+            "settings": {
+                "model": model,
+                "reasoning_effort": reasoning_effort.clone(),
+                "developer_instructions": Value::Null,
+            },
+        });
+    };
+    map.entry("mode".to_string())
+        .or_insert_with(|| json!("default"));
+    let settings = map
+        .entry("settings".to_string())
+        .or_insert_with(|| json!({}));
+    if let Value::Object(settings) = settings {
+        settings.insert("model".to_string(), json!(model));
+        settings.insert("reasoning_effort".to_string(), reasoning_effort.clone());
+        settings
+            .entry("developer_instructions".to_string())
+            .or_insert(Value::Null);
+    }
+    collaboration_mode
+}
+
+fn json_seconds_to_millis(value: Option<&Value>) -> Option<u64> {
+    let seconds = value.and_then(Value::as_f64)?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some((seconds * 1000.0).round() as u64)
+}
+
+fn json_seconds_to_millis_value(value: Option<&Value>) -> Value {
+    json_seconds_to_millis(value)
+        .map(Value::from)
+        .unwrap_or(Value::Null)
+}
+
+fn non_empty_json_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn first_workspace_root(params: &Value) -> Option<String> {
+    params
+        .get("workspaceRoots")
+        .and_then(Value::as_array)
+        .and_then(|roots| {
+            roots
+                .iter()
+                .find_map(|root| non_empty_json_string(Some(root)))
+        })
+}
+
+fn cli_bridge_response_labels(value: &Value) -> String {
+    value
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| cli_bridge_message_labels(messages))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn cli_bridge_message_labels(messages: &[Value]) -> String {
+    if messages.is_empty() {
+        return "-".to_string();
+    }
+    let mut labels = messages
+        .iter()
+        .take(8)
+        .map(cli_bridge_message_label)
+        .collect::<Vec<_>>();
+    if messages.len() > labels.len() {
+        labels.push(format!("+{}", messages.len() - labels.len()));
+    }
+    labels.join(",")
+}
+
+fn cli_bridge_message_label(message: &Value) -> String {
+    let message_type = message.get("type").and_then(Value::as_str).unwrap_or("?");
+    match message_type {
+        "fetch" => bridge_fetch_request(message)
+            .map(|request| format!("fetch:{}", request.endpoint))
+            .unwrap_or_else(|| "fetch:?".to_string()),
+        "fetch-response" => format!(
+            "fetch-response:{}:{}",
+            message
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            message
+                .get("responseType")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        ),
+        "ipc-broadcast" => {
+            let params = message.get("params");
+            let change = params.and_then(|params| params.get("change"));
+            let turn_count = change
+                .and_then(|change| change.get("conversationState"))
+                .and_then(|state| state.get("turns"))
+                .and_then(Value::as_array)
+                .map(|turns| format!(":turns={}", turns.len()))
+                .unwrap_or_default();
+            format!(
+                "ipc-broadcast:{}:{}:{}{}",
+                message.get("method").and_then(Value::as_str).unwrap_or(""),
+                change
+                    .and_then(|change| change.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                params
+                    .and_then(|params| params.get("conversationId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                turn_count
+            )
+        }
+        "mcp-notification" => format!(
+            "mcp-notification:{}",
+            message.get("method").and_then(Value::as_str).unwrap_or("")
+        ),
+        "mcp-request" => format!(
+            "mcp-request:{}",
+            message
+                .get("request")
+                .and_then(|request| request.get("method"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        ),
+        "mcp-response" => format!(
+            "mcp-response:{}",
+            message
+                .get("message")
+                .and_then(|response| response.get("method"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    message
+                        .get("message")
+                        .and_then(|response| response.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn cli_log_message_preview(message: &Value) -> String {
+    let raw = message.to_string();
+    let mut preview = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(1200)
+        .collect::<String>();
+    if raw.chars().count() > preview.chars().count() {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn thread_id_from_thread_start_response(response: &Value) -> Option<String> {
+    response
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn thread_start_response_model(response: &Value) -> Option<Value> {
+    response
+        .get("result")
+        .and_then(|result| result.get("model"))
+        .cloned()
+}
+
+fn copy_json_field(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
+    if let Some(value) = source.get(key) {
+        if !value.is_null() {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn copy_permission_fields(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    if let Some(permissions) = source.get("permissions").and_then(Value::as_object) {
+        copy_json_field(permissions, target, "approvalPolicy");
+        copy_json_field(permissions, target, "sandboxPolicy");
+        copy_json_field(permissions, target, "approvalsReviewer");
+    }
+    copy_json_field(source, target, "approvalPolicy");
+    copy_json_field(source, target, "sandboxPolicy");
+    copy_json_field(source, target, "approvalsReviewer");
+}
+
+fn copy_collaboration_model_fields(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(settings) = source
+        .get("collaborationMode")
+        .and_then(|value| value.get("settings"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    if !target.contains_key("model") {
+        if let Some(model) = settings.get("model").filter(|value| !value.is_null()) {
+            target.insert("model".to_string(), model.clone());
+        }
+    }
+    if !target.contains_key("reasoningEffort") {
+        if let Some(effort) = settings
+            .get("reasoning_effort")
+            .filter(|value| !value.is_null())
+        {
+            target.insert("reasoningEffort".to_string(), effort.clone());
+        }
+    }
+}
+
+fn fetch_response_body_success(request_id: &str, body: Value) -> Value {
+    json!({
+        "type": "fetch-response",
+        "requestId": request_id,
+        "responseType": "success",
+        "status": 200,
+        "headers": { "content-type": "application/json" },
+        "bodyJsonString": body.to_string(),
+    })
+}
+
+fn fetch_response_success(request_id: &str, app_request_id: &str, response: Value) -> Value {
+    let body = match response.get("error") {
+        Some(error) => json!({
+            "requestId": app_request_id,
+            "resultType": "error",
+            "error": error,
+            "type": "response",
+        }),
+        None => json!({
+            "requestId": app_request_id,
+            "result": response.get("result").cloned().unwrap_or(Value::Null),
+            "resultType": "success",
+            "type": "response",
+        }),
+    };
+    json!({
+        "type": "fetch-response",
+        "requestId": request_id,
+        "responseType": "success",
+        "status": 200,
+        "headers": { "content-type": "application/json" },
+        "bodyJsonString": body.to_string(),
+    })
+}
+
+fn fetch_response_error(request_id: &str, error: &str) -> Value {
+    json!({
+        "type": "fetch-response",
+        "requestId": request_id,
+        "responseType": "error",
+        "status": 500,
+        "error": error,
+    })
 }
 
 fn local_device_name() -> String {
@@ -2789,6 +5904,1036 @@ mod tests {
     }
 
     #[test]
+    fn remote_url_includes_web_asset_registry_metadata() {
+        let config = RemoteServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3147,
+            token: "remote-token".to_string(),
+            relay_url: None,
+            relay_connection_id: None,
+            crypto: None,
+            device_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace 1".to_string(),
+            workspace_path: "/tmp/workspace-1".to_string(),
+            cloud_auth: None,
+            web_asset_base_url: Some("https://assets.example.com/codex-web".to_string()),
+            web_asset_version: "latest".to_string(),
+            cdp_host: "127.0.0.1".to_string(),
+            cdp_port: 9222,
+        };
+
+        let url = append_remote_web_asset_params(
+            "http://127.0.0.1:3147/?token=remote-token".to_string(),
+            &config,
+        )
+        .expect("web asset url");
+        let parsed = reqwest::Url::parse(&url).expect("parse url");
+        let pairs = parsed
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            pairs.get("webAssetBaseUrl").map(String::as_str),
+            Some("https://assets.example.com/codex-web")
+        );
+        assert_eq!(
+            pairs.get("webAssetVersion").map(String::as_str),
+            Some("latest")
+        );
+        assert_eq!(
+            pairs.get("webAssetMode").map(String::as_str),
+            Some("registry")
+        );
+    }
+
+    #[test]
+    fn cli_profile_uses_profile_web_asset_registry() {
+        let app_config = AppConfig {
+            remote_web_asset_registry_url: "https://global.example.com".to_string(),
+            remote_web_asset_version: "global".to_string(),
+            ..AppConfig::default()
+        };
+        let profile = ProviderProfile {
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_CLI.to_string(),
+            remote_web_asset_registry_url: "https://profile.example.com/".to_string(),
+            remote_web_asset_version: "26.513.31313".to_string(),
+            ..ProviderProfile::default()
+        };
+
+        assert_eq!(
+            profile_web_asset_base_url(&app_config, Some(&profile)).as_deref(),
+            Some("https://profile.example.com")
+        );
+        assert_eq!(
+            profile_web_asset_version(&app_config, Some(&profile)),
+            "26.513.31313"
+        );
+    }
+
+    #[test]
+    fn app_profile_ignores_web_asset_registry() {
+        let app_config = AppConfig {
+            remote_web_asset_registry_url: "https://global.example.com".to_string(),
+            remote_web_asset_version: "global".to_string(),
+            ..AppConfig::default()
+        };
+        let profile = ProviderProfile {
+            remote_frontend_mode: "app".to_string(),
+            remote_web_asset_registry_url: "https://profile.example.com".to_string(),
+            remote_web_asset_version: "26.513.31313".to_string(),
+            ..ProviderProfile::default()
+        };
+
+        assert_eq!(
+            profile_web_asset_base_url(&app_config, Some(&profile)),
+            None
+        );
+        assert_eq!(
+            profile_web_asset_version(&app_config, Some(&profile)),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn cli_bridge_fetch_parses_dynamic_codex_endpoint() {
+        let request = bridge_fetch_request(&json!({
+            "type": "fetch",
+            "requestId": "fetch-1",
+            "url": "vscode://codex/start-conversation",
+            "body": "{\"hostId\":\"local\",\"cwd\":\"/tmp/project\"}",
+        }))
+        .expect("fetch request");
+
+        assert_eq!(request.endpoint, "start-conversation");
+        assert_eq!(
+            request.body.get("hostId").and_then(Value::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            request.body.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+    }
+
+    #[test]
+    fn cli_codex_fetch_endpoint_params_unwraps_app_action_body() {
+        let body = json!({
+            "params": {
+                "prompt": "Hello Codex",
+                "directoryName": "Manual Session Name"
+            }
+        });
+        let params = codex_fetch_endpoint_params(&body);
+
+        assert_eq!(
+            params.get("prompt").and_then(Value::as_str),
+            Some("Hello Codex")
+        );
+        assert_eq!(
+            params.get("directoryName").and_then(Value::as_str),
+            Some("Manual Session Name")
+        );
+    }
+
+    #[test]
+    fn cli_direct_fetch_response_body_is_not_ipc_wrapped() {
+        let response = fetch_response_body_success(
+            "fetch-1",
+            json!({
+                "cwd": "/Users/alice/Documents/Codex/1970-01-01/hello-0",
+                "outputDirectory": "/Users/alice/Documents/Codex/1970-01-01/hello-0",
+            }),
+        );
+        let body = response
+            .get("bodyJsonString")
+            .and_then(Value::as_str)
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .expect("fetch response body");
+
+        assert_eq!(
+            body.get("outputDirectory").and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
+        );
+        assert_eq!(body.get("result"), None);
+        assert_eq!(body.get("resultType"), None);
+    }
+
+    #[test]
+    fn cli_initialize_request_enables_experimental_api() {
+        let request = cli_app_server_initialize_request();
+
+        assert_eq!(
+            request
+                .get("params")
+                .and_then(|params| params.get("capabilities"))
+                .and_then(|capabilities| capabilities.get("experimentalApi"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cli_frontend_compat_endpoints_return_expected_shapes() {
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "get-copilot-api-proxy-info",
+                &Value::Null,
+                "/tmp/codex-home"
+            ),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "mcp-codex-config",
+                &Value::Null,
+                "/tmp/codex-home"
+            ),
+            Some(json!({ "config": {} }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "developer-instructions",
+                &json!({ "params": { "baseInstructions": "base" } }),
+                "/tmp/codex-home",
+            ),
+            Some(json!({ "instructions": "base" }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "worktree-shell-environment-config",
+                &Value::Null,
+                "/tmp/codex-home",
+            ),
+            Some(json!({ "shellEnvironment": Value::Null }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response("git-origins", &Value::Null, "/tmp/codex-home"),
+            Some(json!({ "origins": [] }))
+        );
+    }
+
+    #[test]
+    fn cli_locale_normalization_ignores_invalid_posix_locale() {
+        assert_eq!(cli_normalize_locale_tag("C"), None);
+        assert_eq!(cli_normalize_locale_tag("C.UTF-8"), None);
+        assert_eq!(cli_normalize_locale_tag("POSIX"), None);
+        assert_eq!(
+            cli_normalize_locale_tag("en_US.UTF-8"),
+            Some("en-US".to_string())
+        );
+        assert_eq!(
+            cli_normalize_locale_tag("zh_CN.UTF-8"),
+            Some("zh-CN".to_string())
+        );
+    }
+
+    #[test]
+    fn cli_paths_exist_response_includes_frontend_existing_paths() {
+        let existing = std::env::current_dir()
+            .expect("current dir")
+            .to_string_lossy()
+            .to_string();
+        let missing = format!("{}/__codexl_missing_path_for_test__", existing);
+        let response = cli_paths_exist_response(&json!({
+            "paths": [existing, missing]
+        }));
+
+        assert_eq!(
+            response
+                .get("existingPaths")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str),
+            Some(existing.as_str())
+        );
+        assert_eq!(
+            response.get("allExist").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cli_global_state_get_and_set_round_trip() {
+        let mut store = HashMap::new();
+
+        assert_eq!(
+            cli_global_state_get_response(
+                &store,
+                &json!({ "params": { "key": "projectless-thread-ids" } }),
+            )
+            .expect("get missing state"),
+            json!({ "value": Value::Null })
+        );
+        assert_eq!(
+            cli_global_state_set_response(
+                &mut store,
+                &json!({
+                    "params": {
+                        "key": "projectless-thread-ids",
+                        "value": ["thread-1"]
+                    }
+                }),
+            )
+            .expect("set state"),
+            json!({ "value": ["thread-1"] })
+        );
+        assert_eq!(
+            cli_global_state_get_response(
+                &store,
+                &json!({ "params": { "key": "projectless-thread-ids" } }),
+            )
+            .expect("get stored state"),
+            json!({ "value": ["thread-1"] })
+        );
+    }
+
+    #[test]
+    fn cli_global_state_set_without_value_removes_key() {
+        let mut store = HashMap::from([(
+            "thread-workspace-root-hints".to_string(),
+            json!({ "thread-1": "/tmp/project" }),
+        )]);
+
+        assert_eq!(
+            cli_global_state_set_response(
+                &mut store,
+                &json!({ "params": { "key": "thread-workspace-root-hints" } }),
+            )
+            .expect("remove missing value"),
+            json!({ "value": Value::Null })
+        );
+        assert_eq!(
+            cli_global_state_get_response(
+                &store,
+                &json!({ "params": { "key": "thread-workspace-root-hints" } }),
+            )
+            .expect("get removed state"),
+            json!({ "value": Value::Null })
+        );
+    }
+
+    #[test]
+    fn cli_projectless_global_state_merges_discovered_ids() {
+        let value = cli_projectless_thread_ids_global_value(
+            json!(["local:thread-1", "thread-2"]),
+            ["thread-2".to_string(), "thread-3".to_string()],
+        );
+
+        assert_eq!(
+            value,
+            json!(["local:thread-1", "local:thread-2", "local:thread-3"])
+        );
+    }
+
+    #[test]
+    fn cli_thread_workspace_root_hints_merge_discovered_projectless_threads() {
+        let value = cli_thread_workspace_root_hints_global_value(
+            json!({ "local:thread-1": "/tmp/project" }),
+            vec![CliProjectlessThreadMetadata {
+                conversation_id: "local:thread-2".to_string(),
+                cwd: "/Users/alice/Documents/Codex/1970-01-01/hello-0".to_string(),
+                workspace_root: "/Users/alice/Documents/Codex".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            value,
+            json!({
+                "local:thread-1": "/tmp/project",
+                "local:thread-2": "/Users/alice/Documents/Codex",
+            })
+        );
+    }
+
+    #[test]
+    fn cli_projectless_cwd_matcher_accepts_codex_documents_patterns() {
+        let root = Path::new("/Users/alice/Documents/Codex");
+
+        assert!(cli_is_projectless_cwd_under_root(
+            Path::new("/Users/alice/Documents/Codex/1970-01-01/hello-0"),
+            root
+        ));
+        assert!(cli_is_projectless_cwd_under_root(
+            Path::new("/Users/alice/Documents/Codex/1970-01-01-hello-0"),
+            root
+        ));
+        assert!(!cli_is_projectless_cwd_under_root(
+            Path::new("/Users/alice/projects/hello"),
+            root
+        ));
+    }
+
+    #[test]
+    fn cli_projectless_session_meta_line_discovers_local_conversation_id() {
+        let home = std::env::var("HOME").expect("HOME");
+        let cwd = Path::new(&home)
+            .join("Documents")
+            .join("Codex")
+            .join("1970-01-01")
+            .join("hello-0");
+        let line = json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "thread-1",
+                "cwd": cwd,
+                "originator": "codexl-remote-cli"
+            }
+        })
+        .to_string();
+
+        let metadata =
+            cli_projectless_thread_from_session_meta_line(&line).expect("projectless metadata");
+        assert_eq!(metadata.conversation_id, "local:thread-1");
+        assert_eq!(
+            metadata.workspace_root,
+            Path::new(&home)
+                .join("Documents")
+                .join("Codex")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn cli_decorates_projectless_thread_response_metadata() {
+        let home = std::env::var("HOME").expect("HOME");
+        let workspace_root = Path::new(&home).join("Documents").join("Codex");
+        let cwd = workspace_root.join("1970-01-01").join("hello-0");
+        let mut response = json!({
+            "jsonrpc": "2.0",
+            "id": "request-1",
+            "result": {
+                "data": [{
+                    "id": "thread-1",
+                    "cwd": cwd,
+                    "createdAt": 0,
+                    "updatedAt": 0
+                }],
+                "nextCursor": Value::Null
+            }
+        });
+
+        decorate_cli_app_server_response("thread/list", &mut response);
+        let thread = response
+            .get("result")
+            .and_then(|result| result.get("data"))
+            .and_then(Value::as_array)
+            .and_then(|threads| threads.first())
+            .expect("thread");
+
+        assert_eq!(
+            thread.get("workspaceKind").and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            thread.get("workspaceBrowserRoot").and_then(Value::as_str),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            thread
+                .get("projectlessOutputDirectory")
+                .and_then(Value::as_str),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn cli_thread_start_params_strip_host_and_copy_permissions() {
+        let params = cli_thread_start_params(json!({
+            "hostId": "local",
+            "cwd": "/tmp/project",
+            "permissions": {
+                "approvalPolicy": "on-request",
+                "sandboxPolicy": { "mode": "workspace-write" },
+                "approvalsReviewer": "user"
+            },
+            "collaborationMode": {
+                "settings": {
+                    "model": "gpt-5.3-codex",
+                    "reasoning_effort": "medium"
+                }
+            },
+            "additionalDeveloperInstructions": "extra instructions"
+        }));
+
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(
+            params.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            params.get("approvalPolicy").and_then(Value::as_str),
+            Some("on-request")
+        );
+        assert_eq!(
+            params.get("approvalsReviewer").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            params.get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            params.get("reasoningEffort").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            params.get("developerInstructions").and_then(Value::as_str),
+            Some("extra instructions")
+        );
+        assert_eq!(
+            params.get("threadSource").and_then(Value::as_str),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn cli_thread_start_params_drop_dynamic_tools_without_experimental_capability() {
+        let params = cli_thread_start_params(json!({
+            "hostId": "local",
+            "cwd": "/tmp/project",
+            "model": "gpt-5.3-codex",
+            "modelProvider": "openai",
+            "developerInstructions": "base instructions",
+            "dynamicTools": null,
+            "experimentalRawEvents": false,
+            "mockExperimentalField": null,
+            "sandbox": { "type": "workspaceWrite", "writableRoots": ["/tmp/project"] },
+            "personality": "pragmatic",
+            "persistExtendedHistory": true
+        }));
+
+        assert_eq!(params.get("dynamicTools"), None);
+        assert_eq!(params.get("experimentalRawEvents"), None);
+        assert_eq!(params.get("mockExperimentalField"), None);
+        assert_eq!(
+            params.get("modelProvider").and_then(Value::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            params.get("developerInstructions").and_then(Value::as_str),
+            Some("base instructions")
+        );
+        assert_eq!(
+            params
+                .get("sandbox")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            params.get("personality").and_then(Value::as_str),
+            Some("pragmatic")
+        );
+        assert_eq!(
+            params
+                .get("persistExtendedHistory")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cli_app_server_method_params_normalizes_thread_start() {
+        let params = cli_app_server_method_params(
+            "thread/start",
+            json!({
+                "hostId": "local",
+                "cwd": "/tmp/project",
+                "dynamicTools": []
+            }),
+        );
+
+        assert_eq!(
+            params.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(params.get("dynamicTools"), None);
+    }
+
+    #[test]
+    fn cli_app_server_method_params_normalizes_turn_start() {
+        let params = cli_app_server_method_params(
+            "turn/start",
+            json!({
+                "hostId": "local",
+                "threadId": "thread-1",
+                "cwd": "/tmp/project",
+                "input": [{ "type": "text", "text": "hello", "text_elements": [] }],
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-5.3-codex",
+                        "reasoning_effort": "medium"
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params.get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            params.get("reasoningEffort").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(params.get("collaborationMode"), None);
+    }
+
+    #[test]
+    fn cli_app_server_method_params_normalizes_thread_resume() {
+        let params = cli_app_server_method_params(
+            "thread/resume",
+            json!({
+                "hostId": "local",
+                "threadId": "0123456789abcdef0123456789abcdef",
+                "path": "/Users/alice/.codex/sessions/thread.jsonl",
+                "cwd": "/tmp/project",
+                "excludeTurns": true,
+                "config": { "model_reasoning_effort": "medium" },
+                "sandbox": { "type": "workspaceWrite", "writableRoots": ["/tmp/project"] },
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-5.3-codex",
+                        "reasoning_effort": "medium"
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            params.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            params.get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            params.get("reasoningEffort").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(
+            params.get("path").and_then(Value::as_str),
+            Some("/Users/alice/.codex/sessions/thread.jsonl")
+        );
+        assert_eq!(
+            params.get("excludeTurns").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            params
+                .get("sandbox")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("workspaceWrite")
+        );
+        assert_eq!(params.get("collaborationMode"), None);
+    }
+
+    #[test]
+    fn cli_thread_resume_params_maps_conversation_id_to_thread_id() {
+        let params = cli_thread_resume_params(json!({
+            "conversationId": "0123456789abcdef0123456789abcdef",
+            "path": "/Users/alice/.codex/sessions/thread.jsonl"
+        }));
+
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(params.get("conversationId"), None);
+        assert_eq!(
+            params.get("path").and_then(Value::as_str),
+            Some("/Users/alice/.codex/sessions/thread.jsonl")
+        );
+    }
+
+    #[test]
+    fn cli_maybe_resume_params_uses_thread_metadata_and_excludes_turns() {
+        let params = cli_maybe_resume_params(
+            &json!({
+                "hostId": "local",
+                "conversationId": "thread-1",
+                "workspaceKind": "project"
+            }),
+            Some(&json!({
+                "path": "/Users/alice/.codex/sessions/thread.jsonl",
+                "cwd": "/tmp/project"
+            })),
+            "thread-1",
+        );
+
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(params.get("conversationId"), None);
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params.get("path").and_then(Value::as_str),
+            Some("/Users/alice/.codex/sessions/thread.jsonl")
+        );
+        assert_eq!(
+            params.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            params
+                .get("workspaceRoots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            params.get("excludeTurns").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cli_conversation_snapshot_message_contains_tail_turns_and_pagination() {
+        let turns_page = CliThreadTurnsPage {
+            next_cursor: json!("cursor-1"),
+            turns: vec![json!({
+                "id": "turn-1",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "id": "item-1",
+                        "content": [{ "type": "text", "text": "hello", "text_elements": [] }]
+                    },
+                    {
+                        "type": "agentMessage",
+                        "id": "item-2",
+                        "text": "hi",
+                        "phase": "final_answer"
+                    }
+                ],
+                "status": "completed",
+                "startedAt": 10,
+                "completedAt": 12,
+                "durationMs": 2000
+            })],
+        };
+
+        let message = cli_conversation_snapshot_message(
+            "thread-1",
+            &json!({
+                "thread": {
+                    "id": "thread-1",
+                    "name": "Test thread",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "path": "/Users/alice/.codex/sessions/thread.jsonl",
+                    "cwd": "/tmp/project",
+                    "status": { "type": "idle" },
+                    "modelProvider": "openai"
+                },
+                "model": "gpt-5.3-codex",
+                "reasoningEffort": "medium",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": { "type": "workspaceWrite", "writableRoots": ["/tmp/project"] },
+                "cwd": "/tmp/project"
+            }),
+            &turns_page,
+            &json!({
+                "workspaceKind": "project",
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-5.3-codex",
+                        "reasoning_effort": "medium"
+                    }
+                }
+            }),
+        )
+        .expect("snapshot");
+
+        assert_eq!(
+            message.get("method").and_then(Value::as_str),
+            Some("thread-stream-state-changed")
+        );
+        let state = message
+            .pointer("/params/change/conversationState")
+            .expect("conversation state");
+        assert_eq!(state.get("id").and_then(Value::as_str), Some("thread-1"));
+        assert_eq!(
+            state.get("resumeState").and_then(Value::as_str),
+            Some("resumed")
+        );
+        assert_eq!(
+            state
+                .pointer("/turns/0/params/input/0/text")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            state
+                .pointer("/turns/0/turnStartedAtMs")
+                .and_then(Value::as_u64),
+            Some(10_000)
+        );
+        assert_eq!(
+            state
+                .pointer("/turnsPagination/olderCursor")
+                .and_then(Value::as_str),
+            Some("cursor-1")
+        );
+        assert_eq!(
+            state
+                .pointer("/turnsPagination/hasLoadedOldest")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cli_conversation_snapshot_message_infers_projectless_workspace_from_cwd() {
+        let home = std::env::var("HOME").expect("HOME");
+        let workspace_root = Path::new(&home).join("Documents").join("Codex");
+        let cwd = workspace_root.join("1970-01-01").join("hello-0");
+        let turns_page = CliThreadTurnsPage {
+            next_cursor: Value::Null,
+            turns: Vec::new(),
+        };
+
+        let message = cli_conversation_snapshot_message(
+            "thread-1",
+            &json!({
+                "thread": {
+                    "id": "thread-1",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "cwd": cwd,
+                    "status": { "type": "idle" }
+                },
+                "model": "gpt-5.3-codex"
+            }),
+            &turns_page,
+            &json!({}),
+        )
+        .expect("snapshot");
+
+        let state = message
+            .pointer("/params/change/conversationState")
+            .expect("conversation state");
+        assert_eq!(
+            state.get("workspaceKind").and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            state.get("workspaceBrowserRoot").and_then(Value::as_str),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn cli_app_server_request_normalization_covers_mcp_thread_start() {
+        let mut request = json!({
+            "id": "request-1",
+            "method": "thread/start",
+            "params": {
+                "hostId": "local",
+                "cwd": "/tmp/project",
+                "modelProvider": "openai",
+                "dynamicTools": [],
+                "experimentalRawEvents": false
+            }
+        });
+
+        normalize_cli_app_server_request(&mut request);
+        let params = request.get("params").expect("params");
+
+        assert_eq!(
+            params.get("cwd").and_then(Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            params.get("modelProvider").and_then(Value::as_str),
+            Some("openai")
+        );
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(params.get("dynamicTools"), None);
+        assert_eq!(params.get("experimentalRawEvents"), None);
+    }
+
+    #[test]
+    fn cli_app_server_request_normalization_covers_mcp_thread_resume() {
+        let mut request = json!({
+            "id": "request-1",
+            "method": "thread/resume",
+            "params": {
+                "hostId": "local",
+                "threadId": "0123456789abcdef0123456789abcdef",
+                "path": "/Users/alice/.codex/sessions/thread.jsonl",
+                "excludeTurns": true
+            }
+        });
+
+        normalize_cli_app_server_request(&mut request);
+        let params = request.get("params").expect("params");
+
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(
+            params.get("path").and_then(Value::as_str),
+            Some("/Users/alice/.codex/sessions/thread.jsonl")
+        );
+        assert_eq!(
+            params.get("excludeTurns").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cli_app_server_request_normalization_covers_mcp_turn_start() {
+        let mut request = json!({
+            "id": "request-1",
+            "method": "turn/start",
+            "params": {
+                "hostId": "local",
+                "threadId": "thread-1",
+                "cwd": "/tmp/project",
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-5.3-codex",
+                        "reasoning_effort": "medium"
+                    }
+                }
+            }
+        });
+
+        normalize_cli_app_server_request(&mut request);
+        let params = request.get("params").expect("params");
+
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params.get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(params.get("hostId"), None);
+        assert_eq!(params.get("collaborationMode"), None);
+    }
+
+    #[test]
+    fn cli_thread_start_params_preserve_projectless_output_directory() {
+        let params = cli_thread_start_params(json!({
+            "hostId": "local",
+            "workspaceKind": "projectless",
+            "cwd": "/Users/alice/Documents/Codex/1970-01-01/hello-0",
+            "workspaceRoots": ["/Users/alice/Documents/Codex"],
+            "projectlessOutputDirectory": "/Users/alice/Documents/Codex/1970-01-01/hello-0",
+            "additionalDeveloperInstructions": "extra instructions"
+        }));
+
+        assert_eq!(
+            params.get("workspaceKind").and_then(Value::as_str),
+            Some("projectless")
+        );
+        assert_eq!(
+            params
+                .get("projectlessOutputDirectory")
+                .and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
+        );
+        assert_eq!(
+            params.get("cwd").and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
+        );
+        let instructions = params
+            .get("developerInstructions")
+            .and_then(Value::as_str)
+            .expect("developer instructions");
+        assert!(instructions.contains("extra instructions"));
+        assert!(
+            instructions.contains(
+                "write scratch files, drafts, generated assets, and other outputs under /Users/alice/Documents/Codex/1970-01-01/hello-0"
+            )
+        );
+    }
+
+    #[test]
+    fn projectless_thread_cwd_uses_codex_documents_root() {
+        let (cwd, workspace_root) =
+            projectless_thread_paths_for_home(Path::new("/Users/alice"), "Hello Codex", 0);
+
+        assert_eq!(
+            workspace_root,
+            PathBuf::from("/Users/alice/Documents/Codex")
+        );
+        assert_eq!(
+            cwd,
+            PathBuf::from("/Users/alice/Documents/Codex/1970-01-01/hello-codex-0")
+        );
+    }
+
+    #[test]
+    fn projectless_thread_cwd_response_includes_frontend_output_directory() {
+        let response = projectless_thread_cwd_response(
+            Path::new("/Users/alice/Documents/Codex/1970-01-01/hello-0"),
+            Path::new("/Users/alice/Documents/Codex"),
+        );
+
+        assert_eq!(
+            response.get("cwd").and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
+        );
+        assert_eq!(
+            response.get("workspaceRoot").and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex")
+        );
+        assert_eq!(
+            response
+                .get("projectlessOutputDirectory")
+                .and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
+        );
+        assert_eq!(
+            response.get("outputDirectory").and_then(Value::as_str),
+            Some("/Users/alice/Documents/Codex/1970-01-01/hello-0")
+        );
+    }
+
+    #[test]
+    fn projectless_slug_is_ascii_and_has_fallback() {
+        assert_eq!(
+            sanitize_projectless_path_segment("Hello Codex"),
+            "hello-codex"
+        );
+        assert_eq!(sanitize_projectless_path_segment("测试一下"), "");
+
+        let (cwd, _) = projectless_thread_paths_for_home(Path::new("/tmp/home"), "测试一下", 0);
+        assert_eq!(
+            cwd,
+            PathBuf::from("/tmp/home/Documents/Codex/1970-01-01/chat-0")
+        );
+    }
+
+    #[test]
     fn relay_metadata_includes_device_uuid() {
         let config = RemoteServerConfig {
             host: "127.0.0.1".to_string(),
@@ -2802,6 +6947,8 @@ mod tests {
             workspace_name: "Workspace 1".to_string(),
             workspace_path: "/tmp/workspace-1".to_string(),
             cloud_auth: None,
+            web_asset_base_url: None,
+            web_asset_version: "latest".to_string(),
             cdp_host: "127.0.0.1".to_string(),
             cdp_port: 9222,
         };
@@ -2837,6 +6984,8 @@ mod tests {
             workspace_name: "Workspace 1".to_string(),
             workspace_path: "/tmp/workspace-1".to_string(),
             cloud_auth: None,
+            web_asset_base_url: None,
+            web_asset_version: "latest".to_string(),
             cdp_host: "127.0.0.1".to_string(),
             cdp_port: 9222,
         });

@@ -168,6 +168,8 @@ fn web_bridge_script_prefers_webtransport_with_websocket_fallback() {
     assert!(WEB_BRIDGE_SCRIPT.contains("falling back to WebSocket"));
     assert!(WEB_BRIDGE_SCRIPT.contains("codexBridgeUrl"));
     assert!(WEB_BRIDGE_SCRIPT.contains("codexBridgeTransportUrl"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codexBridgeParent"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codex-web-parent-bridge-open"));
     assert!(WEB_BRIDGE_SCRIPT.contains(r#"pageParams.get("token")"#));
     assert!(WEB_BRIDGE_SCRIPT.contains("scheduleBridgeReconnect"));
     assert!(WEB_BRIDGE_SCRIPT.contains("bridgeConnectionStarted"));

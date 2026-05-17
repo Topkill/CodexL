@@ -1073,9 +1073,9 @@ fn node_package_for(os: &str, arch: &str) -> Result<NodePackage, String> {
         "x86_64" => "x64",
         other => {
             return Err(format!(
-                "automatic Node.js download is not supported on {} {}; install Node.js {}+ and retry",
-                platform, other, MIN_NODE_MAJOR
-            ))
+            "automatic Node.js download is not supported on {} {}; install Node.js {}+ and retry",
+            platform, other, MIN_NODE_MAJOR
+        ))
         }
     };
     let extension = if platform == "win" { "zip" } else { "tar.gz" };

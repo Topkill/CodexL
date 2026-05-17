@@ -29,7 +29,7 @@ import { decodeCodexQrFromVideo } from "../qrDecoder.js";
 
 const INSTANCE_STORAGE_KEY = "codexl-remote.instances";
 const REMOTE_MODE_WEB = "web";
-const PWA_BUILD = "20260513-local-bridge-plain-v2";
+const PWA_BUILD = "20260516-codex-web-registry-v2";
 const SERVICE_WORKER_URL = `service-worker.js?v=${PWA_BUILD}`;
 const SPRING_TRANSITION = { damping: 30, mass: 0.72, stiffness: 430, type: "spring" } as const;
 const SOFT_SPRING_TRANSITION = { damping: 34, mass: 0.85, stiffness: 300, type: "spring" } as const;
@@ -43,6 +43,8 @@ type Connection = {
   remoteMode?: string;
   token?: string;
   url: string;
+  webAssetBaseUrl?: string;
+  webAssetVersion?: string;
 };
 
 type RemoteInstance = {
@@ -56,6 +58,8 @@ type RemoteInstance = {
   token: string;
   updatedAt: number;
   url: string;
+  webAssetBaseUrl?: string;
+  webAssetVersion?: string;
 };
 
 type NativeQrDetector = {
@@ -665,6 +669,7 @@ const InstanceCard = forwardRef<HTMLDivElement, InstanceCardProps>(function Inst
 
         <CardContent className="grid gap-1 p-0 text-xs leading-relaxed text-muted-foreground">
           <div>Mode: {remoteModeLabel(instance.remoteMode)}</div>
+          {instance.webAssetBaseUrl ? <div>Bundle: {instance.webAssetVersion || "latest"}</div> : null}
           <div>Last connected: {formatTime(instance.lastConnectedAt)}</div>
         </CardContent>
 
@@ -794,6 +799,8 @@ function normalizeStoredInstance(instance: unknown): RemoteInstance | null {
       remoteMode: typeof stored.remoteMode === "string" ? stored.remoteMode : "",
       token: typeof stored.token === "string" ? stored.token : "",
       url: typeof stored.url === "string" ? stored.url : "",
+      webAssetBaseUrl: typeof stored.webAssetBaseUrl === "string" ? stored.webAssetBaseUrl : "",
+      webAssetVersion: typeof stored.webAssetVersion === "string" ? stored.webAssetVersion : "",
     },
     {
       existing: {
@@ -862,6 +869,8 @@ function upsertInstanceFromConnection(
       token: candidate.token,
       updatedAt: Date.now(),
       url: candidate.url,
+      webAssetBaseUrl: candidate.webAssetBaseUrl,
+      webAssetVersion: candidate.webAssetVersion,
     };
     return {
       instance: updated,
@@ -893,6 +902,12 @@ function buildInstanceFromConnection(
   if (connection.jwt) {
     connectionUrl.searchParams.set("jwt", connection.jwt);
   }
+  const nextWebAssetBaseUrl = connectionWebAssetBaseUrl(connection, connectionUrl);
+  const nextWebAssetVersion = connectionWebAssetVersion(connection, connectionUrl);
+  if (nextWebAssetBaseUrl) {
+    connectionUrl.searchParams.set("webAssetBaseUrl", nextWebAssetBaseUrl);
+    connectionUrl.searchParams.set("webAssetVersion", nextWebAssetVersion);
+  }
 
   const now = Date.now();
   const remoteMode = normalizeRemoteMode(
@@ -915,6 +930,8 @@ function buildInstanceFromConnection(
     token: nextToken,
     updatedAt: now,
     url: connectionUrl.toString(),
+    webAssetBaseUrl: nextWebAssetBaseUrl,
+    webAssetVersion: nextWebAssetVersion,
   };
 }
 
@@ -961,7 +978,7 @@ function statusKind(status: string) {
   if (normalized.includes("disconnect") || normalized.includes("retry")) {
     return "retrying";
   }
-  if (normalized.includes("connecting")) {
+  if (normalized.includes("connecting") || normalized.includes("loading") || normalized.includes("preparing")) {
     return "connecting";
   }
   if (normalized.includes("cdp connected")) {
@@ -1005,6 +1022,8 @@ function connectionFromUrlParams(params: URLSearchParams): Connection | null {
     remoteMode: params.get("remoteMode") || params.get("mode") || "",
     token: directToken,
     url: location.href,
+    webAssetBaseUrl: params.get("webAssetBaseUrl") || params.get("web_asset_base_url") || "",
+    webAssetVersion: params.get("webAssetVersion") || params.get("web_asset_version") || "",
   };
 }
 
@@ -1033,6 +1052,18 @@ function parseConnection(raw: string): Connection | null {
                 : connection.remoteMode,
           token: typeof parsed.token === "string" ? parsed.token : connection.token,
           url: connection.url,
+          webAssetBaseUrl:
+            typeof parsed.webAssetBaseUrl === "string"
+              ? parsed.webAssetBaseUrl
+              : typeof parsed.web_asset_base_url === "string"
+                ? parsed.web_asset_base_url
+                : connection.webAssetBaseUrl,
+          webAssetVersion:
+            typeof parsed.webAssetVersion === "string"
+              ? parsed.webAssetVersion
+              : typeof parsed.web_asset_version === "string"
+                ? parsed.web_asset_version
+                : connection.webAssetVersion,
         };
       }
 
@@ -1057,12 +1088,30 @@ function parseConnection(raw: string): Connection | null {
         if (parsedMode) {
           url.searchParams.set("remoteMode", parsedMode);
         }
+        const parsedWebAssetBaseUrl =
+          typeof parsed.webAssetBaseUrl === "string"
+            ? parsed.webAssetBaseUrl
+            : typeof parsed.web_asset_base_url === "string"
+              ? parsed.web_asset_base_url
+              : "";
+        const parsedWebAssetVersion =
+          typeof parsed.webAssetVersion === "string"
+            ? parsed.webAssetVersion
+            : typeof parsed.web_asset_version === "string"
+              ? parsed.web_asset_version
+              : "";
+        if (parsedWebAssetBaseUrl) {
+          url.searchParams.set("webAssetBaseUrl", parsedWebAssetBaseUrl);
+          url.searchParams.set("webAssetVersion", parsedWebAssetVersion || "latest");
+        }
         return {
           cloudUser: typeof parsed.cloudUser === "string" ? parsed.cloudUser : "",
           jwt: typeof parsed.jwt === "string" ? parsed.jwt : "",
           remoteMode: parsedMode,
           token: typeof parsed.token === "string" ? parsed.token : "",
           url: url.toString(),
+          webAssetBaseUrl: parsedWebAssetBaseUrl,
+          webAssetVersion: parsedWebAssetVersion,
         };
       }
     }
@@ -1078,6 +1127,8 @@ function parseConnection(raw: string): Connection | null {
       remoteMode: url.searchParams.get("remoteMode") || url.searchParams.get("mode") || "",
       token: url.searchParams.get("token") || "",
       url: url.toString(),
+      webAssetBaseUrl: url.searchParams.get("webAssetBaseUrl") || url.searchParams.get("web_asset_base_url") || "",
+      webAssetVersion: url.searchParams.get("webAssetVersion") || url.searchParams.get("web_asset_version") || "",
     };
   } catch {
     return null;
@@ -1090,6 +1141,47 @@ function normalizeConnectionUrl(value: string) {
     throw new Error("Unsupported connection protocol");
   }
   return url;
+}
+
+function connectionWebAssetBaseUrl(connection: Connection, connectionUrl: URL) {
+  return normalizeWebAssetBaseUrl(
+    connection.webAssetBaseUrl ||
+      connectionUrl.searchParams.get("webAssetBaseUrl") ||
+      connectionUrl.searchParams.get("web_asset_base_url") ||
+      "",
+  );
+}
+
+function connectionWebAssetVersion(connection: Connection, connectionUrl: URL) {
+  return normalizeWebAssetVersion(
+    connection.webAssetVersion ||
+      connectionUrl.searchParams.get("webAssetVersion") ||
+      connectionUrl.searchParams.get("web_asset_version") ||
+      "latest",
+  );
+}
+
+function normalizeWebAssetBaseUrl(value: string | undefined) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    const url = new URL(raw, location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function normalizeWebAssetVersion(value: string | undefined) {
+  const version = String(value || "").trim() || "latest";
+  return /^[0-9A-Za-z._-]+$/.test(version) ? version : "latest";
 }
 
 function normalizeRemoteMode(_mode: string | undefined) {
@@ -1129,6 +1221,7 @@ function instanceSearchText(instance: RemoteInstance) {
       instance.host,
       hostFromConnectionUrl(instance.url),
       remoteModeLabel(instance.remoteMode),
+      instance.webAssetVersion || "",
       instance.status || "Not connected",
     ].join(" "),
   );

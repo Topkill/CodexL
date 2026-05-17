@@ -5,6 +5,9 @@ fn main() {
     if codexl_lib::run_cli_middleware_if_requested() {
         return;
     }
+    if codexl_lib::run_cli_if_requested() {
+        return;
+    }
 
     codexl_lib::run()
 }

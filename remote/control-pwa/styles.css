@@ -470,6 +470,10 @@ textarea {
   min-width: 86px;
 }
 
+.web-asset-version-select {
+  min-width: 116px;
+}
+
 .zoom-control {
   align-items: center;
   display: inline-flex;

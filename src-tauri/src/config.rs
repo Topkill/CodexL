@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::extensions::builtins::gateway::config as gateway_config;
 
 pub const DEFAULT_PROVIDER_PROFILE_NAME: &str = "Default";
+pub const REMOTE_FRONTEND_MODE_APP: &str = "app";
+pub const REMOTE_FRONTEND_MODE_CLI: &str = "cli";
 pub const BOT_PLATFORM_NONE: &str = "none";
 pub const BOT_PLATFORM_SLACK: &str = "slack";
 pub const BOT_PLATFORM_DISCORD: &str = "discord";
@@ -49,6 +51,9 @@ pub struct ProviderProfile {
     pub base_url: String,
     pub model: String,
     pub proxy_url: String,
+    pub remote_frontend_mode: String,
+    pub remote_web_asset_registry_url: String,
+    pub remote_web_asset_version: String,
     pub codex_home: String,
     pub start_remote_on_launch: bool,
     pub start_remote_cloud_on_launch: bool,
@@ -68,6 +73,9 @@ impl Default for ProviderProfile {
             base_url: String::new(),
             model: String::new(),
             proxy_url: String::new(),
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: "latest".to_string(),
             codex_home: String::new(),
             start_remote_on_launch: false,
             start_remote_cloud_on_launch: false,
@@ -88,6 +96,12 @@ pub struct NewProviderRequest {
     #[serde(default)]
     pub proxy_url: String,
     #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
+    #[serde(default)]
     pub bot: BotProfileConfig,
 }
 
@@ -98,6 +112,12 @@ pub struct NextAiGatewayProviderRequest {
     pub model: String,
     #[serde(default)]
     pub proxy_url: String,
+    #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
     #[serde(default)]
     pub bot: BotProfileConfig,
 }
@@ -111,6 +131,12 @@ pub struct UpdateNextAiGatewayProviderRequest {
     #[serde(default)]
     pub proxy_url: String,
     #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
+    #[serde(default)]
     pub bot: BotProfileConfig,
 }
 
@@ -123,6 +149,12 @@ pub struct ExistingProviderRequest {
     pub model: String,
     #[serde(default)]
     pub proxy_url: String,
+    #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
     #[serde(default)]
     pub bot: BotProfileConfig,
 }
@@ -138,6 +170,12 @@ pub struct UpdateProviderRequest {
     #[serde(default)]
     pub proxy_url: String,
     #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
+    #[serde(default)]
     pub bot: BotProfileConfig,
 }
 
@@ -146,6 +184,12 @@ pub struct WorkspaceRequest {
     pub workspace_name: String,
     #[serde(default)]
     pub proxy_url: String,
+    #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
     #[serde(default)]
     pub bot: BotProfileConfig,
 }
@@ -156,6 +200,12 @@ pub struct UpdateWorkspaceRequest {
     pub workspace_name: String,
     #[serde(default)]
     pub proxy_url: String,
+    #[serde(default)]
+    pub remote_frontend_mode: String,
+    #[serde(default)]
+    pub remote_web_asset_registry_url: String,
+    #[serde(default)]
+    pub remote_web_asset_version: String,
     #[serde(default)]
     pub bot: BotProfileConfig,
 }
@@ -401,6 +451,9 @@ impl DefaultProviderProfile {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             proxy_url: String::new(),
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: "latest".to_string(),
             codex_home: String::new(),
             start_remote_on_launch: false,
             start_remote_cloud_on_launch: false,
@@ -455,6 +508,8 @@ pub struct AppConfig {
     pub remote_control_host: String,
     pub remote_control_port: u16,
     pub remote_relay_url: String,
+    pub remote_web_asset_registry_url: String,
+    pub remote_web_asset_version: String,
     pub device_uuid: String,
     pub remote_cloud_auth: RemoteCloudAuthConfig,
     pub language: String,
@@ -480,6 +535,8 @@ impl Default for AppConfig {
             remote_control_host: env_string("CODEXL_REMOTE_CONTROL_HOST", "0.0.0.0"),
             remote_control_port: env_u16("CODEXL_REMOTE_CONTROL_PORT", 3147),
             remote_relay_url: env_string("CODEXL_REMOTE_RELAY_URL", ""),
+            remote_web_asset_registry_url: env_string("CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL", ""),
+            remote_web_asset_version: env_string("CODEXL_REMOTE_WEB_ASSET_VERSION", "latest"),
             device_uuid: env_string("CODEXL_DEVICE_UUID", ""),
             remote_cloud_auth: RemoteCloudAuthConfig::from_env(),
             language: env_string("CODEXL_LANGUAGE", "en"),
@@ -525,6 +582,13 @@ impl AppConfig {
             .trim()
             .trim_end_matches('/')
             .to_string();
+        self.remote_web_asset_registry_url = self
+            .remote_web_asset_registry_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        self.remote_web_asset_version =
+            normalized_remote_web_asset_version(&self.remote_web_asset_version);
         self.device_uuid = self.device_uuid.trim().to_ascii_lowercase();
         if !is_uuid_like(&self.device_uuid) {
             self.device_uuid = new_uuid_v4();
@@ -696,6 +760,13 @@ impl AppConfig {
             {
                 existing.bot = profile.bot;
                 existing.proxy_url = profile.proxy_url.trim().to_string();
+                existing.remote_frontend_mode =
+                    normalized_remote_frontend_mode(&profile.remote_frontend_mode);
+                existing.remote_web_asset_registry_url = normalized_remote_web_asset_registry_url(
+                    &profile.remote_web_asset_registry_url,
+                );
+                existing.remote_web_asset_version =
+                    normalized_remote_web_asset_version(&profile.remote_web_asset_version);
                 let profile_id = existing.id.clone();
                 existing
                     .bot
@@ -781,8 +852,8 @@ impl AppConfig {
         let next_start_cloud = next_start_remote && start_cloud;
         let next_start_e2ee = next_start_remote && next_start_cloud;
         let next_password = if next_start_e2ee {
-            let password = remote_e2ee_password
-                .unwrap_or_else(|| profile.remote_e2ee_password.clone());
+            let password =
+                remote_e2ee_password.unwrap_or_else(|| profile.remote_e2ee_password.clone());
             if password.is_empty() {
                 return Err("End-to-end encrypted remote control requires a password.".to_string());
             }
@@ -995,11 +1066,20 @@ pub fn add_existing_provider_profile(
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.profile_name)?;
     let bot = input.bot.clone();
     let proxy_url = input.proxy_url.trim().to_string();
+    let remote_frontend_mode = input.remote_frontend_mode.clone();
+    let remote_web_asset_registry_url = input.remote_web_asset_registry_url.clone();
+    let remote_web_asset_version = input.remote_web_asset_version.clone();
     let provider = update_existing_default_provider(input)?;
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
     profile.codex_profile_name = provider.name.clone();
     profile.proxy_url = proxy_url;
+    apply_remote_frontend_options(
+        &mut profile,
+        &remote_frontend_mode,
+        &remote_web_asset_registry_url,
+        &remote_web_asset_version,
+    );
     profile.bot = bot;
     profile.bot.normalize_for_profile(&profile.name);
     write_codex_home_config(&provider, &generated_codex_home(&profile), false)?;
@@ -1007,7 +1087,14 @@ pub fn add_existing_provider_profile(
 }
 
 pub fn create_workspace_profile(input: WorkspaceRequest) -> Result<ProviderProfile, String> {
-    let profile = workspace_profile(input.workspace_name, input.proxy_url, input.bot)?;
+    let profile = workspace_profile(
+        input.workspace_name,
+        input.proxy_url,
+        input.remote_frontend_mode,
+        input.remote_web_asset_registry_url,
+        input.remote_web_asset_version,
+        input.bot,
+    )?;
     write_providerless_codex_home_config(&profile)?;
     Ok(profile)
 }
@@ -1021,6 +1108,12 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
         clear_default_codex_home_top_level_model_config()?;
         let mut profile = default_provider_profile();
         profile.proxy_url = input.proxy_url.trim().to_string();
+        apply_remote_frontend_options(
+            &mut profile,
+            &input.remote_frontend_mode,
+            &input.remote_web_asset_registry_url,
+            &input.remote_web_asset_version,
+        );
         profile.bot = input.bot;
         let profile_id = profile.id.clone();
         profile
@@ -1029,7 +1122,14 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
         return Ok(profile);
     }
 
-    let profile = workspace_profile(input.workspace_name, input.proxy_url, input.bot)?;
+    let profile = workspace_profile(
+        input.workspace_name,
+        input.proxy_url,
+        input.remote_frontend_mode,
+        input.remote_web_asset_registry_url,
+        input.remote_web_asset_version,
+        input.bot,
+    )?;
     write_providerless_codex_home_config(&profile)?;
     Ok(profile)
 }
@@ -1040,6 +1140,9 @@ pub fn update_existing_provider_profile(
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.profile_name)?;
     let bot = input.bot.clone();
     let proxy_url = input.proxy_url.trim().to_string();
+    let remote_frontend_mode = input.remote_frontend_mode.clone();
+    let remote_web_asset_registry_url = input.remote_web_asset_registry_url.clone();
+    let remote_web_asset_version = input.remote_web_asset_version.clone();
     let provider = update_existing_default_provider(ExistingProviderRequest {
         workspace_name: workspace_name.clone(),
         profile_name: input.profile_name,
@@ -1047,12 +1150,21 @@ pub fn update_existing_provider_profile(
         api_key: input.api_key,
         model: input.model,
         proxy_url: String::new(),
+        remote_frontend_mode: String::new(),
+        remote_web_asset_registry_url: String::new(),
+        remote_web_asset_version: String::new(),
         bot: BotProfileConfig::default(),
     })?;
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
     profile.codex_profile_name = provider.name.clone();
     profile.proxy_url = proxy_url;
+    apply_remote_frontend_options(
+        &mut profile,
+        &remote_frontend_mode,
+        &remote_web_asset_registry_url,
+        &remote_web_asset_version,
+    );
     profile.bot = bot;
     profile.bot.normalize_for_profile(&profile.name);
     write_codex_home_config(&provider, &generated_codex_home(&profile), false)?;
@@ -1095,6 +1207,12 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
     profile.name = workspace_name;
     profile.codex_profile_name = provider.name.clone();
     profile.proxy_url = input.proxy_url.trim().to_string();
+    apply_remote_frontend_options(
+        &mut profile,
+        &input.remote_frontend_mode,
+        &input.remote_web_asset_registry_url,
+        &input.remote_web_asset_version,
+    );
     profile.bot = input.bot;
     profile.bot.normalize_for_profile(&profile.name);
     write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
@@ -1113,6 +1231,12 @@ pub fn create_next_ai_gateway_provider(
     profile.name = workspace_name;
     profile.codex_profile_name = provider.name.clone();
     profile.proxy_url = input.proxy_url.trim().to_string();
+    apply_remote_frontend_options(
+        &mut profile,
+        &input.remote_frontend_mode,
+        &input.remote_web_asset_registry_url,
+        &input.remote_web_asset_version,
+    );
     profile.bot = input.bot;
     profile.bot.normalize_for_profile(&profile.name);
     write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
@@ -1131,6 +1255,12 @@ pub fn update_next_ai_gateway_provider_profile(
     profile.name = workspace_name;
     profile.codex_profile_name = provider.name.clone();
     profile.proxy_url = input.proxy_url.trim().to_string();
+    apply_remote_frontend_options(
+        &mut profile,
+        &input.remote_frontend_mode,
+        &input.remote_web_asset_registry_url,
+        &input.remote_web_asset_version,
+    );
     profile.bot = input.bot;
     profile.bot.normalize_for_profile(&profile.name);
     write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
@@ -1190,6 +1320,9 @@ fn update_existing_default_provider(
 fn workspace_profile(
     workspace_name: String,
     proxy_url: String,
+    remote_frontend_mode: String,
+    remote_web_asset_registry_url: String,
+    remote_web_asset_version: String,
     bot: BotProfileConfig,
 ) -> Result<ProviderProfile, String> {
     let workspace_name = workspace_name_or_default(&workspace_name, "")?;
@@ -1203,8 +1336,25 @@ fn workspace_profile(
         bot,
         ..ProviderProfile::default()
     };
+    apply_remote_frontend_options(
+        &mut profile,
+        &remote_frontend_mode,
+        &remote_web_asset_registry_url,
+        &remote_web_asset_version,
+    );
     profile.bot.normalize_for_profile(&profile.name);
     Ok(profile)
+}
+
+fn apply_remote_frontend_options(
+    profile: &mut ProviderProfile,
+    mode: &str,
+    registry_url: &str,
+    version: &str,
+) {
+    profile.remote_frontend_mode = normalized_remote_frontend_mode(mode);
+    profile.remote_web_asset_registry_url = normalized_remote_web_asset_registry_url(registry_url);
+    profile.remote_web_asset_version = normalized_remote_web_asset_version(version);
 }
 
 fn write_default_provider_profile(
@@ -1874,6 +2024,12 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
         profile.base_url = profile.base_url.trim().to_string();
         profile.model = profile.model.trim().to_string();
         profile.proxy_url = profile.proxy_url.trim().to_string();
+        profile.remote_frontend_mode =
+            normalized_remote_frontend_mode(&profile.remote_frontend_mode);
+        profile.remote_web_asset_registry_url =
+            normalized_remote_web_asset_registry_url(&profile.remote_web_asset_registry_url);
+        profile.remote_web_asset_version =
+            normalized_remote_web_asset_version(&profile.remote_web_asset_version);
         profile.codex_home = normalize_home_path(&profile.codex_home);
         if profile.name.is_empty() {
             profile.name = profile.provider_name.clone();
@@ -1889,10 +2045,16 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
             let start_remote_cloud_on_launch = profile.start_remote_cloud_on_launch;
             let start_remote_e2ee_on_launch = profile.start_remote_e2ee_on_launch;
             let remote_e2ee_password = profile.remote_e2ee_password.clone();
+            let remote_frontend_mode = profile.remote_frontend_mode.clone();
+            let remote_web_asset_registry_url = profile.remote_web_asset_registry_url.clone();
+            let remote_web_asset_version = profile.remote_web_asset_version.clone();
             profile = default_provider_profile();
             profile.id = id;
             profile.bot = bot;
             profile.proxy_url = proxy_url;
+            profile.remote_frontend_mode = remote_frontend_mode;
+            profile.remote_web_asset_registry_url = remote_web_asset_registry_url;
+            profile.remote_web_asset_version = remote_web_asset_version;
             profile.start_remote_on_launch = start_remote_on_launch;
             profile.start_remote_cloud_on_launch = start_remote_cloud_on_launch;
             profile.start_remote_e2ee_on_launch = start_remote_e2ee_on_launch;
@@ -2223,6 +2385,26 @@ fn workspace_name_or_default(workspace_name: &str, fallback: &str) -> Result<Str
     Ok(name.to_string())
 }
 
+pub fn normalized_remote_frontend_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        REMOTE_FRONTEND_MODE_CLI => REMOTE_FRONTEND_MODE_CLI.to_string(),
+        _ => REMOTE_FRONTEND_MODE_APP.to_string(),
+    }
+}
+
+pub fn normalized_remote_web_asset_registry_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+pub fn normalized_remote_web_asset_version(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "latest".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn default_provider_profile() -> ProviderProfile {
     let mut profile = ProviderProfile {
         id: new_uuid_v4(),
@@ -2232,6 +2414,9 @@ fn default_provider_profile() -> ProviderProfile {
         base_url: String::new(),
         model: String::new(),
         proxy_url: String::new(),
+        remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+        remote_web_asset_registry_url: String::new(),
+        remote_web_asset_version: "latest".to_string(),
         codex_home: default_codex_home(),
         start_remote_on_launch: false,
         start_remote_cloud_on_launch: false,
@@ -2502,6 +2687,9 @@ model_provider = "old-provider"
         let profile = create_workspace_profile(WorkspaceRequest {
             workspace_name: "workspace-none".to_string(),
             proxy_url: String::new(),
+            remote_frontend_mode: String::new(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: String::new(),
             bot: BotProfileConfig::default(),
         })
         .expect("create providerless workspace");
@@ -2651,6 +2839,9 @@ model_provider = "nextai"
             api_key: None,
             model: "glm-4.6".to_string(),
             proxy_url: String::new(),
+            remote_frontend_mode: String::new(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: String::new(),
             bot: BotProfileConfig::default(),
         })
         .expect("create workspace profile");
@@ -2834,6 +3025,9 @@ model_provider = "nextai"
                 base_url: "http://localhost:3000/v1".to_string(),
                 model: "model".to_string(),
                 proxy_url: String::new(),
+                remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+                remote_web_asset_registry_url: String::new(),
+                remote_web_asset_version: "latest".to_string(),
                 codex_home: String::new(),
                 start_remote_on_launch: false,
                 start_remote_cloud_on_launch: false,
@@ -2883,6 +3077,9 @@ model_provider = "nextai"
                     base_url: "http://localhost:3000/v1".to_string(),
                     model: "model".to_string(),
                     proxy_url: String::new(),
+                    remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+                    remote_web_asset_registry_url: String::new(),
+                    remote_web_asset_version: "latest".to_string(),
                     codex_home: String::new(),
                     start_remote_on_launch: false,
                     start_remote_cloud_on_launch: false,
@@ -2992,6 +3189,9 @@ model_provider = "bs"
             base_url: "https://saved.example/v1".to_string(),
             model: "saved-model".to_string(),
             proxy_url: String::new(),
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: "latest".to_string(),
             codex_home: String::new(),
             start_remote_on_launch: false,
             start_remote_cloud_on_launch: false,
@@ -3055,6 +3255,9 @@ model_provider = "nextai"
             base_url: "http://localhost:3000/v1".to_string(),
             model: "glm".to_string(),
             proxy_url: String::new(),
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: "latest".to_string(),
             codex_home: String::new(),
             start_remote_on_launch: false,
             start_remote_cloud_on_launch: false,

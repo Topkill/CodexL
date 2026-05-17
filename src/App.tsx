@@ -40,6 +40,7 @@ import {
   Smartphone,
   Square,
   Sun,
+  Terminal,
   Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -256,6 +257,10 @@ const BOT_PLATFORM_SPECS: readonly BotPlatformSpec[] = [
 const BOT_PLATFORM_OPTIONS = BOT_PLATFORM_SPECS.map(({ value, label }) => ({ value, label }));
 const NEXT_AI_GATEWAY_PROVIDER_NAME = "next-ai-gateway";
 const WORKSPACE_PROVIDER_NONE_VALUE = "__workspace_provider_none__";
+const DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL = "https://codexl-codex-app-web.pages.dev";
+const DEFAULT_CODEX_WEB_ASSET_VERSION = "latest";
+
+type RemoteFrontendMode = "app" | "cli";
 
 type ProviderProfile = {
   id: string;
@@ -265,6 +270,9 @@ type ProviderProfile = {
   base_url: string;
   model: string;
   proxy_url: string;
+  remote_frontend_mode: RemoteFrontendMode | string;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
   codex_home: string;
   start_remote_on_launch: boolean;
   start_remote_cloud_on_launch: boolean;
@@ -381,6 +389,8 @@ type AppConfig = {
   remote_control_host: string;
   remote_control_port: number;
   remote_relay_url: string;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
   device_uuid: string;
   remote_cloud_auth: RemoteCloudAuthConfig;
   language: Language;
@@ -448,10 +458,18 @@ type RemoteControlInfo = {
   relay_url: string | null;
   relay_connected: boolean;
   require_password: boolean;
+  web_asset_mode: string;
+  web_asset_base_url: string | null;
+  web_asset_version: string;
   cdp_host: string;
   cdp_port: number;
   control_client_count: number;
   frame_client_count: number;
+};
+
+type CodexWebAssetVersions = {
+  latest: string;
+  versions: string[];
 };
 
 type InstanceStatus = LaunchInfo & {
@@ -465,6 +483,9 @@ type NewProvider = {
   api_key: string;
   model: string;
   proxy_url: string;
+  remote_frontend_mode: RemoteFrontendMode;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
   bot: BotProfileConfig;
 };
 
@@ -483,6 +504,9 @@ type ExistingProvider = {
   api_key: string;
   model: string;
   proxy_url: string;
+  remote_frontend_mode: RemoteFrontendMode;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
   bot: BotProfileConfig;
 };
 
@@ -495,6 +519,9 @@ type NextAiGatewayProvider = {
   name: string;
   model: string;
   proxy_url: string;
+  remote_frontend_mode: RemoteFrontendMode;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
   bot: BotProfileConfig;
 };
 
@@ -505,6 +532,9 @@ type UpdateNextAiGatewayProvider = NextAiGatewayProvider & {
 type WorkspaceProvider = {
   workspace_name: string;
   proxy_url: string;
+  remote_frontend_mode: RemoteFrontendMode;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
   bot: BotProfileConfig;
 };
 
@@ -568,6 +598,12 @@ type ProviderForm = {
   providerModel: string;
   gatewayModel: string;
   proxyUrl: string;
+  remoteFrontendMode: RemoteFrontendMode;
+  remoteWebAssetRegistryUrl: string;
+  remoteWebAssetVersion: string;
+  remoteWebAssetVersions: string[];
+  remoteWebAssetVersionsLoading: boolean;
+  remoteWebAssetRegistryError: string;
   botEnabled: boolean;
   botPlatform: BotPlatform;
   botAuthType: BotAuthType;
@@ -589,6 +625,7 @@ type RemoteQrState = {
   profile: ProviderProfile;
   remote: RemoteControlInfo;
   url: string;
+  qrUrl: string;
   markup: string;
 };
 
@@ -746,6 +783,14 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     name: t("instanceDialog.name"),
     workspaceName: t("instanceDialog.workspaceName"),
     proxyUrl: t("instanceDialog.proxyUrl"),
+    remoteFrontendMode: t("instanceDialog.remoteFrontendMode"),
+    remoteFrontendApp: t("instanceDialog.remoteFrontendApp"),
+    remoteFrontendCli: t("instanceDialog.remoteFrontendCli"),
+    codexAppDetected: (path: string) => t("instanceDialog.codexAppDetected", { path }),
+    codexAppNotFound: t("instanceDialog.codexAppNotFound"),
+    registryUrl: t("instanceDialog.registryUrl"),
+    registryVersion: t("instanceDialog.registryVersion"),
+    loadingVersions: t("instanceDialog.loadingVersions"),
     providerProfileName: t("instanceDialog.providerProfileName"),
     bot: t("bot.title"),
     authMethod: t("bot.authMethod"),
@@ -813,6 +858,9 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     apiKeyRequired: t("errors.apiKeyRequired"),
     modelRequired: t("errors.modelRequired"),
     providerRequired: t("errors.providerRequired"),
+    registryUrlRequired: t("errors.registryUrlRequired"),
+    registryVersionRequired: t("errors.registryVersionRequired"),
+    registryVersionsUnavailable: t("errors.registryVersionsUnavailable"),
     botAuthRequired: (fields: string) => t("errors.botAuthRequired", { fields }),
     listen: t("gateway.listen"),
     port: t("gateway.port"),
@@ -849,6 +897,12 @@ const emptyForm: ProviderForm = {
   providerModel: "",
   gatewayModel: "",
   proxyUrl: "",
+  remoteFrontendMode: "app",
+  remoteWebAssetRegistryUrl: DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL,
+  remoteWebAssetVersion: DEFAULT_CODEX_WEB_ASSET_VERSION,
+  remoteWebAssetVersions: [],
+  remoteWebAssetVersionsLoading: false,
+  remoteWebAssetRegistryError: "",
   botEnabled: false,
   botPlatform: "none",
   botAuthType: "qr_login",
@@ -890,6 +944,7 @@ function App() {
   const [dialogMode, setDialogMode] = useState<DialogMode>("add");
   const [editingProfileName, setEditingProfileName] = useState<string | null>(null);
   const [form, setForm] = useState<ProviderForm>(emptyForm);
+  const [codexAppPath, setCodexAppPath] = useState("");
   const [gatewayModels, setGatewayModels] = useState<string[]>([]);
   const [pendingDeleteProfile, setPendingDeleteProfile] = useState<ProviderProfile | null>(null);
   const [removeCodexHome, setRemoveCodexHome] = useState(false);
@@ -1032,6 +1087,17 @@ function App() {
     }
   }, []);
 
+  const detectCodexAppPath = useCallback(async () => {
+    try {
+      const path = await invoke<string>("find_codex");
+      setCodexAppPath(path);
+      return path;
+    } catch {
+      setCodexAppPath("");
+      return "";
+    }
+  }, []);
+
   const loadGatewayModels = useCallback(async () => {
     try {
       const result = await invoke<GatewayConfigFile>("get_gateway_config");
@@ -1140,6 +1206,10 @@ function App() {
   }, [checkForAppUpdate]);
 
   useEffect(() => {
+    void detectCodexAppPath();
+  }, [detectCodexAppPath]);
+
+  useEffect(() => {
     const media = window.matchMedia?.("(prefers-color-scheme: dark)");
     const applyTheme = () => {
       document.documentElement.dataset.theme =
@@ -1226,12 +1296,17 @@ function App() {
     setEditingProfileName(null);
     setSettingsError("");
     setSaveDisabled(false);
-    const [providers, models] = await Promise.all([
+    const [providers, models, detectedCodexAppPath] = await Promise.all([
       loadDefaultProviders(),
       gatewayProfileEnabled ? loadGatewayModels() : Promise.resolve([]),
+      detectCodexAppPath(),
     ]);
     const nextMode: ProviderMode = providers.length > 0 ? "existing" : "none";
-    setForm({ ...emptyForm, gatewayModel: models[0] || "" });
+    setForm({
+      ...emptyForm,
+      ...defaultRemoteFrontendFormFields(detectedCodexAppPath),
+      gatewayModel: models[0] || "",
+    });
     setProviderMode(nextMode);
     if (nextMode === "existing") {
       syncExistingProviderFields(providers[0].name, providers);
@@ -1240,7 +1315,13 @@ function App() {
     window.requestAnimationFrame(() => {
       workspaceNameInputRef.current?.focus();
     });
-  }, [gatewayProfileEnabled, loadDefaultProviders, loadGatewayModels, syncExistingProviderFields]);
+  }, [
+    detectCodexAppPath,
+    gatewayProfileEnabled,
+    loadDefaultProviders,
+    loadGatewayModels,
+    syncExistingProviderFields,
+  ]);
 
   const openEditProviderDialog = useCallback(
     async (profile: ProviderProfile) => {
@@ -1251,8 +1332,9 @@ function App() {
       setForm(emptyForm);
       const isGatewayProfile =
         gatewayProfileEnabled && profile.provider_name === NEXT_AI_GATEWAY_PROVIDER_NAME;
-      const [providers, models] = await Promise.all([
+      const [providers, , models] = await Promise.all([
         loadDefaultProviders(),
+        detectCodexAppPath(),
         isGatewayProfile ? loadGatewayModels() : Promise.resolve([]),
       ]);
 
@@ -1262,6 +1344,7 @@ function App() {
           ...emptyForm,
           workspaceName: profile.name,
           proxyUrl: profile.proxy_url || "",
+          ...profileRemoteFrontendFormFields(profile),
           ...botFormFields(profile.bot, profile.name),
         });
         setSettingsOpen(true);
@@ -1279,6 +1362,7 @@ function App() {
           providerName: profile.codex_profile_name || profile.name,
           gatewayModel: profile.model,
           proxyUrl: profile.proxy_url || "",
+          ...profileRemoteFrontendFormFields(profile),
           ...botFormFields(profile.bot, profile.name),
         });
         if (models.length > 0 && !models.includes(profile.model)) {
@@ -1299,6 +1383,7 @@ function App() {
           ...emptyForm,
           workspaceName: profile.name,
           proxyUrl: profile.proxy_url || "",
+          ...profileRemoteFrontendFormFields(profile),
           existingProfileName: profile.codex_profile_name || profile.name,
           existingBaseUrl: profile.base_url || "",
           existingModel:
@@ -1317,6 +1402,7 @@ function App() {
         ...emptyForm,
         workspaceName: profile.name,
         proxyUrl: profile.proxy_url || "",
+        ...profileRemoteFrontendFormFields(profile),
         existingProfileName: selected.name,
         existingBaseUrl: profile.base_url || selected.base_url || "",
         existingApiKey: selected.api_key || "",
@@ -1331,7 +1417,13 @@ function App() {
         existingProviderSelectRef.current?.focus();
       });
     },
-    [gatewayProfileEnabled, loadDefaultProviders, loadGatewayModels, strings.noProviderFound],
+    [
+      detectCodexAppPath,
+      gatewayProfileEnabled,
+      loadDefaultProviders,
+      loadGatewayModels,
+      strings.noProviderFound,
+    ],
   );
 
   const closeSettingsDialog = useCallback(() => {
@@ -1595,11 +1687,31 @@ function App() {
 
   const launchProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
-      const startRemote = options.startRemote === true;
+      const usesCliMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode) === "cli";
+      const startRemote = options.startRemote === true || usesCliMode;
       const startCloud = startRemote && options.startCloud === true;
       const requireE2ee = startCloud;
 
       try {
+        if (usesCliMode) {
+          await invoke<RemoteControlInfo>("start_remote_control", {
+            profileName: profile.name,
+            remotePassword: null,
+            useCloudRelay: startCloud,
+            requireE2ee,
+          });
+          setConfig((current) =>
+            current
+              ? {
+                  ...current,
+                  active_provider: profile.name,
+                }
+              : current,
+          );
+          await refreshStatus();
+          return;
+        }
+
         const info = await invoke<LaunchInfo>("launch_codex", {
           cdpPort: config?.cdp_port || null,
           codexPath: config?.codex_path || null,
@@ -1661,7 +1773,8 @@ function App() {
 
   const toggleProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
-      const isRunning = Boolean(instanceStatuses.get(profile.name)?.running);
+      const status = instanceStatuses.get(profile.name);
+      const isRunning = Boolean(status?.running || status?.remote_control?.running);
       if (isRunning) {
         await stopCodex(profile);
         return;
@@ -1742,11 +1855,13 @@ function App() {
     (profile: ProviderProfile, remote: RemoteControlInfo) => {
       try {
         const url = remote.lan_url || remote.url;
+        const qrUrl = compactRemoteQrUrl(url, remote);
         setRemoteQr({
           profile,
           remote,
           url,
-          markup: createQrSvg(url, { moduleSize: 5, quietZone: 4 }),
+          qrUrl,
+          markup: createQrSvg(qrUrl, { moduleSize: 5, quietZone: 4 }),
         });
       } catch (error) {
         showSettingsError(error);
@@ -1910,13 +2025,14 @@ function App() {
           <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             {filteredProfiles.map((profile) => {
               const status = instanceStatuses.get(profile.name) || null;
+              const usesCliMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode) === "cli";
               return (
                 <ProfileCard
                   key={profile.name}
                   profile={profile}
                   status={status}
                   remoteLaunchOptions={{
-                    startRemote: profile.start_remote_on_launch,
+                    startRemote: usesCliMode || profile.start_remote_on_launch,
                     startCloud: profile.start_remote_cloud_on_launch,
                   }}
                   onToggleProfile={toggleProfile}
@@ -1974,6 +2090,7 @@ function App() {
           form={form}
           defaultProviders={defaultProviders}
           botConfigs={config?.bot_configs || []}
+          codexAppPath={codexAppPath}
           settingsError={settingsError}
           saveDisabled={saveDisabled}
           editingProfileName={editingProfileName}
@@ -2188,10 +2305,11 @@ function ProfileCard({
 }: ProfileCardProps) {
   const strings = useAppStrings();
   const remote = status?.remote_control || null;
-  const isRunning = Boolean(status?.running);
+  const isRunning = Boolean(status?.running || remote?.running);
   const isRemoteRunning = Boolean(remote?.running);
   const showRemoteActions = isRunning && Boolean(remote?.url);
   const codexProfileName = profile.codex_profile_name || profile.name;
+  const remoteFrontendMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode);
   const providerLine =
     isProviderlessWorkspace(profile)
       ? strings.none
@@ -2250,6 +2368,18 @@ function ProfileCard({
             </span>
           </div>
         ) : null}
+        <div className="flex items-center gap-3 text-sm text-muted-foreground">
+          {remoteFrontendMode === "cli" ? (
+            <Terminal className="w-4 h-4 shrink-0" />
+          ) : (
+            <Monitor className="w-4 h-4 shrink-0" />
+          )}
+          <span className="truncate text-foreground">
+            {remoteFrontendMode === "cli"
+              ? `${strings.remoteFrontendCli} / ${profile.remote_web_asset_version || DEFAULT_CODEX_WEB_ASSET_VERSION}`
+              : strings.remoteFrontendApp}
+          </span>
+        </div>
         {profile.codex_home ? (
           <Button
             type="button"
@@ -3789,6 +3919,7 @@ type SettingsDialogProps = {
   form: ProviderForm;
   defaultProviders: DefaultProviderProfile[];
   botConfigs: SavedBotConfig[];
+  codexAppPath: string;
   settingsError: string;
   saveDisabled: boolean;
   editingProfileName: string | null;
@@ -3817,6 +3948,7 @@ function SettingsDialog({
   form,
   defaultProviders,
   botConfigs,
+  codexAppPath,
   settingsError,
   saveDisabled,
   editingProfileName,
@@ -3900,6 +4032,63 @@ function SettingsDialog({
     void scanHandoffTargets("wifi");
     void scanHandoffTargets("bluetooth");
   }, [form.botEnabled, form.botHandoffEnabled, scanHandoffTargets]);
+
+  useEffect(() => {
+    if (form.remoteFrontendMode !== "cli") {
+      return;
+    }
+    const registryUrl = normalizeRegistryUrl(form.remoteWebAssetRegistryUrl);
+    if (!registryUrl) {
+      onSetForm((current) => ({
+        ...current,
+        remoteWebAssetVersions: [],
+        remoteWebAssetVersionsLoading: false,
+        remoteWebAssetRegistryError: "",
+      }));
+      return;
+    }
+
+    let cancelled = false;
+    onSetForm((current) => ({
+      ...current,
+      remoteWebAssetVersionsLoading: true,
+      remoteWebAssetRegistryError: "",
+    }));
+
+    loadCodexWebAssetVersions(registryUrl)
+      .then((result) => {
+        if (cancelled) return;
+        const versions = result.versions.map((version) => version.trim()).filter(Boolean);
+        const latest = result.latest.trim() || versions[0] || DEFAULT_CODEX_WEB_ASSET_VERSION;
+        onSetForm((current) => {
+          const currentVersion = current.remoteWebAssetVersion.trim();
+          const nextVersion =
+            currentVersion && versions.includes(currentVersion)
+              ? currentVersion
+              : latest;
+          return {
+            ...current,
+            remoteWebAssetVersions: versions,
+            remoteWebAssetVersion: nextVersion,
+            remoteWebAssetVersionsLoading: false,
+            remoteWebAssetRegistryError: "",
+          };
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        onSetForm((current) => ({
+          ...current,
+          remoteWebAssetVersions: [],
+          remoteWebAssetVersionsLoading: false,
+          remoteWebAssetRegistryError: errorMessage(error),
+        }));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [form.remoteFrontendMode, form.remoteWebAssetRegistryUrl, onSetForm]);
 
   return (
     <Dialog
@@ -3991,6 +4180,108 @@ function SettingsDialog({
               onSetForm((current) => ({ ...current, proxyUrl: event.target.value }))
             }
           />
+        </div>
+
+        <div className="flex flex-col gap-3.5">
+          <div className="flex flex-col gap-1.5">
+            <Label>{strings.remoteFrontendMode}</Label>
+            <div className="bg-background border border-border rounded-md grid grid-cols-2 p-0.5">
+              <Button
+                type="button"
+                variant={form.remoteFrontendMode === "app" ? "secondary" : "ghost"}
+                size="sm"
+                className={cn(
+                  "shadow-none",
+                  form.remoteFrontendMode !== "app" && "text-muted-foreground hover:bg-transparent",
+                )}
+                disabled={!codexAppPath}
+                onClick={() =>
+                  onSetForm((current) => ({ ...current, remoteFrontendMode: "app" }))
+                }
+              >
+                <Monitor className="h-3.5 w-3.5" />
+                {strings.remoteFrontendApp}
+              </Button>
+              <Button
+                type="button"
+                variant={form.remoteFrontendMode === "cli" ? "secondary" : "ghost"}
+                size="sm"
+                className={cn(
+                  "shadow-none",
+                  form.remoteFrontendMode !== "cli" && "text-muted-foreground hover:bg-transparent",
+                )}
+                onClick={() =>
+                  onSetForm((current) => ({ ...current, remoteFrontendMode: "cli" }))
+                }
+              >
+                <Terminal className="h-3.5 w-3.5" />
+                {strings.remoteFrontendCli}
+              </Button>
+            </div>
+            {form.remoteFrontendMode === "app" ? (
+              <p
+                className="text-xs text-muted-foreground truncate"
+                title={codexAppPath || strings.codexAppNotFound}
+              >
+                {codexAppPath ? strings.codexAppDetected(codexAppPath) : strings.codexAppNotFound}
+              </p>
+            ) : null}
+          </div>
+
+          {form.remoteFrontendMode === "cli" ? (
+            <div className="grid gap-3.5 sm:grid-cols-[minmax(0,1fr)_180px]">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="remoteWebAssetRegistryUrlInput">{strings.registryUrl}</Label>
+                <Input
+                  id="remoteWebAssetRegistryUrlInput"
+                  type="url"
+                  placeholder={DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL}
+                  value={form.remoteWebAssetRegistryUrl}
+                  onChange={(event) =>
+                    onSetForm((current) => ({
+                      ...current,
+                      remoteWebAssetRegistryUrl: event.target.value,
+                    }))
+                  }
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="remoteWebAssetVersionSelect">{strings.registryVersion}</Label>
+                <Select
+                  value={form.remoteWebAssetVersion || DEFAULT_CODEX_WEB_ASSET_VERSION}
+                  disabled={
+                    form.remoteWebAssetVersionsLoading ||
+                    form.remoteWebAssetVersions.length === 0
+                  }
+                  onValueChange={(value) =>
+                    onSetForm((current) => ({ ...current, remoteWebAssetVersion: value }))
+                  }
+                >
+                  <SelectTrigger id="remoteWebAssetVersionSelect">
+                    <SelectValue
+                      placeholder={
+                        form.remoteWebAssetVersionsLoading
+                          ? strings.loadingVersions
+                          : strings.registryVersion
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {form.remoteWebAssetVersions.map((version) => (
+                      <SelectItem key={version} value={version}>
+                        {version}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {form.remoteWebAssetRegistryError ? (
+                <p className="text-xs text-destructive sm:col-span-2">
+                  {form.remoteWebAssetRegistryError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
         </div>
 
         {providerMode === "existing" ? (
@@ -5146,6 +5437,128 @@ async function copyText(text: string) {
   await navigator.clipboard.writeText(text);
 }
 
+function normalizeRemoteFrontendMode(value: unknown): RemoteFrontendMode {
+  return typeof value === "string" && value.trim().toLowerCase() === "cli" ? "cli" : "app";
+}
+
+function compactRemoteQrUrl(value: string, remote: RemoteControlInfo) {
+  try {
+    const url = new URL(value);
+    for (const key of [
+      "webAssetMode",
+      "webAssetBaseUrl",
+      "webAssetVersion",
+      "web_asset_mode",
+      "web_asset_base_url",
+      "web_asset_version",
+    ]) {
+      url.searchParams.delete(key);
+    }
+    if (remote.require_password) {
+      url.searchParams.set("requirePassword", "1");
+      url.searchParams.set("e2ee", "v1");
+    }
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+function normalizeRegistryUrl(value: string) {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function defaultRemoteFrontendFormFields(codexAppPath: string): Partial<ProviderForm> {
+  return {
+    remoteFrontendMode: codexAppPath.trim() ? "app" : "cli",
+    remoteWebAssetRegistryUrl: DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL,
+    remoteWebAssetVersion: DEFAULT_CODEX_WEB_ASSET_VERSION,
+    remoteWebAssetVersions: [],
+    remoteWebAssetVersionsLoading: false,
+    remoteWebAssetRegistryError: "",
+  };
+}
+
+function profileRemoteFrontendFormFields(profile: ProviderProfile): Partial<ProviderForm> {
+  return {
+    remoteFrontendMode: normalizeRemoteFrontendMode(profile.remote_frontend_mode),
+    remoteWebAssetRegistryUrl:
+      normalizeRegistryUrl(profile.remote_web_asset_registry_url || "") ||
+      DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL,
+    remoteWebAssetVersion:
+      (profile.remote_web_asset_version || "").trim() || DEFAULT_CODEX_WEB_ASSET_VERSION,
+    remoteWebAssetVersions: [],
+    remoteWebAssetVersionsLoading: false,
+    remoteWebAssetRegistryError: "",
+  };
+}
+
+function readRemoteFrontendConfig(
+  form: ProviderForm,
+  strings: AppStrings,
+  showError: (error: unknown) => void,
+): {
+  remote_frontend_mode: RemoteFrontendMode;
+  remote_web_asset_registry_url: string;
+  remote_web_asset_version: string;
+} | null {
+  const mode = normalizeRemoteFrontendMode(form.remoteFrontendMode);
+  if (mode === "app") {
+    return {
+      remote_frontend_mode: "app",
+      remote_web_asset_registry_url: normalizeRegistryUrl(form.remoteWebAssetRegistryUrl),
+      remote_web_asset_version: form.remoteWebAssetVersion.trim() || DEFAULT_CODEX_WEB_ASSET_VERSION,
+    };
+  }
+
+  const registryUrl = normalizeRegistryUrl(form.remoteWebAssetRegistryUrl);
+  const version = form.remoteWebAssetVersion.trim();
+  if (!registryUrl) {
+    showError(strings.registryUrlRequired);
+    return null;
+  }
+  try {
+    const parsed = new URL(registryUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("invalid protocol");
+    }
+  } catch {
+    showError(strings.registryUrlRequired);
+    return null;
+  }
+  if (!version) {
+    showError(strings.registryVersionRequired);
+    return null;
+  }
+  if (form.remoteWebAssetRegistryError) {
+    showError(form.remoteWebAssetRegistryError);
+    return null;
+  }
+  if (
+    form.remoteWebAssetVersions.length > 0 &&
+    !form.remoteWebAssetVersions.includes(version)
+  ) {
+    showError(strings.registryVersionRequired);
+    return null;
+  }
+  if (!form.remoteWebAssetVersionsLoading && form.remoteWebAssetVersions.length === 0) {
+    showError(strings.registryVersionsUnavailable);
+    return null;
+  }
+
+  return {
+    remote_frontend_mode: "cli",
+    remote_web_asset_registry_url: registryUrl,
+    remote_web_asset_version: version,
+  };
+}
+
+async function loadCodexWebAssetVersions(registryUrl: string): Promise<CodexWebAssetVersions> {
+  return invoke<CodexWebAssetVersions>("list_codex_web_asset_versions", {
+    registryUrl: normalizeRegistryUrl(registryUrl),
+  });
+}
+
 function readNewProviderForm(
   form: ProviderForm,
   workspaceNameRef: React.RefObject<HTMLInputElement | null>,
@@ -5195,7 +5608,9 @@ function readNewProviderForm(
   if (extensionsEnabled && !validateBotAuth(form, strings, showError)) {
     return null;
   }
-  return provider;
+  const remoteFrontend = readRemoteFrontendConfig(form, strings, showError);
+  if (!remoteFrontend) return null;
+  return { ...provider, ...remoteFrontend };
 }
 
 function readWorkspaceProviderForm(
@@ -5219,7 +5634,9 @@ function readWorkspaceProviderForm(
   if (extensionsEnabled && !validateBotAuth(form, strings, showError)) {
     return null;
   }
-  return provider;
+  const remoteFrontend = readRemoteFrontendConfig(form, strings, showError);
+  if (!remoteFrontend) return null;
+  return { ...provider, ...remoteFrontend };
 }
 
 function readNextAiGatewayProviderForm(
@@ -5257,7 +5674,9 @@ function readNextAiGatewayProviderForm(
   if (extensionsEnabled && !validateBotAuth(form, strings, showError)) {
     return null;
   }
-  return provider;
+  const remoteFrontend = readRemoteFrontendConfig(form, strings, showError);
+  if (!remoteFrontend) return null;
+  return { ...provider, ...remoteFrontend };
 }
 
 function readExistingProviderForm(
@@ -5297,7 +5716,9 @@ function readExistingProviderForm(
   if (extensionsEnabled && !validateBotAuth(form, strings, showError)) {
     return null;
   }
-  return provider;
+  const remoteFrontend = readRemoteFrontendConfig(form, strings, showError);
+  if (!remoteFrontend) return null;
+  return { ...provider, ...remoteFrontend };
 }
 
 function normalizedProfiles(nextConfig: AppConfig): ProviderProfile[] {
@@ -6004,6 +6425,12 @@ function dedupeProfiles(profiles: ProviderProfile[]) {
       base_url: profile.base_url.trim(),
       model: profile.model.trim(),
       proxy_url: (profile.proxy_url || "").trim(),
+      remote_frontend_mode: normalizeRemoteFrontendMode(profile.remote_frontend_mode),
+      remote_web_asset_registry_url:
+        normalizeRegistryUrl(profile.remote_web_asset_registry_url || "") ||
+        DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL,
+      remote_web_asset_version:
+        (profile.remote_web_asset_version || "").trim() || DEFAULT_CODEX_WEB_ASSET_VERSION,
       codex_home: profile.codex_home.trim(),
       start_remote_on_launch: Boolean(profile.start_remote_on_launch),
       start_remote_cloud_on_launch:

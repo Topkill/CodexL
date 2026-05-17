@@ -23,6 +23,41 @@ pub fn find_codex_app() -> Option<String> {
     }
 }
 
+pub fn resolve_codex_cli_executable(
+    explicit_path: Option<&str>,
+    configured_codex_path: &str,
+) -> String {
+    if let Some(path) = explicit_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return path.to_string();
+    }
+
+    for key in ["CODEXL_REAL_CODEX_CLI_PATH", "CODEX_CLI_PATH"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+
+    if !configured_codex_path.trim().is_empty() {
+        if let Some(path) = bundled_cli_path(configured_codex_path) {
+            return path.to_string_lossy().to_string();
+        }
+        if configured_codex_path.contains(".app/Contents/MacOS/") {
+            return "codex".to_string();
+        }
+        if Path::new(configured_codex_path).is_file() {
+            return configured_codex_path.to_string();
+        }
+    }
+
+    "codex".to_string()
+}
+
 pub fn launch_codex(
     executable: &str,
     cdp_port: u16,
@@ -503,6 +538,14 @@ fn executable_from_app_bundle(app_path: &Path) -> Option<String> {
     None
 }
 
+fn bundled_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
+    let executable = PathBuf::from(codex_app_executable);
+    let contents_dir = executable.parent()?.parent()?;
+    let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let candidate = contents_dir.join("Resources").join(file_name);
+    candidate.is_file().then_some(candidate)
+}
+
 fn read_bundle_executable(info_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(info_path).ok()?;
     // Simple plist parsing: find CFBundleExecutable value
@@ -526,6 +569,37 @@ fn read_bundle_executable(info_path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn resolves_cli_from_codex_app_resources_without_launching_app_binary() {
+        let root = unique_test_dir("codex-cli-resources");
+        let macos_dir = root.join("Codex.app").join("Contents").join("MacOS");
+        let resources_dir = root.join("Codex.app").join("Contents").join("Resources");
+        std::fs::create_dir_all(&macos_dir).expect("create MacOS dir");
+        std::fs::create_dir_all(&resources_dir).expect("create Resources dir");
+        let app_executable = macos_dir.join("Codex");
+        let cli_executable = resources_dir.join("codex");
+        std::fs::write(&app_executable, "").expect("write app executable");
+        std::fs::write(&cli_executable, "").expect("write cli executable");
+
+        let resolved = resolve_codex_cli_executable(None, &app_executable.to_string_lossy());
+        assert_ne!(resolved, app_executable.to_string_lossy().to_string());
+        assert!(
+            resolved == cli_executable.to_string_lossy()
+                || !resolved.contains(".app/Contents/MacOS/")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_resolver_never_falls_back_to_macos_app_executable() {
+        let app_executable = "/tmp/MissingCodex.app/Contents/MacOS/Codex";
+
+        let resolved = resolve_codex_cli_executable(None, app_executable);
+        assert_ne!(resolved, app_executable);
+        assert!(!resolved.contains(".app/Contents/MacOS/"));
+    }
 
     #[test]
     fn detects_codex_app_server_for_profile() {
@@ -611,6 +685,14 @@ mod tests {
             .get_envs()
             .find(|(name, _)| *name == OsStr::new(key))
             .and_then(|(_, value)| value.map(|value| value.to_string_lossy().to_string()))
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos))
     }
 
     fn process_entry(pid: u32, ppid: u32, pgid: u32) -> ProcessEntry {

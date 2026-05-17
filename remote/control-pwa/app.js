@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260513-local-bridge-plain-v2";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260513-local-bridge-plain-v2";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260516-codex-web-registry-v2";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260516-codex-web-registry-v2";
 
 const urlParams = new URLSearchParams(location.search);
 const initialConnection = connectionFromUrlParams(urlParams);
@@ -34,8 +34,15 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260513-local-bridge-plain-v2";
+const PWA_BUILD = "20260516-codex-web-registry-v2";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
+const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
+const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
+const PARENT_BRIDGE_SEND_MESSAGE = "codex-web-parent-bridge-send";
+const PARENT_BRIDGE_MESSAGE = "codex-web-parent-bridge-message";
+const PARENT_BRIDGE_CLOSE_MESSAGE = "codex-web-parent-bridge-close";
+const PARENT_BRIDGE_CLOSED_MESSAGE = "codex-web-parent-bridge-closed";
+const PARENT_BRIDGE_ERROR_MESSAGE = "codex-web-parent-bridge-error";
 const SERVICE_WORKER_URL = `service-worker.js?v=${PWA_BUILD}`;
 const E2EE_VERSION = "v1";
 const E2EE_SALT_PREFIX = "codexl-remote-e2ee-v1";
@@ -52,6 +59,8 @@ let remoteCrypto = null;
 let remoteRequiresPassword = false;
 let remoteOrigin = location.origin;
 let remotePathPrefix = websocketBasePath(location.pathname);
+let webAssetBaseUrl = "";
+let webAssetVersion = "latest";
 let transportPreference = (urlParams.get("transport") || "auto").toLowerCase();
 let webTransportFallbackLogged = false;
 let pointerMoveTimer = null;
@@ -64,6 +73,7 @@ let editingInstanceId = "";
 let pendingDeleteInstanceId = "";
 let pendingPasswordConnection = null;
 let instances = readStoredInstances();
+let parentBridgeClients = new Map();
 
 const state = {
   connected: false,
@@ -162,6 +172,7 @@ const connectButton = document.querySelector("#connectButton");
 const saveEditButton = document.querySelector("#saveEditButton");
 const subtitle = document.querySelector("#subtitle");
 const webFrame = document.querySelector("#webFrame");
+const webAssetVersionSelect = document.querySelector("#webAssetVersionSelect");
 const isListPage = Boolean(connectView);
 const isControlPage = Boolean(controlView);
 
@@ -409,6 +420,16 @@ function setupControlEventHandlers() {
 
   remoteModeSelect?.addEventListener("change", () => {
     switchRemoteMode(remoteModeSelect.value, { remember: true });
+  });
+
+  webAssetVersionSelect?.addEventListener("change", () => {
+    const nextVersion = normalizeWebAssetVersion(webAssetVersionSelect.value);
+    if (!webAssetRegistryEnabled() || nextVersion === webAssetVersion) {
+      return;
+    }
+    webAssetVersion = nextVersion;
+    persistActiveWebAssetSelection();
+    void connectWebBridgeMode();
   });
 
   webFrame?.addEventListener("load", () => {
@@ -777,7 +798,15 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
     return;
   }
 
-  const requiresPassword = connectionRequiresPassword(connection, connectionUrl);
+  token = nextToken;
+  remoteAuthMode = connectionUrl.searchParams.get("auth") || "";
+  remoteCloudUser = connection.cloudUser || connectionUrl.searchParams.get("cloudUser") || "";
+  remoteJwt = connection.jwt || connectionUrl.searchParams.get("jwt") || "";
+  remoteOrigin = connectionUrl.origin;
+  remotePathPrefix = websocketBasePath(connectionUrl.pathname);
+
+  const remoteInfo = await fetchRemoteInfo();
+  const requiresPassword = connectionRequiresPassword(connection, connectionUrl, remoteInfo);
   if (requiresPassword && (!remoteCrypto || remoteCrypto.token !== nextToken)) {
     remoteCrypto = null;
     pendingPasswordConnection = { connection, instanceId };
@@ -795,21 +824,31 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   if (activeInstanceId) {
     updateInstanceStatus(activeInstanceId, "Connecting");
   }
-  token = nextToken;
   remoteRequiresPassword = requiresPassword;
-  remoteAuthMode = connectionUrl.searchParams.get("auth") || "";
-  remoteCloudUser = connection.cloudUser || connectionUrl.searchParams.get("cloudUser") || "";
-  remoteJwt = connection.jwt || connectionUrl.searchParams.get("jwt") || "";
-  remoteOrigin = connectionUrl.origin;
-  remotePathPrefix = websocketBasePath(connectionUrl.pathname);
+  webAssetBaseUrl = connectionWebAssetBaseUrl(connection, connectionUrl, remoteInfo);
+  webAssetVersion = connectionWebAssetVersion(connection, connectionUrl, remoteInfo);
+  configureWebAssetVersionSelect();
+  if (webAssetRegistryEnabled()) {
+    void refreshWebAssetVersions();
+  }
   transportPreference = (connectionUrl.searchParams.get("transport") || urlParams.get("transport") || "auto").toLowerCase();
   webTransportFallbackLogged = false;
-  state.remoteMode = normalizeRemoteMode(connection.remoteMode || connection.mode || connectionUrl.searchParams.get("remoteMode") || connectionUrl.searchParams.get("mode"));
+  state.remoteMode = normalizeRemoteMode(
+    connection.remoteMode ||
+      connection.mode ||
+      connectionUrl.searchParams.get("remoteMode") ||
+      connectionUrl.searchParams.get("mode") ||
+      remoteInfoField(remoteInfo, "remoteMode", "remote_mode", "mode"),
+  );
   if (remoteModeSelect) {
     remoteModeSelect.value = state.remoteMode;
   }
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Connecting", { remoteMode: state.remoteMode });
+    updateInstanceStatus(activeInstanceId, "Connecting", {
+      remoteMode: state.remoteMode,
+      webAssetBaseUrl,
+      webAssetVersion,
+    });
   }
 
   closeRealtimeSession();
@@ -910,6 +949,7 @@ function closeRealtimeSession() {
 
 function resetWebFrame() {
   state.webFrameLoaded = false;
+  closeParentBridgeClients();
   if (webFrame) {
     webFrame.hidden = true;
     webFrame.removeAttribute("src");
@@ -963,16 +1003,17 @@ async function connectWebBridgeMode() {
   state.connected = false;
   state.frameConnected = false;
   state.webFrameLoaded = false;
-  setStatus("Preparing web cache");
+  const registryMode = webAssetRegistryEnabled();
+  setStatus(registryMode ? `Loading app bundle (${webAssetVersion})` : "Preparing web cache");
   if (activeInstanceId) {
-    updateInstanceStatus(activeInstanceId, "Preparing web cache");
+    updateInstanceStatus(activeInstanceId, registryMode ? `Loading app bundle (${webAssetVersion})` : "Preparing web cache");
   }
   applyRemoteModeLayout();
 
-  if (canLoadWebFrameDirectly()) {
-    setStatus("Loading web bridge");
+  if (registryMode || canLoadWebFrameDirectly()) {
+    setStatus(registryMode ? `Loading app bundle (${webAssetVersion})` : "Loading web bridge");
     if (activeInstanceId) {
-      updateInstanceStatus(activeInstanceId, "Loading web bridge");
+      updateInstanceStatus(activeInstanceId, registryMode ? `Loading app bundle (${webAssetVersion})` : "Loading web bridge");
     }
     loadWebFrame(remoteFrameUrl, attempt);
     return;
@@ -1037,12 +1078,13 @@ function startControlLoops() {
   }
 }
 
-function connectionRequiresPassword(connection, connectionUrl) {
+function connectionRequiresPassword(connection, connectionUrl, remoteInfo = null) {
   return (
     booleanFlag(connection.requirePassword) ||
     booleanFlag(connection.require_password) ||
     booleanFlag(connectionUrl.searchParams.get("requirePassword")) ||
-    connectionUrl.searchParams.get("e2ee") === E2EE_VERSION
+    connectionUrl.searchParams.get("e2ee") === E2EE_VERSION ||
+    booleanFlag(remoteInfoField(remoteInfo, "requirePassword", "require_password"))
   );
 }
 
@@ -1151,6 +1193,7 @@ function instanceSearchText(instance) {
       instance.host,
       hostFromConnectionUrl(instance.url),
       remoteModeLabel(instance.remoteMode),
+      instance.webAssetVersion || "",
       instance.status || "Not connected",
     ].join(" "),
   );
@@ -1197,10 +1240,14 @@ function createInstanceCard(instance) {
 
   const meta = document.createElement("div");
   meta.className = "instance-meta";
-  meta.append(
+  const metaLines = [
     createMetaLine("Mode", remoteModeLabel(instance.remoteMode)),
     createMetaLine("Last connected", formatTime(instance.lastConnectedAt)),
-  );
+  ];
+  if (instance.webAssetBaseUrl) {
+    metaLines.splice(1, 0, createMetaLine("Bundle", instance.webAssetVersion || "latest"));
+  }
+  meta.append(...metaLines);
 
   const actions = document.createElement("div");
   actions.className = "instance-actions";
@@ -1430,6 +1477,8 @@ function upsertInstanceFromConnection(connection, { name = "", status = "" } = {
       token: candidate.token,
       updatedAt: Date.now(),
       url: candidate.url,
+      webAssetBaseUrl: candidate.webAssetBaseUrl,
+      webAssetVersion: candidate.webAssetVersion,
     };
     instances = instances.map((instance) => (instance.id === existing.id ? updated : instance));
     saveStoredInstances();
@@ -1459,6 +1508,12 @@ function buildInstanceFromConnection(connection, { existing = null, name = "", s
   if (connection.jwt) {
     connectionUrl.searchParams.set("jwt", connection.jwt);
   }
+  const nextWebAssetBaseUrl = connectionWebAssetBaseUrl(connection, connectionUrl);
+  const nextWebAssetVersion = connectionWebAssetVersion(connection, connectionUrl);
+  if (nextWebAssetBaseUrl) {
+    connectionUrl.searchParams.set("webAssetBaseUrl", nextWebAssetBaseUrl);
+    connectionUrl.searchParams.set("webAssetVersion", nextWebAssetVersion);
+  }
   const requirePassword = connectionRequiresPassword(connection, connectionUrl);
   if (requirePassword) {
     connectionUrl.searchParams.set("requirePassword", "1");
@@ -1486,6 +1541,8 @@ function buildInstanceFromConnection(connection, { existing = null, name = "", s
     token: nextToken,
     updatedAt: now,
     url: connectionUrl.toString(),
+    webAssetBaseUrl: nextWebAssetBaseUrl,
+    webAssetVersion: nextWebAssetVersion,
   };
 }
 
@@ -1564,6 +1621,8 @@ function normalizeStoredInstance(instance) {
       requirePassword: Boolean(instance.requirePassword),
       token: typeof instance.token === "string" ? instance.token : "",
       url: typeof instance.url === "string" ? instance.url : "",
+      webAssetBaseUrl: typeof instance.webAssetBaseUrl === "string" ? instance.webAssetBaseUrl : "",
+      webAssetVersion: typeof instance.webAssetVersion === "string" ? instance.webAssetVersion : "",
     },
     {
       existing: {
@@ -1807,7 +1866,7 @@ function statusKind(status) {
   if (normalized.includes("disconnect") || normalized.includes("retry")) {
     return "retrying";
   }
-  if (normalized.includes("connecting")) {
+  if (normalized.includes("connecting") || normalized.includes("loading") || normalized.includes("preparing")) {
     return "connecting";
   }
   if (normalized.includes("cdp connected")) {
@@ -1852,6 +1911,8 @@ function connectionFromUrlParams(params) {
     requirePassword: booleanFlag(params.get("requirePassword")) || params.get("e2ee") === E2EE_VERSION,
     token: directToken,
     url: location.href,
+    webAssetBaseUrl: params.get("webAssetBaseUrl") || params.get("web_asset_base_url") || "",
+    webAssetVersion: params.get("webAssetVersion") || params.get("web_asset_version") || "",
   };
 }
 
@@ -1884,6 +1945,18 @@ function parseConnection(raw) {
             connection.requirePassword,
           token: typeof parsed.token === "string" ? parsed.token : connection.token,
           url: connection.url,
+          webAssetBaseUrl:
+            typeof parsed.webAssetBaseUrl === "string"
+              ? parsed.webAssetBaseUrl
+              : typeof parsed.web_asset_base_url === "string"
+                ? parsed.web_asset_base_url
+                : connection.webAssetBaseUrl,
+          webAssetVersion:
+            typeof parsed.webAssetVersion === "string"
+              ? parsed.webAssetVersion
+              : typeof parsed.web_asset_version === "string"
+                ? parsed.web_asset_version
+                : connection.webAssetVersion,
         };
       }
 
@@ -1908,6 +1981,22 @@ function parseConnection(raw) {
         if (parsedMode) {
           url.searchParams.set("remoteMode", parsedMode);
         }
+        const parsedWebAssetBaseUrl =
+          typeof parsed.webAssetBaseUrl === "string"
+            ? parsed.webAssetBaseUrl
+            : typeof parsed.web_asset_base_url === "string"
+              ? parsed.web_asset_base_url
+              : "";
+        const parsedWebAssetVersion =
+          typeof parsed.webAssetVersion === "string"
+            ? parsed.webAssetVersion
+            : typeof parsed.web_asset_version === "string"
+              ? parsed.web_asset_version
+              : "";
+        if (parsedWebAssetBaseUrl) {
+          url.searchParams.set("webAssetBaseUrl", parsedWebAssetBaseUrl);
+          url.searchParams.set("webAssetVersion", parsedWebAssetVersion || "latest");
+        }
         const requirePassword = parsed.requirePassword === true || parsed.require_password === true;
         if (requirePassword) {
           url.searchParams.set("requirePassword", "1");
@@ -1920,6 +2009,8 @@ function parseConnection(raw) {
           requirePassword,
           token: typeof parsed.token === "string" ? parsed.token : "",
           url: url.toString(),
+          webAssetBaseUrl: parsedWebAssetBaseUrl,
+          webAssetVersion: parsedWebAssetVersion,
         };
       }
     }
@@ -1936,6 +2027,8 @@ function parseConnection(raw) {
       requirePassword: booleanFlag(url.searchParams.get("requirePassword")) || url.searchParams.get("e2ee") === E2EE_VERSION,
       token: url.searchParams.get("token") || "",
       url: url.toString(),
+      webAssetBaseUrl: url.searchParams.get("webAssetBaseUrl") || url.searchParams.get("web_asset_base_url") || "",
+      webAssetVersion: url.searchParams.get("webAssetVersion") || url.searchParams.get("web_asset_version") || "",
     };
   } catch {
     return null;
@@ -2189,12 +2282,210 @@ function wsUrl(pathname) {
   return `${protocol}//${host}${remotePathPrefix}${pathname}?${params.toString()}`;
 }
 
+async function fetchRemoteInfo() {
+  try {
+    const infoUrl = new URL(`${remotePathPrefix}/api/remote-info`, remoteOrigin);
+    infoUrl.searchParams.set("token", token);
+    if (remoteCloudUser) {
+      infoUrl.searchParams.set("cloudUser", remoteCloudUser);
+    }
+    if (remoteJwt) {
+      infoUrl.searchParams.set("jwt", remoteJwt);
+    }
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 1800);
+    const response = await fetch(infoUrl, { cache: "no-store", signal: controller.signal }).finally(() => {
+      window.clearTimeout(timeout);
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const info = await response.json();
+    return info && typeof info === "object" ? info : null;
+  } catch (error) {
+    console.warn("[remote-info] unable to load connection metadata", error);
+    return null;
+  }
+}
+
+function webAssetRegistryEnabled() {
+  return Boolean(webAssetBaseUrl);
+}
+
+function connectionWebAssetBaseUrl(connection, connectionUrl, remoteInfo = null) {
+  return normalizeWebAssetBaseUrl(
+    connection.webAssetBaseUrl ||
+      connection.web_asset_base_url ||
+      connectionUrl.searchParams.get("webAssetBaseUrl") ||
+      connectionUrl.searchParams.get("web_asset_base_url") ||
+      remoteInfoField(remoteInfo, "webAssetBaseUrl", "web_asset_base_url") ||
+      urlParams.get("webAssetBaseUrl") ||
+      urlParams.get("web_asset_base_url") ||
+      "",
+  );
+}
+
+function connectionWebAssetVersion(connection, connectionUrl, remoteInfo = null) {
+  return normalizeWebAssetVersion(
+    connection.webAssetVersion ||
+      connection.web_asset_version ||
+      connectionUrl.searchParams.get("webAssetVersion") ||
+      connectionUrl.searchParams.get("web_asset_version") ||
+      remoteInfoField(remoteInfo, "webAssetVersion", "web_asset_version") ||
+      urlParams.get("webAssetVersion") ||
+      urlParams.get("web_asset_version") ||
+      "latest",
+  );
+}
+
+function remoteInfoField(remoteInfo, ...keys) {
+  if (!remoteInfo || typeof remoteInfo !== "object") {
+    return "";
+  }
+  for (const key of keys) {
+    const value = remoteInfo[key];
+    if (value !== undefined && value !== null) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function normalizeWebAssetBaseUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    const url = new URL(raw, location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function normalizeWebAssetVersion(value) {
+  const version = String(value || "").trim() || "latest";
+  return /^[0-9A-Za-z._-]+$/.test(version) ? version : "latest";
+}
+
+function applyWebAssetParams(params) {
+  if (!webAssetRegistryEnabled()) {
+    return params;
+  }
+  params.set("webAssetMode", "registry");
+  params.set("webAssetBaseUrl", webAssetBaseUrl);
+  params.set("webAssetVersion", webAssetVersion);
+  return params;
+}
+
+function webAssetFrameUrl() {
+  const base = new URL(`${webAssetBaseUrl}/`);
+  return new URL(`${encodeURIComponent(webAssetVersion)}/index.html`, base);
+}
+
+function configureWebAssetVersionSelect(versions = [], latest = "") {
+  if (!webAssetVersionSelect) {
+    return;
+  }
+  if (!webAssetRegistryEnabled()) {
+    webAssetVersionSelect.hidden = true;
+    return;
+  }
+
+  const labels = new Map();
+  const latestVersion = normalizeWebAssetVersion(latest || "");
+  labels.set("latest", latest && latestVersion !== "latest" ? `Latest (${latestVersion})` : "Latest");
+  labels.set(webAssetVersion, webAssetVersion === "latest" ? labels.get("latest") : webAssetVersion);
+  for (const item of versions) {
+    const version = normalizeWebAssetVersion(typeof item === "string" ? item : item?.version);
+    if (!version || version === "latest") {
+      continue;
+    }
+    labels.set(version, typeof item?.label === "string" && item.label ? item.label : version);
+  }
+
+  webAssetVersionSelect.replaceChildren(
+    ...Array.from(labels, ([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      return option;
+    }),
+  );
+  webAssetVersionSelect.value = labels.has(webAssetVersion) ? webAssetVersion : "latest";
+  webAssetVersionSelect.hidden = false;
+}
+
+async function refreshWebAssetVersions() {
+  const baseUrl = webAssetBaseUrl;
+  if (!baseUrl) {
+    return;
+  }
+  try {
+    const response = await fetch(new URL("versions.json", `${baseUrl}/`), { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const manifest = await response.json();
+    if (baseUrl !== webAssetBaseUrl) {
+      return;
+    }
+    configureWebAssetVersionSelect(manifest?.versions || [], manifest?.latest || "");
+  } catch (error) {
+    console.warn("[web-assets] unable to load versions.json", error);
+  }
+}
+
+function persistActiveWebAssetSelection() {
+  if (!activeInstanceId || !webAssetRegistryEnabled()) {
+    return;
+  }
+  let changed = false;
+  instances = instances.map((instance) => {
+    if (instance.id !== activeInstanceId) {
+      return instance;
+    }
+    let nextUrl = instance.url;
+    try {
+      const url = normalizeConnectionUrl(instance.url);
+      url.searchParams.set("webAssetBaseUrl", webAssetBaseUrl);
+      url.searchParams.set("webAssetVersion", webAssetVersion);
+      nextUrl = url.toString();
+    } catch {
+      // Keep the existing URL if it cannot be parsed; the instance fields still persist the selection.
+    }
+    changed = true;
+    return {
+      ...instance,
+      updatedAt: Date.now(),
+      url: nextUrl,
+      webAssetBaseUrl,
+      webAssetVersion,
+    };
+  });
+  if (changed) {
+    saveStoredInstances();
+  }
+}
+
 function webBridgeUrl() {
-  const url = new URL(`${remotePathPrefix}/web/index.html`, remoteOrigin);
+  const url = webAssetRegistryEnabled()
+    ? webAssetFrameUrl()
+    : new URL(`${remotePathPrefix}/web/index.html`, remoteOrigin);
   url.searchParams.set("hostId", "local");
   url.searchParams.set("token", token);
   applyWebEndpointCryptoParams(url.searchParams);
   url.searchParams.set(WEB_BRIDGE_URL_PARAM, webBridgeSocketUrl());
+  if (webAssetRegistryEnabled()) {
+    url.searchParams.set("codexBridgeParent", "1");
+    url.searchParams.set("codexBridgeParentOrigin", location.origin);
+  }
   const bridgeTransportUrl = webBridgeWebTransportUrl();
   if (bridgeTransportUrl) {
     url.searchParams.set("codexBridgeTransportUrl", bridgeTransportUrl);
@@ -2273,6 +2564,7 @@ function openRemoteControlPageDirectly() {
   url.searchParams.set("remoteMode", REMOTE_MODE_WEB);
   url.searchParams.set("transport", transportPreference || "auto");
   applyCryptoParams(url.searchParams);
+  applyWebAssetParams(url.searchParams);
   if (remoteCloudUser) {
     url.searchParams.set("cloudUser", remoteCloudUser);
   }
@@ -2532,6 +2824,9 @@ function retryingStatus(text) {
 }
 
 function handleWebBridgeStatusMessage(event) {
+  if (handleParentBridgeFrameMessage(event)) {
+    return;
+  }
   const message = event.data || {};
   if (!message || message.type !== WEB_BRIDGE_STATUS_MESSAGE) {
     return;
@@ -2567,6 +2862,132 @@ function handleWebBridgeStatusMessage(event) {
       updateInstanceStatus(activeInstanceId, text);
     }
     scheduleWebBridgeStaleReload(text);
+  }
+}
+
+function handleParentBridgeFrameMessage(event) {
+  const message = event.data || {};
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const type = message.type;
+  if (
+    type !== PARENT_BRIDGE_OPEN_MESSAGE &&
+    type !== PARENT_BRIDGE_SEND_MESSAGE &&
+    type !== PARENT_BRIDGE_CLOSE_MESSAGE
+  ) {
+    return false;
+  }
+  if (!webFrame?.contentWindow || event.source !== webFrame.contentWindow) {
+    return true;
+  }
+  const clientId = typeof message.clientId === "string" ? message.clientId : "";
+  if (!clientId) {
+    return true;
+  }
+  if (type === PARENT_BRIDGE_OPEN_MESSAGE) {
+    openParentBridgeClient(clientId);
+  } else if (type === PARENT_BRIDGE_SEND_MESSAGE) {
+    sendParentBridgeClientMessage(clientId, String(message.raw || ""));
+  } else if (type === PARENT_BRIDGE_CLOSE_MESSAGE) {
+    closeParentBridgeClient(clientId, { notify: false });
+  }
+  return true;
+}
+
+function openParentBridgeClient(clientId) {
+  const existing = parentBridgeClients.get(clientId);
+  if (existing?.socket?.readyState === WebSocket.OPEN) {
+    postParentBridgeFrameMessage(clientId, { type: PARENT_BRIDGE_OPENED_MESSAGE });
+    return;
+  }
+  closeParentBridgeClient(clientId, { notify: false });
+
+  const socket = new WebSocket(webBridgeSocketUrl());
+  const client = {
+    opened: false,
+    socket,
+  };
+  parentBridgeClients.set(clientId, client);
+
+  socket.addEventListener("open", () => {
+    client.opened = true;
+    postParentBridgeFrameMessage(clientId, { type: PARENT_BRIDGE_OPENED_MESSAGE });
+  });
+  socket.addEventListener("message", (event) => {
+    postParentBridgeFrameMessage(clientId, {
+      raw: typeof event.data === "string" ? event.data : "",
+      type: PARENT_BRIDGE_MESSAGE,
+    });
+  });
+  socket.addEventListener("close", () => {
+    if (parentBridgeClients.get(clientId)?.socket !== socket) {
+      return;
+    }
+    parentBridgeClients.delete(clientId);
+    postParentBridgeFrameMessage(clientId, { type: PARENT_BRIDGE_CLOSED_MESSAGE });
+  });
+  socket.addEventListener("error", () => {
+    if (!client.opened) {
+      postParentBridgeFrameMessage(clientId, {
+        error: "Codex bridge websocket failed to connect",
+        type: PARENT_BRIDGE_ERROR_MESSAGE,
+      });
+    }
+  });
+}
+
+function sendParentBridgeClientMessage(clientId, raw) {
+  const socket = parentBridgeClients.get(clientId)?.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    postParentBridgeFrameMessage(clientId, {
+      error: "Codex bridge websocket is not open",
+      type: PARENT_BRIDGE_ERROR_MESSAGE,
+    });
+    return;
+  }
+  socket.send(raw);
+}
+
+function closeParentBridgeClient(clientId, { notify = true } = {}) {
+  const client = parentBridgeClients.get(clientId);
+  if (!client) {
+    return;
+  }
+  parentBridgeClients.delete(clientId);
+  try {
+    client.socket?.close();
+  } catch {}
+  if (notify) {
+    postParentBridgeFrameMessage(clientId, { type: PARENT_BRIDGE_CLOSED_MESSAGE });
+  }
+}
+
+function closeParentBridgeClients() {
+  for (const clientId of Array.from(parentBridgeClients.keys())) {
+    closeParentBridgeClient(clientId, { notify: false });
+  }
+  parentBridgeClients = new Map();
+}
+
+function postParentBridgeFrameMessage(clientId, payload) {
+  if (!webFrame?.contentWindow) {
+    return;
+  }
+  webFrame.contentWindow.postMessage(
+    {
+      ...payload,
+      clientId,
+    },
+    webFrameTargetOrigin(),
+  );
+}
+
+function webFrameTargetOrigin() {
+  try {
+    return new URL(webFrame?.src || "", location.href).origin;
+  } catch {
+    return "*";
   }
 }
 

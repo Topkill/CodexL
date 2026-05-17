@@ -1,3 +1,4 @@
+mod cli;
 mod cli_middleware;
 mod config;
 mod extensions;
@@ -11,9 +12,11 @@ use config::{
     AppConfig, BotProfileConfig, DefaultProviderProfile, ExistingProviderRequest,
     NewProviderRequest, NextAiGatewayProviderRequest, UpdateNextAiGatewayProviderRequest,
     UpdateProviderRequest, UpdateWorkspaceRequest, WorkspaceRequest, DEFAULT_PROVIDER_PROFILE_NAME,
+    REMOTE_FRONTEND_MODE_CLI,
 };
 use extensions::builtins::bot_bridge;
 use extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -23,6 +26,10 @@ use tokio::sync::Mutex;
 
 pub fn run_cli_middleware_if_requested() -> bool {
     cli_middleware::run_if_requested()
+}
+
+pub fn run_cli_if_requested() -> bool {
+    cli::run_if_requested()
 }
 
 #[derive(Clone)]
@@ -51,6 +58,59 @@ fn find_codex() -> Result<String, String> {
     launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CodexWebAssetVersions {
+    latest: String,
+    versions: Vec<String>,
+}
+
+#[tauri::command]
+async fn list_codex_web_asset_versions(
+    registry_url: String,
+) -> Result<CodexWebAssetVersions, String> {
+    let registry_url = registry_url.trim().trim_end_matches('/');
+    if registry_url.is_empty() {
+        return Err("REGISTRY_URL is required".to_string());
+    }
+    let versions_url = reqwest::Url::parse(&format!("{}/versions.json", registry_url))
+        .map_err(|e| format!("Invalid REGISTRY_URL: {}", e))?;
+    let response = reqwest::get(versions_url)
+        .await
+        .map_err(|e| format!("Failed to fetch versions.json: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Failed to fetch versions.json: {}", e))?;
+    let manifest = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Invalid versions.json: {}", e))?;
+    let latest = manifest
+        .get("latest")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let mut versions = Vec::new();
+    if let Some(items) = manifest.get("versions").and_then(|value| value.as_array()) {
+        for item in items {
+            let version = item
+                .as_str()
+                .or_else(|| item.get("version").and_then(|value| value.as_str()))
+                .map(str::trim)
+                .unwrap_or_default();
+            if !version.is_empty() && !versions.iter().any(|existing| existing == version) {
+                versions.push(version.to_string());
+            }
+        }
+    }
+    if !latest.is_empty() && !versions.iter().any(|version| version == &latest) {
+        versions.insert(0, latest.clone());
+    }
+    if versions.is_empty() {
+        return Err("versions.json does not contain any versions".to_string());
+    }
+    Ok(CodexWebAssetVersions { latest, versions })
+}
+
 #[tauri::command]
 async fn launch_codex(
     state: tauri::State<'_, AppState>,
@@ -59,6 +119,31 @@ async fn launch_codex(
     codex_home: Option<String>,
     profile_name: Option<String>,
 ) -> Result<server::LaunchInfo, String> {
+    let requested_profile_name = {
+        let config = state.config.lock().await;
+        profile_name
+            .clone()
+            .unwrap_or_else(|| config.active_provider.clone())
+    };
+    let uses_cli_mode = {
+        let config = state.config.lock().await;
+        config
+            .provider_profile(&requested_profile_name)
+            .map(|profile| {
+                profile
+                    .remote_frontend_mode
+                    .trim()
+                    .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLI)
+            })
+            .unwrap_or(false)
+    };
+    if uses_cli_mode {
+        return Err(
+            "CLI mode workspaces do not launch Codex App. Start remote control instead."
+                .to_string(),
+        );
+    }
+
     server::launch_codex_instance(
         state.inner(),
         server::LaunchRequest {
@@ -298,6 +383,9 @@ async fn update_provider(
     if provider.original_name == DEFAULT_PROVIDER_PROFILE_NAME {
         let bot = provider.bot.clone();
         let proxy_url = provider.proxy_url.trim().to_string();
+        let remote_frontend_mode = provider.remote_frontend_mode.clone();
+        let remote_web_asset_registry_url = provider.remote_web_asset_registry_url.clone();
+        let remote_web_asset_version = provider.remote_web_asset_version.clone();
         config::update_default_provider_selection(ExistingProviderRequest {
             workspace_name: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
             profile_name: provider.profile_name,
@@ -305,6 +393,9 @@ async fn update_provider(
             api_key: provider.api_key,
             model: provider.model,
             proxy_url: proxy_url.clone(),
+            remote_frontend_mode: String::new(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: String::new(),
             bot: BotProfileConfig::default(),
         })?;
         let mut config = state.config.lock().await;
@@ -315,6 +406,9 @@ async fn update_provider(
         {
             profile.bot = bot;
             profile.proxy_url = proxy_url;
+            profile.remote_frontend_mode = remote_frontend_mode;
+            profile.remote_web_asset_registry_url = remote_web_asset_registry_url;
+            profile.remote_web_asset_version = remote_web_asset_version;
             let profile_id = profile.id.clone();
             profile
                 .bot
@@ -661,7 +755,13 @@ pub fn run() {
                         let profile_name = config.active_provider.clone();
                         let start_remote = config
                             .provider_profile(&profile_name)
-                            .map(|profile| profile.start_remote_on_launch)
+                            .map(|profile| {
+                                profile.start_remote_on_launch
+                                    || profile
+                                        .remote_frontend_mode
+                                        .trim()
+                                        .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLI)
+                            })
                             .unwrap_or(false);
                         (config.auto_launch, profile_name, start_remote)
                     };
@@ -706,6 +806,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             find_codex,
+            list_codex_web_asset_versions,
             launch_codex,
             stop_codex,
             get_status,

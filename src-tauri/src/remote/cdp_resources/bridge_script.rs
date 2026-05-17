@@ -127,6 +127,13 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  const sharedObjects = (window.__codexWebSharedObjects ||= Object.create(null));
 	  const pending = new Map();
 	  const BRIDGE_STATUS_MESSAGE = "codex-web-bridge-status";
+	  const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
+	  const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
+	  const PARENT_BRIDGE_SEND_MESSAGE = "codex-web-parent-bridge-send";
+	  const PARENT_BRIDGE_MESSAGE = "codex-web-parent-bridge-message";
+	  const PARENT_BRIDGE_CLOSE_MESSAGE = "codex-web-parent-bridge-close";
+	  const PARENT_BRIDGE_CLOSED_MESSAGE = "codex-web-parent-bridge-closed";
+	  const PARENT_BRIDGE_ERROR_MESSAGE = "codex-web-parent-bridge-error";
 	  const BRIDGE_HEARTBEAT_INTERVAL_MS = 15000;
 	  const BRIDGE_HEARTBEAT_STALE_MS = 30000;
 	  const BRIDGE_HEARTBEAT_TIMEOUT_MS = 8000;
@@ -167,6 +174,13 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  let connectingSocket = null;
 	  let transportClient = null;
 	  let connectingTransport = null;
+	  let parentBridgeOpen = false;
+	  let parentBridgeListenerInstalled = false;
+	  let parentBridgeStopHeartbeat = null;
+	  let parentBridgeOpenTimer = null;
+	  let connectingParentBridge = null;
+	  let resolveParentBridge = null;
+	  let rejectParentBridge = null;
 	  let webTransportUnavailable = false;
 	  let bridgeConnectionStarted = false;
 	  let bridgeLastHeartbeatAckAt = 0;
@@ -182,6 +196,32 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  const E2EE_STORAGE_PREFIX = "codexl.remote.e2ee.v1.";
 	  let bridgeCryptoPromise = null;
 
+	  function parentBridgeTargetOrigin() {
+	    return pageParams.get("codexBridgeParentOrigin") || "*";
+	  }
+
+	  function shouldUseParentBridge() {
+	    return pageParams.get("codexBridgeParent") === "1" && window.parent && window.parent !== window;
+	  }
+
+	  function parentBridgeConnection() {
+	    return {
+	      send(raw) {
+	        return sendParentBridgeRaw(raw);
+	      },
+	    };
+	  }
+
+	  function postParentBridgeMessage(message) {
+	    window.parent.postMessage(
+	      {
+	        ...message,
+	        clientId: bridgeClientId,
+	      },
+	      parentBridgeTargetOrigin(),
+	    );
+	  }
+
 	  function notifyBridgeStatus(status, detail = {}) {
 	    try {
 	      window.parent?.postMessage(
@@ -191,16 +231,76 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	          ts: Date.now(),
 	          type: BRIDGE_STATUS_MESSAGE,
 	        },
-	        window.location.origin,
+	        parentBridgeTargetOrigin(),
 	      );
 	    } catch {}
 	  }
+
+  function bridgeDebug(...args) {
+    try {
+      console.info("[codex-web][bridge]", ...args);
+    } catch {}
+  }
+
+  function bridgeMessageLabel(message) {
+    if (!message || typeof message !== "object") {
+      return String(message);
+    }
+    const type = message.type || "?";
+    if (type === "fetch") {
+      let endpoint = "";
+      try {
+        endpoint = new URL(message.url, window.location.href).pathname.replace(/^\//, "");
+      } catch {}
+      return `fetch:${endpoint}:${message.requestId || ""}`;
+    }
+    if (type === "fetch-response") {
+      return `fetch-response:${message.requestId || ""}:${message.responseType || ""}`;
+    }
+    if (type === "ipc-broadcast") {
+      const params = message.params || {};
+      const change = params.change || {};
+      const turnCount =
+        change.type === "snapshot" && Array.isArray(change.conversationState?.turns)
+          ? `:turns=${change.conversationState.turns.length}`
+          : "";
+      return `ipc-broadcast:${message.method || ""}:${change.type || ""}:${params.conversationId || ""}${turnCount}`;
+    }
+    if (type === "thread-stream-state-changed") {
+      const change = message.change || {};
+      const turnCount =
+        change.type === "snapshot" && Array.isArray(change.conversationState?.turns)
+          ? `:turns=${change.conversationState.turns.length}`
+          : "";
+      return `thread-stream-state-changed:${change.type || ""}:${message.conversationId || ""}${turnCount}`;
+    }
+    if (type === "mcp-request") {
+      return `mcp-request:${message.request?.method || ""}`;
+    }
+    if (type === "mcp-notification") {
+      return `mcp-notification:${message.method || ""}`;
+    }
+    if (type === "mcp-response") {
+      return `mcp-response:${message.message?.method || message.message?.id || ""}`;
+    }
+    return type;
+  }
+
+  function bridgePayloadLabels(payload) {
+    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+    const labels = messages.slice(0, 8).map(bridgeMessageLabel);
+    if (messages.length > labels.length) {
+      labels.push(`+${messages.length - labels.length}`);
+    }
+    return labels.join(",") || "-";
+  }
 
   function dispatchHostMessage(message) {
     if (!message || typeof message !== "object") {
       return;
     }
     const hostMessage = stripBridgeMetadata(normalizeHostMessageForCodexApp(message));
+    bridgeDebug("dispatchHostMessage", bridgeMessageLabel(hostMessage));
     if (hostMessage.type === "shared-object-updated" && typeof hostMessage.key === "string") {
       sharedObjects[hostMessage.key] = hostMessage.value;
     }
@@ -443,6 +543,23 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 
 	  function closeBridgeConnection() {
 	    clearBridgeHeartbeatTimeout();
+	    if (parentBridgeOpen || connectingParentBridge) {
+	      try {
+	        postParentBridgeMessage({ type: PARENT_BRIDGE_CLOSE_MESSAGE });
+	      } catch {}
+	    }
+	    parentBridgeOpen = false;
+	    connectingParentBridge = null;
+	    resolveParentBridge = null;
+	    rejectParentBridge = null;
+	    if (parentBridgeOpenTimer) {
+	      window.clearTimeout(parentBridgeOpenTimer);
+	      parentBridgeOpenTimer = null;
+	    }
+	    try {
+	      parentBridgeStopHeartbeat?.();
+	    } catch {}
+	    parentBridgeStopHeartbeat = null;
 	    try {
 	      socket?.close();
 	    } catch {}
@@ -484,6 +601,114 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	      window.clearInterval(timer);
 	      clearBridgeHeartbeatTimeout();
 	    };
+	  }
+
+	  function ensureParentBridgeListener() {
+	    if (parentBridgeListenerInstalled) {
+	      return;
+	    }
+	    parentBridgeListenerInstalled = true;
+	    window.addEventListener("message", handleParentBridgeMessage);
+	  }
+
+	  function openParentBridgeConnection() {
+	    if (parentBridgeOpen) {
+	      return Promise.resolve(parentBridgeConnection());
+	    }
+	    if (connectingParentBridge) {
+	      return connectingParentBridge;
+	    }
+	    ensureParentBridgeListener();
+	    connectingParentBridge = new Promise((resolve, reject) => {
+	      resolveParentBridge = resolve;
+	      rejectParentBridge = reject;
+	      if (parentBridgeOpenTimer) {
+	        window.clearTimeout(parentBridgeOpenTimer);
+	      }
+	      parentBridgeOpenTimer = window.setTimeout(() => {
+	        parentBridgeOpenTimer = null;
+	        connectingParentBridge = null;
+	        resolveParentBridge = null;
+	        rejectParentBridge = null;
+	        reject(new Error("Timed out waiting for parent Codex bridge"));
+	      }, BRIDGE_HEARTBEAT_TIMEOUT_MS);
+	      postParentBridgeMessage({ type: PARENT_BRIDGE_OPEN_MESSAGE });
+	    });
+	    return connectingParentBridge;
+	  }
+
+	  async function sendParentBridgeRaw(raw) {
+	    if (!parentBridgeOpen) {
+	      throw new Error("Parent Codex bridge is not open");
+	    }
+	    postParentBridgeMessage({
+	      raw: await encryptBridgeText(raw),
+	      type: PARENT_BRIDGE_SEND_MESSAGE,
+	    });
+	  }
+
+	  function settleParentBridgeOpen() {
+	    if (parentBridgeOpenTimer) {
+	      window.clearTimeout(parentBridgeOpenTimer);
+	      parentBridgeOpenTimer = null;
+	    }
+	    parentBridgeOpen = true;
+	    connectingParentBridge = null;
+	    const resolve = resolveParentBridge;
+	    resolveParentBridge = null;
+	    rejectParentBridge = null;
+	    try {
+	      parentBridgeStopHeartbeat?.();
+	    } catch {}
+	    parentBridgeStopHeartbeat = startBridgeHeartbeat(sendParentBridgeRaw);
+	    markBridgeConnectionOpen();
+	    resolve?.(parentBridgeConnection());
+	  }
+
+	  function handleParentBridgeClosed(reason) {
+	    const error = new Error(reason || "Parent Codex bridge closed");
+	    parentBridgeOpen = false;
+	    if (parentBridgeOpenTimer) {
+	      window.clearTimeout(parentBridgeOpenTimer);
+	      parentBridgeOpenTimer = null;
+	    }
+	    try {
+	      parentBridgeStopHeartbeat?.();
+	    } catch {}
+	    parentBridgeStopHeartbeat = null;
+	    if (connectingParentBridge) {
+	      const reject = rejectParentBridge;
+	      connectingParentBridge = null;
+	      resolveParentBridge = null;
+	      rejectParentBridge = null;
+	      reject?.(error);
+	      return;
+	    }
+	    notifyBridgeStatus("disconnected");
+	    rejectPending(error);
+	    scheduleBridgeReconnect();
+	  }
+
+	  async function handleParentBridgeMessage(event) {
+	    const message = event.data || {};
+	    if (!message || message.clientId !== bridgeClientId) {
+	      return;
+	    }
+	    if (message.type === PARENT_BRIDGE_OPENED_MESSAGE) {
+	      settleParentBridgeOpen();
+	      return;
+	    }
+	    if (message.type === PARENT_BRIDGE_MESSAGE) {
+	      try {
+	        handleBridgePayload(JSON.parse(await decryptBridgeText(String(message.raw || ""))));
+	      } catch (error) {
+	        console.warn("[codex-web] invalid parent bridge payload", error);
+	      }
+	      return;
+	    }
+	    if (message.type === PARENT_BRIDGE_CLOSED_MESSAGE || message.type === PARENT_BRIDGE_ERROR_MESSAGE) {
+	      handleParentBridgeClosed(String(message.error || message.reason || ""));
+	    }
 	  }
 
 	  function markBridgeConnectionOpen() {
@@ -680,6 +905,13 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	    if (payload?.type === "bridge-heartbeat-ack") {
 	      return;
 	    }
+      bridgeDebug(
+        "handleBridgePayload",
+        `id=${payload?.id || ""}`,
+        `messages=${Array.isArray(payload?.messages) ? payload.messages.length : 0}`,
+        bridgePayloadLabels(payload),
+        payload?.error ? `error=${payload.error}` : "",
+      );
 	    for (const hostMessage of payload.messages || []) {
 	      if (hostMessage?.type === "codex-web-bridge-notification-gap") {
 	        requestHostSnapshot(hostMessage.reason || "notification-gap", { force: true });
@@ -880,6 +1112,9 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	  }
 
 	  async function openBridgeConnection() {
+	    if (shouldUseParentBridge()) {
+	      return await openParentBridgeConnection();
+	    }
 	    if (shouldTryBridgeTransport()) {
 	      try {
 	        return await openBridgeTransport();
@@ -1074,6 +1309,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	      closeBridgeConnection();
 	    }
 	    const id = String(nextMessageId++);
+      bridgeDebug("sendBridgeRequest", `id=${id}`, bridgeMessageLabel(message));
 	    const timeoutMs = bridgeRequestTimeoutMs(message);
 	    const pendingResponse = new Promise((resolve, reject) => {
 	      const timer = window.setTimeout(() => {
@@ -1092,6 +1328,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	        pending.delete(id);
 	        entry.reject(error);
 	      }
+        bridgeDebug("sendBridgeRequest failed", `id=${id}`, bridgeMessageLabel(message), error?.message || String(error));
 	      scheduleBridgeReconnect();
 	    }
 	    return pendingResponse;
@@ -1975,6 +2212,7 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
       return;
     }
     try {
+      bridgeDebug("forwardToCodexHost", bridgeMessageLabel(message));
       if (await maybeHandleWebFolderPickerMessage(message)) {
         return;
       }

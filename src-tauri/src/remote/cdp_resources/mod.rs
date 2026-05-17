@@ -28,18 +28,19 @@ pub use bridge::{
     dispatch_web_bridge_message, dispatch_web_bridge_socket_payload_with_emitter,
     handle_web_bridge_websocket, spawn_web_bridge_notification_pump,
 };
+pub(crate) use bridge::{
+    is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message, web_bridge_socket_response,
+};
 pub use resource::{
     dispatch_web_resource_socket_payload, get_web_resource, handle_web_resource_websocket,
 };
 
 #[cfg(test)]
 use bridge::{
-    is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message,
     web_bridge_dispatch_expression, web_bridge_event_hub_test_fanout_messages,
     web_bridge_event_hub_test_gap_message, web_bridge_notification_install_expression,
     web_bridge_notification_poll_expression, web_bridge_snapshot_request_expression,
-    web_bridge_socket_response, web_bridge_stream_poll_expression,
-    web_bridge_stream_start_expression,
+    web_bridge_stream_poll_expression, web_bridge_stream_start_expression,
 };
 #[cfg(test)]
 use bridge_script::WEB_BRIDGE_SCRIPT;

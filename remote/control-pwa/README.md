@@ -31,6 +31,55 @@ iframe load the cached `/web/index.html` from the PWA's own service worker
 scope. The cached iframe receives the authenticated web bridge URL in its query
 string.
 
+## Codex App web asset registry
+
+For environments that can run Codex CLI but do not have Codex App installed,
+CodexL can load the Codex App frontend from a hosted static registry instead of
+mirroring `/web/` resources from the local app.
+
+Extract the webview bundle from an installed Codex App package:
+
+```sh
+pnpm run extract:codex-web -- --app /Applications/Codex.app --clean
+```
+
+The script writes a versioned static registry to `dist/codex-app-web`:
+
+```text
+dist/codex-app-web/
+  versions.json
+  latest.json
+  latest/index.html
+  26.513.31313/index.html
+  26.513.31313/manifest.json
+  26.513.31313/assets/...
+```
+
+`index.html` is prepared for static hosting: the existing CodexL web bridge is
+injected before the Codex module bundle, CSP placeholders are removed, and root
+asset URLs are made relative to the version directory. `latest/index.html`
+redirects to the newest extracted version while preserving the remote bridge
+query string.
+
+Publish the registry to Cloudflare Pages:
+
+```sh
+pnpm run publish:codex-web -- --project-name codexl-codex-app-web
+```
+
+Then configure the desktop app or its launch environment with the hosted base
+URL. The version defaults to `latest`:
+
+```sh
+CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL=https://codexl-codex-app-web.pages.dev
+CODEXL_REMOTE_WEB_ASSET_VERSION=latest
+```
+
+Remote connection URLs include `webAssetBaseUrl` and `webAssetVersion`. QR
+codes keep only the short token URL; after connecting, the control page reads
+the registry metadata from `/api/remote-info`, loads that hosted bundle by
+default, and shows a bundle selector when the registry exposes `versions.json`.
+
 Camera scanning requires a browser secure context, such as HTTPS or localhost.
 The PWA uses the browser's native QR detector when available and falls back to
 the bundled `jsQR` decoder, then the CodexL-specific local decoder, on mobile

@@ -345,24 +345,60 @@ pub async fn current_launch_info(state: &AppState) -> Result<LaunchInfo, String>
 
 pub async fn instance_statuses(state: &AppState) -> Result<Vec<InstanceStatus>, String> {
     let infos = running_launch_infos(state).await?;
-    let remote_controls = remote::remote_control_status_map(state).await;
-    Ok(infos
+    let mut remote_controls = remote::remote_control_status_map(state).await;
+    let config = state.config.lock().await.clone();
+    let mut statuses = infos
         .into_iter()
-        .map(|info| InstanceStatus {
-            running: info.running,
-            pid: info.pid,
-            cdp_host: info.cdp_host,
-            cdp_port: info.cdp_port,
-            http_host: info.http_host,
-            http_port: info.http_port,
-            codex_path: info.codex_path,
-            codex_home: info.codex_home,
-            proxy_url: info.proxy_url,
-            cli_stdio_path: info.cli_stdio_path,
-            remote_control: remote_controls.get(&info.profile_name).cloned(),
-            profile_name: info.profile_name,
+        .map(|info| {
+            let remote_control = remote_controls.remove(&info.profile_name);
+            InstanceStatus {
+                running: info.running,
+                pid: info.pid,
+                cdp_host: info.cdp_host,
+                cdp_port: info.cdp_port,
+                http_host: info.http_host,
+                http_port: info.http_port,
+                codex_path: info.codex_path,
+                codex_home: info.codex_home,
+                proxy_url: info.proxy_url,
+                cli_stdio_path: info.cli_stdio_path,
+                remote_control,
+                profile_name: info.profile_name,
+            }
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    for (profile_name, remote_control) in remote_controls {
+        let profile = config.provider_profile(&profile_name);
+        let codex_home = profile
+            .as_ref()
+            .map(|profile| {
+                config::generated_codex_home(profile)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_else(|| config.codex_home.clone());
+        let proxy_url = profile
+            .as_ref()
+            .map(|profile| profile.proxy_url.clone())
+            .unwrap_or_default();
+        statuses.push(InstanceStatus {
+            running: false,
+            pid: None,
+            cdp_host: remote_control.cdp_host.clone(),
+            cdp_port: remote_control.cdp_port,
+            http_host: config.http_host.clone(),
+            http_port: config.http_port,
+            codex_path: config.codex_path.clone(),
+            codex_home,
+            proxy_url,
+            cli_stdio_path: None,
+            remote_control: Some(remote_control),
+            profile_name,
+        });
+    }
+
+    Ok(statuses)
 }
 
 async fn handle_request(

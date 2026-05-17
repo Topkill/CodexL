@@ -1102,7 +1102,7 @@ where
     web_bridge_socket_response(id, result)
 }
 
-pub(super) fn is_web_bridge_socket_heartbeat(message: &Value) -> bool {
+pub(crate) fn is_web_bridge_socket_heartbeat(message: &Value) -> bool {
     message.get("type").and_then(Value::as_str) == Some(WEB_BRIDGE_HEARTBEAT_TYPE)
 }
 
@@ -1369,7 +1369,7 @@ fn decrypt_bridge_socket_text(crypto: Option<&RemoteCrypto>, raw: &str) -> Resul
     }
 }
 
-pub(super) fn parse_web_bridge_socket_message(
+pub(crate) fn parse_web_bridge_socket_message(
     raw: &str,
 ) -> (Option<String>, Result<Value, String>) {
     let value = match serde_json::from_str::<Value>(raw) {
@@ -1394,7 +1394,7 @@ pub(super) fn web_bridge_id_to_string(value: &Value) -> Option<String> {
     }
 }
 
-pub(super) fn web_bridge_socket_response(
+pub(crate) fn web_bridge_socket_response(
     id: Option<String>,
     result: Result<Value, String>,
 ) -> Value {
