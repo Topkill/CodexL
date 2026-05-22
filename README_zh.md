@@ -90,7 +90,6 @@ http://192.168.1.10:3147/?token=...
 | 扩展 | 用途 |
 | --- | --- |
 | Bot Gateway | 将 Codex 连接到 IM 平台，并支持 Bot 登录、消息转发和 handoff 配置。 |
-| Qwen ASR | 通过内置 MCP Server 为 Codex 添加 Qwen3-ASR 语音转录工具。 |
 | NeXT AI Gateway | 将其他协议接口转换为 Codex 可使用的 provider。 |
 
 扩展默认关闭，可在应用设置中启用。启用扩展时，运行时需要 Node.js 20+。
@@ -151,6 +150,9 @@ https://github.com/musistudio/codexl/releases/latest/download/latest.json
 | `CODEXL_HTTP_PORT` | `14588` | 本地 HTTP 代理端口。 |
 | `CODEXL_REMOTE_CONTROL_HOST` | `0.0.0.0` | 远控服务 host。 |
 | `CODEXL_REMOTE_CONTROL_PORT` | `3147` | 远控服务起始端口。 |
+| `CODEXL_REMOTE_TRANSCRIBE_BASE_URL` | 空 | OpenAI-compatible 第三方转录 Base URL；请求会发送到 `/audio/transcriptions`。 |
+| `CODEXL_REMOTE_TRANSCRIBE_API_KEY` | 空 | 第三方转录后端使用的 Bearer token。 |
+| `CODEXL_REMOTE_TRANSCRIBE_MODEL` | `gpt-4o-mini-transcribe` | 远程语音转录请求发送的 model 字段。 |
 | `CODEXL_LANGUAGE` | `en` | 默认界面语言，可使用 `en` 或 `zh`。 |
 | `CODEXL_APPEARANCE` | `system` | 默认外观，可使用 `system`、`light` 或 `dark`。 |
 | `CODEXL_EXTENSIONS_ENABLED` | `false` | 是否默认启用扩展总开关。 |

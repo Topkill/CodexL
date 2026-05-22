@@ -90,7 +90,6 @@ This repository includes optional extensions:
 | Extension | Purpose |
 | --- | --- |
 | Bot Gateway | Connect Codex to IM platforms, with Bot login, message forwarding, and handoff settings. |
-| Qwen ASR | Add Qwen3-ASR transcription tools to Codex through a built-in MCP server. |
 | NeXT AI Gateway | Convert other protocol interfaces into providers that Codex can use. |
 
 Extensions are disabled by default and can be enabled in app settings. When extensions are enabled, the runtime requires Node.js 20+.
@@ -151,6 +150,9 @@ It then downloads the signed update package for the current platform, installs i
 | `CODEXL_HTTP_PORT` | `14588` | Local HTTP proxy port. |
 | `CODEXL_REMOTE_CONTROL_HOST` | `0.0.0.0` | Remote-control service host. |
 | `CODEXL_REMOTE_CONTROL_PORT` | `3147` | Starting remote-control service port. |
+| `CODEXL_REMOTE_TRANSCRIBE_BASE_URL` | Empty | OpenAI-compatible third-party transcription base URL; requests are sent to `/audio/transcriptions`. |
+| `CODEXL_REMOTE_TRANSCRIBE_API_KEY` | Empty | Bearer token for the third-party transcription backend. |
+| `CODEXL_REMOTE_TRANSCRIBE_MODEL` | `gpt-4o-mini-transcribe` | Model field sent with remote voice transcription requests. |
 | `CODEXL_LANGUAGE` | `en` | Default UI language, either `en` or `zh`. |
 | `CODEXL_APPEARANCE` | `system` | Default appearance: `system`, `light`, or `dark`. |
 | `CODEXL_EXTENSIONS_ENABLED` | `false` | Whether the extension master switch is enabled by default. |

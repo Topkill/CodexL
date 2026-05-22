@@ -29,10 +29,12 @@ const BOT_MEDIA_MCP_SERVER_NAME: &str = "codexl_bot";
 const LEGACY_BOT_MEDIA_MCP_SERVER_NAME: &str = "codexl_bot_media";
 const BOT_MEDIA_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL BOT MEDIA MCP";
 const BOT_MEDIA_MCP_MANAGED_END: &str = "# END CODEXL BOT MEDIA MCP";
-const QWEN_ASR_MCP_RUN_MODE_ARG: &str = "--codexl-qwen-asr-mcp";
-const QWEN_ASR_MCP_SERVER_NAME: &str = "codexl_qwen_asr";
-const QWEN_ASR_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL QWEN ASR MCP";
-const QWEN_ASR_MCP_MANAGED_END: &str = "# END CODEXL QWEN ASR MCP";
+const RETIRED_QWEN_ASR_MCP_SERVER_NAME: &str = "codexl_qwen_asr";
+const RETIRED_QWEN_ASR_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL QWEN ASR MCP";
+const RETIRED_QWEN_ASR_MCP_MANAGED_END: &str = "# END CODEXL QWEN ASR MCP";
+const RETIRED_DOUBAO_IME_MCP_SERVER_NAME: &str = "codexl_doubao_ime";
+const RETIRED_DOUBAO_IME_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL DOUBAO IME MCP";
+const RETIRED_DOUBAO_IME_MCP_MANAGED_END: &str = "# END CODEXL DOUBAO IME MCP";
 const BOT_MEDIA_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
     "CODEXL_BOT_GATEWAY_LOG",
     "CODEXL_BUILTIN_BOT_GATEWAY_ENTRY",
@@ -42,20 +44,6 @@ const BOT_MEDIA_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
     "CODEXL_NODE_PATH",
     "CODEXL_NODE_DIST_BASE_URL",
 ];
-const QWEN_ASR_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
-    "CODEXL_BUILTIN_QWEN_ASR_ENTRY",
-    "CODEXL_BUILTIN_QWEN_ASR_PACKAGE",
-    "CODEXL_BUILTIN_QWEN_ASR_PACKAGE_URL",
-    "CODEXL_BUILTIN_QWEN_ASR_UPDATE_MANIFEST_URL",
-    "CODEXL_NODE_PATH",
-    "CODEXL_NODE_DIST_BASE_URL",
-    "CODEXL_QWEN_ASR_MCP_URL",
-    "CODEXL_QWEN_ASR_GRADIO_URL",
-    "CODEXL_QWEN_ASR_LANG",
-    "CODEXL_QWEN_ASR_RETURN_TIMESTAMPS",
-    "CODEXL_QWEN_ASR_TOOL_TIMEOUT_MS",
-];
-
 static UUID_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,7 +491,6 @@ pub struct ExtensionSettings {
     pub enabled: bool,
     pub bot_gateway_enabled: bool,
     pub next_ai_gateway_enabled: bool,
-    pub qwen_asr_enabled: bool,
 }
 
 impl Default for ExtensionSettings {
@@ -512,7 +499,6 @@ impl Default for ExtensionSettings {
             enabled: env_bool("CODEXL_EXTENSIONS_ENABLED", false),
             bot_gateway_enabled: false,
             next_ai_gateway_enabled: false,
-            qwen_asr_enabled: false,
         }
     }
 }
@@ -529,6 +515,7 @@ pub struct AppConfig {
     pub remote_relay_url: String,
     pub remote_web_asset_registry_url: String,
     pub remote_web_asset_version: String,
+    pub remote_transcribe_base_url: String,
     pub remote_transcribe_api_url: String,
     pub remote_transcribe_api_key: String,
     pub remote_transcribe_model: String,
@@ -549,6 +536,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         let codex_home = default_codex_home();
+        let legacy_transcribe_api_url = env_string("CODEXL_REMOTE_TRANSCRIBE_API_URL", "");
         Self {
             cdp_host: env_string("CODEXL_CDP_HOST", "127.0.0.1"),
             cdp_port: env_u16("CODEXL_CDP_PORT", 9222),
@@ -559,7 +547,11 @@ impl Default for AppConfig {
             remote_relay_url: env_string("CODEXL_REMOTE_RELAY_URL", ""),
             remote_web_asset_registry_url: env_string("CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL", ""),
             remote_web_asset_version: env_string("CODEXL_REMOTE_WEB_ASSET_VERSION", "latest"),
-            remote_transcribe_api_url: env_string("CODEXL_REMOTE_TRANSCRIBE_API_URL", ""),
+            remote_transcribe_base_url: env_string(
+                "CODEXL_REMOTE_TRANSCRIBE_BASE_URL",
+                &legacy_transcribe_api_url,
+            ),
+            remote_transcribe_api_url: legacy_transcribe_api_url,
             remote_transcribe_api_key: env_string("CODEXL_REMOTE_TRANSCRIBE_API_KEY", ""),
             remote_transcribe_model: env_string(
                 "CODEXL_REMOTE_TRANSCRIBE_MODEL",
@@ -617,11 +609,15 @@ impl AppConfig {
             .to_string();
         self.remote_web_asset_version =
             normalized_remote_web_asset_version(&self.remote_web_asset_version);
-        self.remote_transcribe_api_url = self
-            .remote_transcribe_api_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+        self.remote_transcribe_base_url =
+            normalize_transcribe_base_url(&self.remote_transcribe_base_url);
+        self.remote_transcribe_api_url =
+            normalize_transcribe_base_url(&self.remote_transcribe_api_url);
+        if self.remote_transcribe_base_url.is_empty() && !self.remote_transcribe_api_url.is_empty()
+        {
+            self.remote_transcribe_base_url = self.remote_transcribe_api_url.clone();
+        }
+        self.remote_transcribe_api_url = self.remote_transcribe_base_url.clone();
         self.remote_transcribe_api_key = self.remote_transcribe_api_key.trim().to_string();
         self.remote_transcribe_model = self.remote_transcribe_model.trim().to_string();
         if self.remote_transcribe_model.is_empty() {
@@ -1666,15 +1662,27 @@ fn is_bot_media_mcp_table_header(line: &str) -> bool {
         })
 }
 
-fn sync_qwen_asr_mcp_config(codex_home: &Path, enabled: bool) -> Result<(), String> {
+pub fn remove_retired_builtin_mcp_configs_for_launch(codex_home: &str) -> Result<(), String> {
+    let codex_home = PathBuf::from(normalize_home_path(codex_home));
+    std::fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
+    remove_retired_builtin_mcp_configs(&codex_home)
+}
+
+fn remove_retired_builtin_mcp_configs(codex_home: &Path) -> Result<(), String> {
     let target_config_path = codex_home.join("config.toml");
     let content = std::fs::read_to_string(&target_config_path).unwrap_or_default();
-    let without_existing = remove_qwen_asr_mcp_config(&content);
-    let updated = if enabled {
-        append_qwen_asr_mcp_config(&without_existing)?
-    } else {
-        without_existing
-    };
+    let updated = remove_retired_mcp_config(
+        &content,
+        RETIRED_QWEN_ASR_MCP_SERVER_NAME,
+        RETIRED_QWEN_ASR_MCP_MANAGED_BEGIN,
+        RETIRED_QWEN_ASR_MCP_MANAGED_END,
+    );
+    let updated = remove_retired_mcp_config(
+        &updated,
+        RETIRED_DOUBAO_IME_MCP_SERVER_NAME,
+        RETIRED_DOUBAO_IME_MCP_MANAGED_BEGIN,
+        RETIRED_DOUBAO_IME_MCP_MANAGED_END,
+    );
     if updated == content {
         return Ok(());
     }
@@ -1687,82 +1695,32 @@ fn sync_qwen_asr_mcp_config(codex_home: &Path, enabled: bool) -> Result<(), Stri
     std::fs::write(target_config_path, ensure_trailing_newline(&updated)).map_err(|e| e.to_string())
 }
 
-pub fn sync_qwen_asr_mcp_config_for_launch(codex_home: &str, enabled: bool) -> Result<(), String> {
-    let codex_home = PathBuf::from(normalize_home_path(codex_home));
-    std::fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
-    sync_qwen_asr_mcp_config(&codex_home, enabled)
-}
-
-fn append_qwen_asr_mcp_config(content: &str) -> Result<String, String> {
-    let command = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut env = Vec::new();
-    for name in QWEN_ASR_MCP_OPTIONAL_ENV_NAMES {
-        let Some(value) = std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        env.push((*name, value));
-    }
-
-    let mut output = content.trim_end().to_string();
-    if !output.is_empty() {
-        output.push_str("\n\n");
-    }
-    output.push_str(QWEN_ASR_MCP_MANAGED_BEGIN);
-    output.push('\n');
-    output.push_str(&format!(
-        "[mcp_servers.{}]\n",
-        toml_key(QWEN_ASR_MCP_SERVER_NAME)
-    ));
-    output.push_str(&format!(
-        "command = \"{}\"\n",
-        toml_escape(&command.to_string_lossy())
-    ));
-    output.push_str(&format!(
-        "args = [\"{}\"]\n",
-        toml_escape(QWEN_ASR_MCP_RUN_MODE_ARG)
-    ));
-    output.push_str("enabled = true\n");
-    output.push_str("startup_timeout_sec = 30\n");
-    output.push_str("tool_timeout_sec = 600\n");
-    if !env.is_empty() {
-        output.push('\n');
-        output.push_str(&format!(
-            "[mcp_servers.{}.env]\n",
-            toml_key(QWEN_ASR_MCP_SERVER_NAME)
-        ));
-        for (key, value) in env {
-            output.push_str(&format!("{} = \"{}\"\n", key, toml_escape(&value)));
-        }
-    }
-    output.push_str(QWEN_ASR_MCP_MANAGED_END);
-    Ok(output)
-}
-
-fn remove_qwen_asr_mcp_config(content: &str) -> String {
+fn remove_retired_mcp_config(
+    content: &str,
+    server_name: &str,
+    managed_begin: &str,
+    managed_end: &str,
+) -> String {
     let mut output = Vec::new();
     let mut in_managed_block = false;
     let mut in_target_table = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed == QWEN_ASR_MCP_MANAGED_BEGIN {
+        if trimmed == managed_begin {
             in_managed_block = true;
             in_target_table = false;
             continue;
         }
         if in_managed_block {
-            if trimmed == QWEN_ASR_MCP_MANAGED_END {
+            if trimmed == managed_end {
                 in_managed_block = false;
             }
             continue;
         }
 
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_target_table = is_qwen_asr_mcp_table_header(trimmed);
+            in_target_table = is_retired_mcp_table_header(trimmed, server_name);
             if in_target_table {
                 continue;
             }
@@ -1777,10 +1735,10 @@ fn remove_qwen_asr_mcp_config(content: &str) -> String {
     output.join("\n").trim_end().to_string()
 }
 
-fn is_qwen_asr_mcp_table_header(line: &str) -> bool {
+fn is_retired_mcp_table_header(line: &str, server_name: &str) -> bool {
     let inner = line.trim_start_matches('[').trim_end_matches(']').trim();
-    inner == format!("mcp_servers.{}", QWEN_ASR_MCP_SERVER_NAME)
-        || inner.starts_with(&format!("mcp_servers.{}.", QWEN_ASR_MCP_SERVER_NAME))
+    inner == format!("mcp_servers.{}", server_name)
+        || inner.starts_with(&format!("mcp_servers.{}.", server_name))
 }
 
 fn ensure_trailing_newline(content: &str) -> String {
@@ -2561,6 +2519,21 @@ pub fn normalized_remote_web_asset_version(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn normalize_transcribe_base_url(value: &str) -> String {
+    const TRANSCRIBE_ENDPOINT_SUFFIX: &str = "/audio/transcriptions";
+
+    let mut base_url = value.trim().trim_end_matches('/').to_string();
+    if base_url
+        .to_ascii_lowercase()
+        .ends_with(TRANSCRIBE_ENDPOINT_SUFFIX)
+    {
+        let next_len = base_url.len() - TRANSCRIBE_ENDPOINT_SUFFIX.len();
+        base_url.truncate(next_len);
+        base_url = base_url.trim_end_matches('/').to_string();
+    }
+    base_url
 }
 
 fn default_provider_profile() -> ProviderProfile {
@@ -3481,26 +3454,40 @@ model = "glm"
     }
 
     #[test]
-    fn qwen_asr_mcp_config_writes_and_removes_managed_server() {
-        let root = test_dir("qwen-asr-mcp");
+    fn retired_builtin_mcp_cleanup_removes_qwen_asr_and_doubao_ime_servers() {
+        let root = test_dir("retired-builtins-mcp");
         std::fs::create_dir_all(&root).expect("create codex home");
-        std::fs::write(root.join("config.toml"), "model = \"glm\"\n").expect("write config");
+        std::fs::write(
+            root.join("config.toml"),
+            r#"model = "glm"
 
-        sync_qwen_asr_mcp_config_for_launch(&root.to_string_lossy(), true)
-            .expect("enable qwen asr mcp");
-        let content = std::fs::read_to_string(root.join("config.toml")).expect("read config");
+# BEGIN CODEXL QWEN ASR MCP
+[mcp_servers.codexl_qwen_asr]
+command = "/Applications/Codex Launcher.app/Contents/MacOS/codex-launcher"
+args = ["--codexl-qwen-asr-mcp"]
+enabled = true
+# END CODEXL QWEN ASR MCP
 
-        assert!(content.contains("[mcp_servers.codexl_qwen_asr]"));
-        assert!(content.contains("args = [\"--codexl-qwen-asr-mcp\"]"));
-        assert!(content.contains("enabled = true"));
-        assert!(content.contains("tool_timeout_sec = 600"));
+[mcp_servers.codexl_doubao_ime]
+command = "/Applications/Codex Launcher.app/Contents/MacOS/codex-launcher"
+args = ["--codexl-doubao-ime-mcp"]
+enabled = true
 
-        sync_qwen_asr_mcp_config_for_launch(&root.to_string_lossy(), false)
-            .expect("disable qwen asr mcp");
+[profiles.default]
+model = "glm"
+"#,
+        )
+        .expect("write config");
+
+        remove_retired_builtin_mcp_configs_for_launch(&root.to_string_lossy())
+            .expect("cleanup retired mcp configs");
         let content = std::fs::read_to_string(root.join("config.toml")).expect("read config");
 
         assert!(!content.contains("codexl_qwen_asr"));
-        assert!(content.contains("model = \"glm\""));
+        assert!(!content.contains("--codexl-qwen-asr-mcp"));
+        assert!(!content.contains("codexl_doubao_ime"));
+        assert!(!content.contains("--codexl-doubao-ime-mcp"));
+        assert!(content.contains("[profiles.default]"));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -394,6 +394,7 @@ type AppConfig = {
   remote_relay_url: string;
   remote_web_asset_registry_url: string;
   remote_web_asset_version: string;
+  remote_transcribe_base_url?: string;
   remote_transcribe_api_url: string;
   remote_transcribe_api_key: string;
   remote_transcribe_model: string;
@@ -414,7 +415,6 @@ type ExtensionSettings = {
   enabled: boolean;
   bot_gateway_enabled: boolean;
   next_ai_gateway_enabled: boolean;
-  qwen_asr_enabled: boolean;
 };
 
 type RuntimeStatus = {
@@ -759,7 +759,6 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     extensionSettingsDescription: t("settings.extensionSettingsDescription"),
     enableExtensions: t("settings.enableExtensions"),
     botGatewayDescription: t("settings.botGatewayDescription"),
-    qwenAsrDescription: t("settings.qwenAsrDescription"),
     nextAiGatewayDescription: t("settings.nextAiGatewayDescription"),
     ready: t("settings.ready"),
     notReady: t("settings.notReady"),
@@ -1696,7 +1695,7 @@ function App() {
       language: Language;
       appearance: Appearance;
       extensions: ExtensionSettings;
-      transcribeApiUrl: string;
+      transcribeBaseUrl: string;
       transcribeApiKey: string;
       transcribeModel: string;
       botConfigs?: SavedBotConfig[];
@@ -1710,7 +1709,8 @@ function App() {
         language: nextSettings.language,
         appearance: nextSettings.appearance,
         extensions: normalizeExtensionSettings(nextSettings.extensions),
-        remote_transcribe_api_url: transcribeSettings.transcribeApiUrl,
+        remote_transcribe_base_url: transcribeSettings.transcribeBaseUrl,
+        remote_transcribe_api_url: transcribeSettings.transcribeBaseUrl,
         remote_transcribe_api_key: transcribeSettings.transcribeApiKey,
         remote_transcribe_model: transcribeSettings.transcribeModel,
         provider_profiles: mergeSavedBotConfigsIntoProfiles(config.provider_profiles, nextBotConfigs),
@@ -2134,7 +2134,7 @@ function App() {
           appearance={appearance}
           language={language}
           extensions={normalizeExtensionSettings(config.extensions)}
-          transcribeApiUrl={config.remote_transcribe_api_url || ""}
+          transcribeBaseUrl={config.remote_transcribe_base_url || config.remote_transcribe_api_url || ""}
           transcribeApiKey={config.remote_transcribe_api_key || ""}
           transcribeModel={config.remote_transcribe_model || DEFAULT_TRANSCRIBE_MODEL}
           botConfigs={config.bot_configs || []}
@@ -2707,7 +2707,7 @@ function AppSettingsDialog({
   appearance,
   language,
   extensions,
-  transcribeApiUrl,
+  transcribeBaseUrl,
   transcribeApiKey,
   transcribeModel,
   botConfigs,
@@ -2722,7 +2722,7 @@ function AppSettingsDialog({
   appearance: Appearance;
   language: Language;
   extensions: ExtensionSettings;
-  transcribeApiUrl: string;
+  transcribeBaseUrl: string;
   transcribeApiKey: string;
   transcribeModel: string;
   botConfigs: SavedBotConfig[];
@@ -2733,7 +2733,7 @@ function AppSettingsDialog({
     language: Language;
     appearance: Appearance;
     extensions: ExtensionSettings;
-    transcribeApiUrl: string;
+    transcribeBaseUrl: string;
     transcribeApiKey: string;
     transcribeModel: string;
     botConfigs?: SavedBotConfig[];
@@ -2747,7 +2747,7 @@ function AppSettingsDialog({
   const [draftLanguage, setDraftLanguage] = useState<Language>(language);
   const [draftAppearance, setDraftAppearance] = useState<Appearance>(appearance);
   const [draftExtensions, setDraftExtensions] = useState<ExtensionSettings>(normalizeExtensionSettings(extensions));
-  const [draftTranscribeApiUrl, setDraftTranscribeApiUrl] = useState(transcribeApiUrl);
+  const [draftTranscribeBaseUrl, setDraftTranscribeBaseUrl] = useState(transcribeBaseUrl);
   const [draftTranscribeApiKey, setDraftTranscribeApiKey] = useState(transcribeApiKey);
   const [draftTranscribeModel, setDraftTranscribeModel] = useState(transcribeModel || DEFAULT_TRANSCRIBE_MODEL);
   const [draftBotConfigs, setDraftBotConfigs] = useState<SavedBotConfig[]>(normalizeSavedBotConfigs(botConfigs));
@@ -2849,11 +2849,11 @@ function AppSettingsDialog({
     );
     try {
       const transcribeSettings = normalizeTranscribeSettings({
-        transcribeApiUrl: draftTranscribeApiUrl,
+        transcribeBaseUrl: draftTranscribeBaseUrl,
         transcribeApiKey: draftTranscribeApiKey,
         transcribeModel: draftTranscribeModel,
       });
-      if (transcribeSettings.transcribeApiUrl && !isHttpUrl(transcribeSettings.transcribeApiUrl)) {
+      if (transcribeSettings.transcribeBaseUrl && !isHttpUrl(transcribeSettings.transcribeBaseUrl)) {
         showToast("error", strings.invalidTranscribeApiUrl);
         return;
       }
@@ -2866,7 +2866,7 @@ function AppSettingsDialog({
         appearance: draftAppearance,
         language: draftLanguage,
         extensions: draftExtensions,
-        transcribeApiUrl: transcribeSettings.transcribeApiUrl,
+        transcribeBaseUrl: transcribeSettings.transcribeBaseUrl,
         transcribeApiKey: transcribeSettings.transcribeApiKey,
         transcribeModel: transcribeSettings.transcribeModel,
         botConfigs: draftBotConfigs,
@@ -3125,9 +3125,9 @@ function AppSettingsDialog({
                   <div className="grid gap-2">
                     <Input
                       id="transcribeApiUrl"
-                      value={draftTranscribeApiUrl}
-                      placeholder="https://api.openai.com/v1/audio/transcriptions"
-                      onChange={(event) => setDraftTranscribeApiUrl(event.target.value)}
+                      value={draftTranscribeBaseUrl}
+                      placeholder="https://api.openai.com/v1"
+                      onChange={(event) => setDraftTranscribeBaseUrl(event.target.value)}
                     />
                     <p className="text-xs leading-relaxed text-muted-foreground">
                       {strings.transcribeApiUrlDescription}
@@ -6530,9 +6530,6 @@ function extensionDescription(extension: BuiltinExtensionStatus, strings: AppStr
   if (extension.id === "bot-gateway") {
     return strings.botGatewayDescription;
   }
-  if (extension.id === "qwen-asr") {
-    return strings.qwenAsrDescription;
-  }
   if (extension.id === "next-ai-gateway") {
     return strings.nextAiGatewayDescription;
   }
@@ -6772,15 +6769,28 @@ function normalizeAppearance(value: unknown): Appearance {
 }
 
 function normalizeTranscribeSettings(settings: {
+  transcribeBaseUrl?: string;
   transcribeApiUrl?: string;
   transcribeApiKey?: string;
   transcribeModel?: string;
 }) {
+  const rawBaseUrl = settings.transcribeBaseUrl ?? settings.transcribeApiUrl ?? "";
+  const transcribeBaseUrl = normalizeTranscribeBaseUrl(rawBaseUrl);
   return {
-    transcribeApiUrl: String(settings.transcribeApiUrl || "").trim().replace(/\/+$/, ""),
+    transcribeBaseUrl,
+    transcribeApiUrl: transcribeBaseUrl,
     transcribeApiKey: String(settings.transcribeApiKey || "").trim(),
     transcribeModel: String(settings.transcribeModel || "").trim() || DEFAULT_TRANSCRIBE_MODEL,
   };
+}
+
+function normalizeTranscribeBaseUrl(value: unknown) {
+  const suffix = "/audio/transcriptions";
+  let baseUrl = String(value || "").trim().replace(/\/+$/, "");
+  if (baseUrl.toLowerCase().endsWith(suffix)) {
+    baseUrl = baseUrl.slice(0, -suffix.length).replace(/\/+$/, "");
+  }
+  return baseUrl;
 }
 
 function isHttpUrl(value: string) {
@@ -6797,7 +6807,6 @@ function normalizeExtensionSettings(value: Partial<ExtensionSettings> | undefine
     | (Partial<ExtensionSettings> & {
         botGatewayEnabled?: boolean;
         nextAiGatewayEnabled?: boolean;
-        qwenAsrEnabled?: boolean;
       })
     | undefined
     | null;
@@ -6805,7 +6814,6 @@ function normalizeExtensionSettings(value: Partial<ExtensionSettings> | undefine
     enabled: Boolean(value?.enabled),
     bot_gateway_enabled: raw?.bot_gateway_enabled ?? raw?.botGatewayEnabled ?? false,
     next_ai_gateway_enabled: raw?.next_ai_gateway_enabled ?? raw?.nextAiGatewayEnabled ?? false,
-    qwen_asr_enabled: raw?.qwen_asr_enabled ?? raw?.qwenAsrEnabled ?? false,
   };
 }
 
@@ -6826,9 +6834,6 @@ function extensionEnabledSetting(settings: ExtensionSettings, extensionId: strin
   if (extensionId === "next-ai-gateway") {
     return settings.next_ai_gateway_enabled;
   }
-  if (extensionId === "qwen-asr") {
-    return settings.qwen_asr_enabled;
-  }
   return false;
 }
 
@@ -6842,9 +6847,6 @@ function setExtensionEnabledSetting(
   }
   if (extensionId === "next-ai-gateway") {
     return { ...settings, next_ai_gateway_enabled: enabled };
-  }
-  if (extensionId === "qwen-asr") {
-    return { ...settings, qwen_asr_enabled: enabled };
   }
   return settings;
 }

@@ -74,9 +74,6 @@ const CODEX_DESKTOP_API_PROD_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_DESKTOP_API_DEV_BASE_URL: &str = "http://localhost:8000/api";
 const CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
 const DEFAULT_TRANSCRIBE_MODEL: &str = "gpt-4o-mini-transcribe";
-const DEFAULT_QWEN_ASR_GRADIO_URL: &str = "https://qwen-qwen3-asr.ms.show/";
-const DEFAULT_QWEN_ASR_LANG: &str = "Auto";
-const QWEN_ASR_TRANSCRIBE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const CLI_ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const CLI_PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
 const CLI_THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
@@ -189,25 +186,25 @@ enum RemoteBackend {
 
 #[derive(Debug, Clone)]
 struct TranscribeApiConfig {
-    url: String,
+    base_url: String,
     api_key: String,
     model: String,
-    qwen_asr_enabled: bool,
 }
 
 impl TranscribeApiConfig {
     fn from_app_config(config: &AppConfig) -> Self {
         Self {
-            url: config.remote_transcribe_api_url.trim().to_string(),
+            base_url: non_empty_string(&config.remote_transcribe_base_url)
+                .or_else(|| non_empty_string(&config.remote_transcribe_api_url))
+                .unwrap_or_default(),
             api_key: config.remote_transcribe_api_key.trim().to_string(),
             model: non_empty_string(&config.remote_transcribe_model)
                 .unwrap_or_else(|| DEFAULT_TRANSCRIBE_MODEL.to_string()),
-            qwen_asr_enabled: config.extensions.enabled && config.extensions.qwen_asr_enabled,
         }
     }
 
     fn is_custom(&self) -> bool {
-        !self.url.trim().is_empty()
+        !self.base_url.trim().is_empty()
     }
 }
 
@@ -2175,10 +2172,7 @@ async fn start_cli_app_server_bridge(
             false,
         )?;
     }
-    config::sync_qwen_asr_mcp_config_for_launch(
-        &requested_config.codex_home,
-        requested_config.extensions.enabled && requested_config.extensions.qwen_asr_enabled,
-    )?;
+    config::remove_retired_builtin_mcp_configs_for_launch(&requested_config.codex_home)?;
 
     let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
     let active_cli_profile = requested_config.active_cli_profile();
@@ -3642,9 +3636,6 @@ async fn cli_desktop_api_fetch_response(
     if transcribe_api.is_custom() {
         return cli_custom_transcribe_fetch_response(message, transcribe_api).await;
     }
-    if transcribe_api.qwen_asr_enabled {
-        return cli_qwen_asr_transcribe_fetch_response(message).await;
-    }
 
     let url = cli_desktop_api_url(url);
     let (request_headers, request_body) = cli_desktop_api_fetch_init(message)?;
@@ -3723,11 +3714,7 @@ async fn cli_custom_transcribe_fetch_response(
         .get("requestId")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let url = reqwest::Url::parse(&transcribe_api.url)
-        .map_err(|e| (500, format!("Invalid transcribe API URL: {}", e)))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err((500, "Transcribe API URL must use http or https".to_string()));
-    }
+    let url = transcribe_api_endpoint_url(&transcribe_api.base_url)?;
 
     let (request_headers, request_body) =
         cli_openai_transcribe_fetch_init(message, &transcribe_api.model)?;
@@ -3789,477 +3776,33 @@ async fn cli_custom_transcribe_fetch_response(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CliTranscribeAudioFile {
-    filename: String,
-    content_type: String,
-    bytes: Vec<u8>,
-}
+fn transcribe_api_endpoint_url(base_url: &str) -> Result<reqwest::Url, (u16, String)> {
+    const TRANSCRIBE_ENDPOINT_SUFFIX: &str = "/audio/transcriptions";
 
-async fn cli_qwen_asr_transcribe_fetch_response(message: &Value) -> Result<Value, (u16, String)> {
-    let request_id = message
-        .get("requestId")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let (headers, body) = cli_desktop_api_fetch_init(message)?;
-    let audio = cli_transcribe_audio_file_from_request(&headers, body)?;
-    let uploaded_file = qwen_asr_upload_audio(audio).await?;
-    let result = qwen_asr_call_transcribe(uploaded_file).await?;
-    let body = qwen_asr_openai_transcribe_body(result);
-
-    Ok(fetch_response_body_success_status(
-        request_id,
-        200,
-        json!({ "content-type": "application/json" }),
-        body,
-    ))
-}
-
-fn cli_transcribe_audio_file_from_request(
-    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
-    body: Vec<u8>,
-) -> Result<CliTranscribeAudioFile, (u16, String)> {
-    let content_type = headers
-        .iter()
-        .find(|(name, _)| name == reqwest::header::CONTENT_TYPE)
-        .and_then(|(_, value)| value.to_str().ok())
-        .unwrap_or("application/octet-stream");
-
-    if let Some(boundary) = cli_multipart_boundary(content_type) {
-        return cli_multipart_audio_file(&body, &boundary);
-    }
-
-    if body.is_empty() {
-        return Err((500, "Transcribe request body is empty".to_string()));
-    }
-
-    Ok(CliTranscribeAudioFile {
-        filename: format!(
-            "codex{}",
-            audio_extension_for_content_type(content_type).unwrap_or(".webm")
-        ),
-        content_type: content_type.to_string(),
-        bytes: body,
-    })
-}
-
-fn cli_multipart_audio_file(
-    body: &[u8],
-    boundary: &str,
-) -> Result<CliTranscribeAudioFile, (u16, String)> {
-    let delimiter = format!("--{}", boundary).into_bytes();
-    let mut candidate: Option<CliTranscribeAudioFile> = None;
-
-    for raw_part in split_by_subslice(body, &delimiter) {
-        let part = trim_multipart_part(raw_part);
-        if part.is_empty() || part.starts_with(b"--") {
-            continue;
-        }
-        let Some(header_end) = find_subslice(part, b"\r\n\r\n") else {
-            continue;
-        };
-        let header_text = String::from_utf8_lossy(&part[..header_end]);
-        let mut content_disposition = "";
-        let mut content_type = "application/octet-stream";
-        for line in header_text.lines() {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            if name.trim().eq_ignore_ascii_case("content-disposition") {
-                content_disposition = value.trim();
-            } else if name.trim().eq_ignore_ascii_case("content-type") {
-                content_type = value.trim();
-            }
-        }
-        if !content_disposition
-            .to_ascii_lowercase()
-            .contains("form-data")
-        {
-            continue;
-        }
-
-        let field_name = multipart_header_param(content_disposition, "name").unwrap_or_default();
-        let filename = multipart_header_param(content_disposition, "filename")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}{}",
-                    if field_name.is_empty() {
-                        "codex"
-                    } else {
-                        &field_name
-                    },
-                    audio_extension_for_content_type(content_type).unwrap_or(".webm")
-                )
-            });
-        let bytes = trim_single_trailing_crlf(&part[header_end + 4..]).to_vec();
-        if bytes.is_empty() {
-            continue;
-        }
-
-        let file = CliTranscribeAudioFile {
-            filename,
-            content_type: content_type.to_string(),
-            bytes,
-        };
-        if field_name == "file" || field_name == "audio" || field_name == "audio_upload" {
-            return Ok(file);
-        }
-        if candidate.is_none()
-            && !multipart_header_param(content_disposition, "filename")
-                .unwrap_or_default()
-                .is_empty()
-        {
-            candidate = Some(file);
-        }
-    }
-
-    candidate.ok_or_else(|| {
-        (
+    let mut url = reqwest::Url::parse(base_url.trim())
+        .map_err(|e| (500, format!("Invalid transcribe API base URL: {}", e)))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((
             500,
-            "Transcribe request is missing an audio file".to_string(),
-        )
-    })
-}
-
-async fn qwen_asr_upload_audio(audio: CliTranscribeAudioFile) -> Result<Value, (u16, String)> {
-    let upload_url = qwen_asr_upload_url()?;
-    let filename = audio.filename.clone();
-    let content_type = audio.content_type.clone();
-    let mime_type = audio
-        .content_type
-        .split(';')
-        .next()
-        .unwrap_or("application/octet-stream")
-        .trim();
-    let part = reqwest::multipart::Part::bytes(audio.bytes)
-        .file_name(filename.clone())
-        .mime_str(mime_type)
-        .map_err(|err| (500, format!("Invalid audio MIME type: {}", err)))?;
-    let form = reqwest::multipart::Form::new().part("files", part);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(QWEN_ASR_TRANSCRIBE_TIMEOUT_MS))
-        .build()
-        .map_err(|e| (500, e.to_string()))?;
-    let response = client
-        .post(upload_url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| (500, format!("Qwen ASR upload failed: {}", e)))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| (500, e.to_string()))?;
-    if !status.is_success() {
-        return Err((
-            status.as_u16(),
-            format!("Qwen ASR upload failed: {}", truncate_for_error(&body)),
+            "Transcribe API base URL must use http or https".to_string(),
         ));
     }
-    let path = qwen_asr_uploaded_path(&body).ok_or_else(|| {
-        (
-            500,
-            format!(
-                "Qwen ASR upload returned an unsupported response: {}",
-                truncate_for_error(&body)
-            ),
-        )
-    })?;
-    Ok(json!({
-        "path": path,
-        "orig_name": filename,
-        "mime_type": content_type,
-        "meta": { "_type": "gradio.FileData" }
-    }))
-}
 
-async fn qwen_asr_call_transcribe(audio_upload: Value) -> Result<Value, (u16, String)> {
-    let call_url = qwen_asr_api_call_url("transcribe")?;
-    let request = json!({
-        "data": [audio_upload, qwen_asr_language(), false]
-    });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(QWEN_ASR_TRANSCRIBE_TIMEOUT_MS))
-        .build()
-        .map_err(|e| (500, e.to_string()))?;
-    let response = client
-        .post(call_url)
-        .header(CONTENT_TYPE.as_str(), "application/json")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| (500, format!("Qwen ASR transcription failed: {}", e)))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| (500, e.to_string()))?;
-    if !status.is_success() {
-        return Err((
-            status.as_u16(),
-            format!(
-                "Qwen ASR transcription failed: {}",
-                truncate_for_error(&body)
-            ),
-        ));
-    }
-    let event_id = serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("event_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            (
-                500,
-                format!(
-                    "Qwen ASR returned an unsupported response: {}",
-                    truncate_for_error(&body)
-                ),
-            )
-        })?;
-
-    let event_url = qwen_asr_api_event_url("transcribe", &event_id)?;
-    let response = client
-        .get(event_url)
-        .send()
-        .await
-        .map_err(|e| (500, format!("Qwen ASR transcription failed: {}", e)))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| (500, e.to_string()))?;
-    if !status.is_success() {
-        return Err((
-            status.as_u16(),
-            format!(
-                "Qwen ASR transcription failed: {}",
-                truncate_for_error(&body)
-            ),
-        ));
-    }
-    parse_gradio_event_response(&body).map_err(|err| (500, err))
-}
-
-fn qwen_asr_openai_transcribe_body(result: Value) -> Value {
-    let text = qwen_asr_result_text(&result);
-    json!({ "text": text })
-}
-
-fn qwen_asr_result_text(value: &Value) -> String {
-    if let Some(items) = value.as_array() {
-        if let Some(text) = items.get(1).and_then(Value::as_str) {
-            return text.trim().to_string();
-        }
-        if let Some(text) = items.iter().find_map(Value::as_str) {
-            return text.trim().to_string();
-        }
-    }
-    if let Some(text) = value
-        .get("structuredContent")
-        .and_then(|content| content.get("text"))
-        .and_then(Value::as_str)
-    {
-        return text.trim().to_string();
-    }
-    if let Some(text) = value.get("text").and_then(Value::as_str) {
-        return text.trim().to_string();
-    }
-    if let Some(content) = value.get("content").and_then(Value::as_array) {
-        let mut parts = Vec::new();
-        for item in content {
-            let Some(text) = item.get("text").and_then(Value::as_str) else {
-                continue;
-            };
-            parts.push(qwen_asr_text_content_text(text));
-        }
-        return parts
-            .into_iter()
-            .map(|part| part.trim().to_string())
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
-    String::new()
-}
-
-fn qwen_asr_text_content_text(text: &str) -> String {
-    let trimmed = text.trim();
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        if let Some(text) = value.get("text").and_then(Value::as_str) {
-            return text.to_string();
-        }
-        if let Some(text) = value.as_str() {
-            return text.to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn qwen_asr_uploaded_path(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(body).ok()?;
-    if let Some(items) = value.as_array() {
-        return items
-            .first()
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-    }
-    value
-        .get("path")
-        .or_else(|| value.get("url"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .get("files")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-}
-
-fn parse_gradio_event_response(body: &str) -> Result<Value, String> {
-    let mut messages = Vec::new();
-    let mut data = Vec::new();
-    for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            data.push(rest.trim_start());
-            continue;
-        }
-        if line.trim().is_empty() && !data.is_empty() {
-            messages.push(data.join("\n"));
-            data.clear();
-        }
-    }
-    if !data.is_empty() {
-        messages.push(data.join("\n"));
-    }
-
-    messages
-        .last()
-        .ok_or_else(|| "Qwen ASR returned an empty response".to_string())
-        .and_then(|message| serde_json::from_str(message).map_err(|err| err.to_string()))
-}
-
-fn qwen_asr_gradio_url() -> Result<reqwest::Url, (u16, String)> {
-    let base = std::env::var("CODEXL_QWEN_ASR_GRADIO_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_QWEN_ASR_GRADIO_URL.to_string());
-    reqwest::Url::parse(&base).map_err(|err| (500, format!("Invalid Qwen ASR Gradio URL: {}", err)))
-}
-
-fn qwen_asr_upload_url() -> Result<String, (u16, String)> {
-    qwen_asr_gradio_url()?
-        .join("/gradio_api/upload")
-        .map(|url| url.to_string())
-        .map_err(|err| (500, format!("Invalid Qwen ASR upload URL: {}", err)))
-}
-
-fn qwen_asr_api_call_url(endpoint: &str) -> Result<String, (u16, String)> {
-    qwen_asr_gradio_url()?
-        .join(&format!("/gradio_api/call/{}", endpoint))
-        .map(|url| url.to_string())
-        .map_err(|err| (500, format!("Invalid Qwen ASR API URL: {}", err)))
-}
-
-fn qwen_asr_api_event_url(endpoint: &str, event_id: &str) -> Result<String, (u16, String)> {
-    qwen_asr_gradio_url()?
-        .join(&format!("/gradio_api/call/{}/{}", endpoint, event_id))
-        .map(|url| url.to_string())
-        .map_err(|err| (500, format!("Invalid Qwen ASR event URL: {}", err)))
-}
-
-fn qwen_asr_language() -> String {
-    std::env::var("CODEXL_QWEN_ASR_LANG")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_QWEN_ASR_LANG.to_string())
-}
-
-fn split_by_subslice<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
-    if needle.is_empty() {
-        return vec![haystack];
-    }
-    let mut parts = Vec::new();
-    let mut start = 0;
-    while let Some(relative_index) = find_subslice(&haystack[start..], needle) {
-        let index = start + relative_index;
-        parts.push(&haystack[start..index]);
-        start = index + needle.len();
-    }
-    parts.push(&haystack[start..]);
-    parts
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn trim_multipart_part(mut value: &[u8]) -> &[u8] {
-    if value.starts_with(b"\r\n") {
-        value = &value[2..];
-    }
-    trim_single_trailing_crlf(value)
-}
-
-fn trim_single_trailing_crlf(value: &[u8]) -> &[u8] {
-    if value.ends_with(b"\r\n") {
-        &value[..value.len() - 2]
-    } else {
-        value
-    }
-}
-
-fn multipart_header_param(header: &str, name: &str) -> Option<String> {
-    for part in header.split(';').skip(1) {
-        let Some((key, value)) = part.trim().split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case(name) {
-            return Some(value.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-fn audio_extension_for_content_type(content_type: &str) -> Option<&'static str> {
-    match content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
+    let path = url.path().trim_end_matches('/');
+    if !path
         .to_ascii_lowercase()
-        .as_str()
+        .ends_with(TRANSCRIBE_ENDPOINT_SUFFIX)
     {
-        "audio/aac" => Some(".aac"),
-        "audio/flac" => Some(".flac"),
-        "audio/mp4" | "audio/m4a" => Some(".m4a"),
-        "audio/mpeg" | "audio/mp3" => Some(".mp3"),
-        "audio/ogg" | "audio/opus" => Some(".ogg"),
-        "audio/wav" | "audio/wave" | "audio/x-wav" => Some(".wav"),
-        "audio/webm" => Some(".webm"),
-        _ => None,
+        let next_path = if path.is_empty() || path == "/" {
+            TRANSCRIBE_ENDPOINT_SUFFIX.to_string()
+        } else {
+            format!("{}{}", path, TRANSCRIBE_ENDPOINT_SUFFIX)
+        };
+        url.set_path(&next_path);
     }
-}
-
-fn truncate_for_error(value: &str) -> String {
-    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.len() > 500 {
-        format!("{}...", &text[..500])
-    } else {
-        text
-    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
 }
 
 fn cli_desktop_api_fetch_init(
@@ -7811,40 +7354,25 @@ mod tests {
     }
 
     #[test]
-    fn cli_qwen_asr_extracts_multipart_audio_file() {
-        let boundary = "codex-test-boundary";
-        let body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"codex.webm\"\r\nContent-Type: audio/webm\r\n\r\naudio\r\n--{boundary}--\r\n"
+    fn transcribe_api_endpoint_url_appends_openai_path_to_base_url() {
+        let url = transcribe_api_endpoint_url("https://api.example.com/v1/")
+            .expect("transcribe endpoint");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/v1/audio/transcriptions"
         );
-        let headers = vec![(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_str(&format!(
-                "multipart/form-data; boundary={}",
-                boundary
-            ))
-            .expect("header"),
-        )];
-
-        let audio = cli_transcribe_audio_file_from_request(&headers, body.into_bytes())
-            .expect("audio file");
-
-        assert_eq!(audio.filename, "codex.webm");
-        assert_eq!(audio.content_type, "audio/webm");
-        assert_eq!(audio.bytes, b"audio");
     }
 
     #[test]
-    fn qwen_asr_result_text_reads_mcp_content_text() {
-        let result = json!({
-            "content": [
-                {
-                    "type": "text",
-                    "text": "{\"text\":\"hello from qwen\"}"
-                }
-            ]
-        });
+    fn transcribe_api_endpoint_url_preserves_legacy_full_endpoint() {
+        let url = transcribe_api_endpoint_url("https://api.example.com/v1/audio/transcriptions")
+            .expect("transcribe endpoint");
 
-        assert_eq!(qwen_asr_result_text(&result), "hello from qwen");
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/v1/audio/transcriptions"
+        );
     }
 
     #[test]

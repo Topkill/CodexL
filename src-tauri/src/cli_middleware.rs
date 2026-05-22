@@ -6,7 +6,6 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::extensions;
 use crate::extensions::builtins::bot_bridge;
 use serde_json::{json, Value};
 
@@ -22,7 +21,6 @@ const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const RUN_MODE_ARG: &str = "--codexl-cli-middleware";
 const STDIO_RUN_MODE_ARG: &str = "--codexl-cli-stdio";
 const BOT_MEDIA_MCP_RUN_MODE_ARG: &str = "--codexl-bot-media-mcp";
-const QWEN_ASR_MCP_RUN_MODE_ARG: &str = "--codexl-qwen-asr-mcp";
 
 type RequestMap = Arc<Mutex<std::collections::HashMap<String, RequestInfo>>>;
 type SharedChildStdin = Arc<Mutex<ChildStdin>>;
@@ -142,9 +140,6 @@ pub fn run_if_requested() -> bool {
         }
         value if value == OsStr::new(BOT_MEDIA_MCP_RUN_MODE_ARG) => {
             bot_bridge::run_bot_media_mcp_stdio()
-        }
-        value if value == OsStr::new(QWEN_ASR_MCP_RUN_MODE_ARG) => {
-            extensions::run_builtin_qwen_asr_mcp_stdio()
         }
         _ => return false,
     };
