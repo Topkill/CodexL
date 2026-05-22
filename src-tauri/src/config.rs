@@ -1004,7 +1004,13 @@ impl RemoteCloudAuthConfig {
         }
     }
 }
-
+fn sys_home_dir() -> Option<String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CODEXL_CONFIG_PATH") {
         let trimmed = path.trim();
@@ -1013,8 +1019,7 @@ fn config_path() -> Option<PathBuf> {
         }
     }
 
-    std::env::var("HOME")
-        .ok()
+    sys_home_dir()
         .map(|home| PathBuf::from(home).join(".codexl").join("config.json"))
 }
 
@@ -1025,14 +1030,14 @@ pub fn default_codex_home() -> String {
         .map(|value| normalize_home_path(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            std::env::var("HOME")
+            sys_home_dir()
                 .map(|home| {
                     PathBuf::from(home)
                         .join(".codex")
                         .to_string_lossy()
                         .to_string()
                 })
-                .unwrap_or_else(|_| ".codex".to_string())
+                .unwrap_or_else(|| ".codex".to_string())
         })
 }
 
@@ -1042,14 +1047,14 @@ pub fn default_codex_config_path() -> PathBuf {
 
 pub fn generated_codex_home(profile: &ProviderProfile) -> PathBuf {
     let slug = slugify(&profile.name);
-    std::env::var("HOME")
+    sys_home_dir()
         .map(|home| {
             PathBuf::from(home)
                 .join(".codexl")
                 .join("codex-homes")
                 .join(&slug)
         })
-        .unwrap_or_else(|_| PathBuf::from(".codexl").join("codex-homes").join(slug))
+        .unwrap_or_else(|| PathBuf::from(".codexl").join("codex-homes").join(slug))
 }
 
 pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
@@ -1059,14 +1064,14 @@ pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
     } else {
         name
     });
-    std::env::var("HOME")
+    sys_home_dir()
         .map(|home| {
             PathBuf::from(home)
                 .join(".codexl")
                 .join("bot-gateway")
                 .join(&slug)
         })
-        .unwrap_or_else(|_| PathBuf::from(".codexl").join("bot-gateway").join(slug))
+        .unwrap_or_else(|| PathBuf::from(".codexl").join("bot-gateway").join(slug))
 }
 
 pub fn ensure_provider_codex_home(profile: &ProviderProfile) -> Result<String, String> {
@@ -1752,10 +1757,10 @@ fn ensure_trailing_newline(content: &str) -> String {
 pub fn normalize_home_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| trimmed.to_string());
+        return sys_home_dir().unwrap_or_else(|| trimmed.to_string());
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = sys_home_dir() {
             return PathBuf::from(home).join(rest).to_string_lossy().to_string();
         }
     }
