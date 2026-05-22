@@ -4372,7 +4372,6 @@ function SettingsDialog({
                   "shadow-none",
                   form.remoteFrontendMode !== "app" && "text-muted-foreground hover:bg-transparent",
                 )}
-                disabled={!codexAppPath}
                 onClick={() =>
                   onSetForm((current) => ({ ...current, remoteFrontendMode: "app" }))
                 }
