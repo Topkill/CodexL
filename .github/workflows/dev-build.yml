@@ -3,7 +3,7 @@ name: Dev Build Desktop App
 on:
   push:
     branches:
-      - main  # 每次你向 main 分支 push 代码时自动触发
+      - windows-adapt  # 每次你向 windows-adapt 分支 push 代码时自动触发
   workflow_dispatch: # 支持手动点击按钮触发
 
 permissions:

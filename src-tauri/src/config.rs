@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use toml_edit::DocumentMut;
 
 use crate::extensions::builtins::gateway::config as gateway_config;
 
@@ -1019,8 +1020,7 @@ fn config_path() -> Option<PathBuf> {
         }
     }
 
-    sys_home_dir()
-        .map(|home| PathBuf::from(home).join(".codexl").join("config.json"))
+    sys_home_dir().map(|home| PathBuf::from(home).join(".codexl").join("config.json"))
 }
 
 pub fn default_codex_home() -> String {
@@ -1214,10 +1214,32 @@ pub fn update_existing_provider_profile(
 }
 
 pub fn update_default_provider_selection(input: ExistingProviderRequest) -> Result<(), String> {
-    let profile = update_existing_default_provider(input)?;
+    let mut profile = read_default_provider_profiles()?
+        .into_iter()
+        .find(|profile| profile.name == input.profile_name)
+        .ok_or_else(|| format!("Provider profile not found: {}", input.profile_name))?;
+
+    let model = input.model.trim();
+    if model.is_empty() {
+        return Err("model is required".to_string());
+    }
+    profile.model = model.to_string();
+
+    if let Some(base_url) = input.base_url {
+        profile.base_url = base_url.trim().to_string();
+    }
+    if let Some(api_key) = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        profile.api_key = api_key.to_string();
+    }
+
     let path = default_codex_config_path();
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = set_top_level_model_config(&content, &profile.model);
+    let updated = upsert_default_provider_selection_content(&content, &profile);
     std::fs::write(path, updated).map_err(|e| e.to_string())
 }
 
@@ -1768,68 +1790,82 @@ pub fn normalize_home_path(path: &str) -> String {
 }
 
 fn parse_default_provider_profiles(content: &str) -> Vec<DefaultProviderProfile> {
-    use std::collections::HashMap;
+    let mut result = Vec::new();
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return result;
+    };
 
-    let mut providers: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut profiles: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut current: Option<(String, String)> = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some((section, name)) = parse_table_header(trimmed) {
-            current = Some((section, name));
-            continue;
-        }
-
-        let Some((section, name)) = current.as_ref() else {
-            continue;
-        };
-        let Some((key, value)) = parse_string_assignment(trimmed) else {
-            continue;
-        };
-
-        match section.as_str() {
-            "model_providers" => {
-                providers
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(key, value);
-            }
-            "profiles" => {
-                profiles.entry(name.clone()).or_default().insert(key, value);
-            }
-            _ => {}
+    if let Some(profiles) = doc.get("profiles").and_then(|item| item.as_table()) {
+        for (profile_name, profile_item) in profiles.iter() {
+            let Some(profile_table) = profile_item.as_table() else {
+                continue;
+            };
+            let Some(provider_name) = table_string(profile_table, "model_provider") else {
+                continue;
+            };
+            let Some(model) = table_string(profile_table, "model") else {
+                continue;
+            };
+            result.push(DefaultProviderProfile {
+                name: profile_name.to_string(),
+                base_url: model_provider_string(&doc, &provider_name, "base_url")
+                    .unwrap_or_default(),
+                api_key: model_provider_string(&doc, &provider_name, "experimental_bearer_token")
+                    .unwrap_or_default(),
+                provider_name,
+                model,
+            });
         }
     }
 
-    let mut result = Vec::new();
-    for (profile_name, profile_values) in profiles {
-        let Some(provider_name) = profile_values.get("model_provider").cloned() else {
-            continue;
-        };
-        let Some(model) = profile_values.get("model").cloned() else {
-            continue;
-        };
-        let base_url = providers
-            .get(&provider_name)
-            .and_then(|values| values.get("base_url"))
-            .cloned()
-            .unwrap_or_default();
-        let api_key = providers
-            .get(&provider_name)
-            .and_then(|values| values.get("experimental_bearer_token"))
-            .cloned()
-            .unwrap_or_default();
+    let Some((model, provider_name)) = top_level_model_config_from_doc(&doc) else {
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        return result;
+    };
+    if !result.iter().any(|profile| profile.name == provider_name) {
         result.push(DefaultProviderProfile {
-            name: profile_name,
+            name: provider_name.clone(),
+            base_url: model_provider_string(&doc, &provider_name, "base_url").unwrap_or_default(),
+            api_key: model_provider_string(&doc, &provider_name, "experimental_bearer_token")
+                .unwrap_or_default(),
             provider_name,
-            base_url,
-            api_key,
             model,
         });
     }
+
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
+}
+
+fn top_level_model_config_from_doc(doc: &DocumentMut) -> Option<(String, String)> {
+    let model = doc_string(doc, "model")?;
+    let provider_name = doc_string(doc, "model_provider")?;
+    Some((model, provider_name))
+}
+
+fn doc_string(doc: &DocumentMut, key: &str) -> Option<String> {
+    doc.get(key)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn table_string(table: &toml_edit::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn model_provider_string(doc: &DocumentMut, provider_name: &str, key: &str) -> Option<String> {
+    doc.get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(provider_name))
+        .and_then(|provider| provider.as_table())
+        .and_then(|provider| table_string(provider, key))
 }
 
 fn parse_table_header(line: &str) -> Option<(String, String)> {
@@ -1858,23 +1894,23 @@ fn parse_string_assignment(line: &str) -> Option<(String, String)> {
 }
 
 fn parse_top_level_model_config(content: &str) -> (String, String) {
-    let mut model = String::new();
-    let mut provider_name = String::new();
+    let doc = content
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            break;
-        }
-        let Some((key, value)) = parse_string_assignment(trimmed) else {
-            continue;
-        };
-        match key.as_str() {
-            "model" => model = value,
-            "model_provider" => provider_name = value,
-            _ => {}
-        }
-    }
+    let model = doc
+        .get("model")
+        .and_then(|i| i.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let provider_name = doc
+        .get("model_provider")
+        .and_then(|i| i.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     (model, provider_name)
 }
@@ -1965,34 +2001,79 @@ fn provider_detail_from_default_config(profile: &ProviderProfile) -> DefaultProv
     detail
 }
 
+fn upsert_default_provider_selection_content(
+    content: &str,
+    profile: &DefaultProviderProfile,
+) -> String {
+    if profile_table_exists(content, &profile.name) {
+        return upsert_provider_profile_content(content, profile, false);
+    }
+
+    let updated = upsert_model_provider_content(content, profile, false);
+    set_top_level_provider_config(&updated, &profile.provider_name, &profile.model)
+}
+
+fn profile_table_exists(content: &str, profile_name: &str) -> bool {
+    content
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            doc.get("profiles")
+                .and_then(|item| item.as_table())
+                .map(|profiles| profiles.contains_key(profile_name))
+        })
+        .unwrap_or(false)
+}
+
+fn upsert_model_provider_content(
+    content: &str,
+    profile: &DefaultProviderProfile,
+    force_defaults: bool,
+) -> String {
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
+    let provider_exists = model_provider_string(&doc, &profile.provider_name, "name").is_some()
+        || doc
+            .get("model_providers")
+            .and_then(|item| item.as_table())
+            .is_some_and(|providers| providers.contains_key(&profile.provider_name));
+
+    if !doc["model_providers"].is_table() {
+        doc["model_providers"] = toml_edit::table();
+    }
+    let providers = doc["model_providers"]
+        .as_table_mut()
+        .expect("model_providers table");
+    let provider = providers
+        .entry(&profile.provider_name)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    if !provider.is_table() {
+        *provider = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let provider = provider
+        .as_table_mut()
+        .expect("model provider entry should be a table");
+
+    provider["name"] = toml_edit::value(&profile.provider_name);
+    provider["base_url"] = toml_edit::value(&profile.base_url);
+    if !profile.api_key.is_empty() {
+        provider["experimental_bearer_token"] = toml_edit::value(&profile.api_key);
+    }
+    if force_defaults || !provider_exists {
+        provider["wire_api"] = toml_edit::value("responses");
+    }
+
+    doc.to_string()
+}
+
 fn upsert_provider_profile_content(
     content: &str,
     profile: &DefaultProviderProfile,
     force_defaults: bool,
 ) -> String {
-    let provider_exists = table_exists(content, "model_providers", &profile.provider_name);
     let profile_exists = table_exists(content, "profiles", &profile.name);
-
-    let mut provider_assignments = vec![
-        ("name".to_string(), profile.provider_name.clone()),
-        ("base_url".to_string(), profile.base_url.clone()),
-    ];
-    if !profile.api_key.is_empty() {
-        provider_assignments.push((
-            "experimental_bearer_token".to_string(),
-            profile.api_key.clone(),
-        ));
-    }
-    if force_defaults || !provider_exists {
-        provider_assignments.push(("wire_api".to_string(), "responses".to_string()));
-    }
-
-    let mut updated = upsert_table_assignments(
-        content,
-        "model_providers",
-        &profile.provider_name,
-        &provider_assignments,
-    );
+    let mut updated = upsert_model_provider_content(content, profile, force_defaults);
 
     let mut profile_assignments = vec![
         ("model".to_string(), profile.model.clone()),
@@ -2096,43 +2177,33 @@ fn table_exists(content: &str, section: &str, name: &str) -> bool {
 }
 
 fn set_top_level_model_config(content: &str, model: &str) -> String {
-    let mut output = Vec::new();
-    output.push(format!("model = \"{}\"", toml_escape(model)));
-
-    let mut in_top_level = true;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if in_top_level && trimmed.starts_with('[') {
-            in_top_level = false;
-        }
-        if in_top_level
-            && (trimmed.starts_with("model =") || trimmed.starts_with("model_provider ="))
-        {
-            continue;
-        }
-        output.push(line.to_string());
+    let provider_name = parse_top_level_model_config(content).1;
+    if !provider_name.is_empty() {
+        return set_top_level_provider_config(content, &provider_name, model);
     }
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
+    doc["model"] = toml_edit::value(model);
+    doc.to_string()
+}
 
-    output.join("\n")
+fn set_top_level_provider_config(content: &str, provider_name: &str, model: &str) -> String {
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
+    doc["model_provider"] = toml_edit::value(provider_name);
+    doc["model"] = toml_edit::value(model);
+    doc.to_string()
 }
 
 fn clear_top_level_model_config(content: &str) -> String {
-    let mut output = Vec::new();
-    let mut in_top_level = true;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if in_top_level && trimmed.starts_with('[') {
-            in_top_level = false;
-        }
-        if in_top_level
-            && (trimmed.starts_with("model =") || trimmed.starts_with("model_provider ="))
-        {
-            continue;
-        }
-        output.push(line.to_string());
-    }
-
-    output.join("\n")
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
+    doc.remove("model");
+    doc.remove("model_provider");
+    doc.to_string()
 }
 
 fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfile> {
@@ -2696,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_model_config_does_not_add_model_provider() {
+    fn top_level_model_config_preserves_existing_model_provider() {
         let content = r#"model = "old-model"
 model_provider = "old-provider"
 
@@ -2712,8 +2783,89 @@ model_provider = "profile-provider"
             .expect("top-level content");
 
         assert!(top_level.contains("model = \"new-model\""));
-        assert!(!top_level.contains("model_provider ="));
+        assert!(top_level.contains("model_provider = \"old-provider\""));
         assert!(updated.contains("model_provider = \"profile-provider\""));
+    }
+
+    #[test]
+    fn default_provider_profiles_include_top_level_provider() {
+        let content = r#"model_provider = "custom"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://localhost:8090/v1"
+"#;
+
+        let profiles = parse_default_provider_profiles(content);
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "custom");
+        assert_eq!(profiles[0].provider_name, "custom");
+        assert_eq!(profiles[0].model, "gpt-5.5");
+        assert_eq!(profiles[0].base_url, "http://localhost:8090/v1");
+    }
+
+    #[test]
+    fn default_provider_selection_preserves_top_level_provider_shape() {
+        let content = r#"model_provider = "custom"
+model = "old-model"
+
+[model_providers.custom]
+name = "custom"
+base_url = "http://old.example/v1"
+wire_api = "responses"
+"#;
+        let profile = DefaultProviderProfile {
+            name: "custom".to_string(),
+            provider_name: "custom".to_string(),
+            base_url: "http://new.example/v1".to_string(),
+            api_key: String::new(),
+            model: "gpt-5.5".to_string(),
+        };
+
+        let updated = upsert_default_provider_selection_content(content, &profile);
+
+        assert!(updated.contains("model_provider = \"custom\""));
+        assert!(updated.contains("model = \"gpt-5.5\""));
+        assert!(updated.contains("[model_providers.custom]"));
+        assert!(updated.contains("base_url = \"http://new.example/v1\""));
+        assert!(!updated.contains("[profiles.custom]"));
+    }
+
+    #[test]
+    fn default_provider_selection_preserves_profile_table_shape() {
+        let content = r#"[model_providers.custom]
+name = "custom"
+base_url = "http://old.example/v1"
+
+[profiles.custom]
+model = "old-model"
+model_provider = "custom"
+"#;
+        let profile = DefaultProviderProfile {
+            name: "custom".to_string(),
+            provider_name: "custom".to_string(),
+            base_url: "http://new.example/v1".to_string(),
+            api_key: String::new(),
+            model: "gpt-5.5".to_string(),
+        };
+
+        let updated = upsert_default_provider_selection_content(content, &profile);
+        let top_level = updated
+            .split("[model_providers.custom]")
+            .next()
+            .expect("top-level content");
+
+        assert!(!top_level.contains("model_provider ="));
+        assert!(!top_level.contains("model ="));
+        assert!(updated.contains("[profiles.custom]"));
+        assert!(updated.contains("model = \"gpt-5.5\""));
+        assert!(updated.contains("model_provider = \"custom\""));
+        assert!(updated.contains("base_url = \"http://new.example/v1\""));
     }
 
     #[test]
