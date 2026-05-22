@@ -583,6 +583,12 @@ impl AppConfig {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|content| serde_json::from_str::<AppConfig>(&content).ok())
             .unwrap_or_default();
+        if let Ok(codex_path) = std::env::var("CODEXL_CODEX_PATH") {
+            let codex_path = normalize_home_path(&codex_path);
+            if !codex_path.trim().is_empty() {
+                config.codex_path = codex_path;
+            }
+        }
         config.normalize();
         let _ = config.save();
         config
@@ -1237,10 +1243,7 @@ pub fn update_default_provider_selection(input: ExistingProviderRequest) -> Resu
         profile.api_key = api_key.to_string();
     }
 
-    let path = default_codex_config_path();
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = upsert_default_provider_selection_content(&content, &profile);
-    std::fs::write(path, updated).map_err(|e| e.to_string())
+    write_default_provider_selection(&profile)
 }
 
 pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProfile, String> {
@@ -1376,9 +1379,16 @@ fn update_existing_default_provider(
         profile.api_key = api_key.to_string();
     }
 
-    write_default_provider_profile(&profile, false)?;
+    write_default_provider_selection(&profile)?;
     write_provider_codex_home_config(&profile, false)?;
     Ok(profile)
+}
+
+fn write_default_provider_selection(profile: &DefaultProviderProfile) -> Result<(), String> {
+    let path = default_codex_config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = upsert_default_provider_selection_content(&content, profile);
+    std::fs::write(path, updated).map_err(|e| e.to_string())
 }
 
 fn workspace_profile(
@@ -2866,6 +2876,121 @@ model_provider = "custom"
         assert!(updated.contains("model = \"gpt-5.5\""));
         assert!(updated.contains("model_provider = \"custom\""));
         assert!(updated.contains("base_url = \"http://new.example/v1\""));
+    }
+
+    #[test]
+    fn app_config_load_applies_codex_path_env_override() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let root = test_dir("app-config-load-codex-path-env");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+
+        let config_path = root.join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&AppConfig::default()).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let old_home = std::env::var("HOME").ok();
+        let old_userprofile = std::env::var("USERPROFILE").ok();
+        let old_config_path = std::env::var("CODEXL_CONFIG_PATH").ok();
+        let old_codex_path = std::env::var("CODEXL_CODEX_PATH").ok();
+
+        std::env::set_var("HOME", &root);
+        std::env::set_var("USERPROFILE", &root);
+        std::env::set_var("CODEXL_CONFIG_PATH", &config_path);
+        std::env::set_var("CODEXL_CODEX_PATH", r"C:\path\to\Codex.exe");
+
+        let config = AppConfig::load();
+
+        assert_eq!(config.codex_path, r"C:\path\to\Codex.exe");
+        let saved = std::fs::read_to_string(&config_path).expect("read saved config");
+        assert!(saved.contains(r#""codex_path": "C:\\path\\to\\Codex.exe""#));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_userprofile {
+            std::env::set_var("USERPROFILE", value);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+        if let Some(value) = old_config_path {
+            std::env::set_var("CODEXL_CONFIG_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_CONFIG_PATH");
+        }
+        if let Some(value) = old_codex_path {
+            std::env::set_var("CODEXL_CODEX_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_CODEX_PATH");
+        }
+    }
+
+    #[test]
+    fn update_existing_default_provider_preserves_profile_table_shape() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let root = test_dir("update-existing-default-provider");
+        std::fs::create_dir_all(root.join(".codex")).expect("create codex home");
+
+        let old_home = std::env::var("HOME").ok();
+        let old_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", &root);
+        std::env::set_var("USERPROFILE", &root);
+
+        let config_path = default_codex_config_path();
+        std::fs::write(
+            &config_path,
+            r#"[model_providers.custom]
+name = "custom"
+base_url = "http://old.example/v1"
+
+[profiles.custom]
+model = "old-model"
+model_provider = "custom"
+"#,
+        )
+        .expect("write default config");
+
+        let profile = update_existing_default_provider(ExistingProviderRequest {
+            workspace_name: "custom".to_string(),
+            profile_name: "custom".to_string(),
+            base_url: Some("http://new.example/v1".to_string()),
+            api_key: None,
+            model: "gpt-5.5".to_string(),
+            proxy_url: String::new(),
+            remote_frontend_mode: String::new(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: String::new(),
+            bot: BotProfileConfig::default(),
+        })
+        .expect("update provider");
+
+        assert_eq!(profile.model, "gpt-5.5");
+        let updated = std::fs::read_to_string(&config_path).expect("read updated config");
+        let top_level = updated
+            .split("[profiles.custom]")
+            .next()
+            .expect("top-level content");
+        assert!(!top_level.contains("model_provider ="));
+        assert!(!top_level.contains("model ="));
+        assert!(updated.contains("[profiles.custom]"));
+        assert!(updated.contains("model = \"gpt-5.5\""));
+        assert!(updated.contains("model_provider = \"custom\""));
+        assert!(updated.contains("base_url = \"http://new.example/v1\""));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_userprofile {
+            std::env::set_var("USERPROFILE", value);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
     }
 
     #[test]
