@@ -16,6 +16,10 @@ const plugins = [
     beforePackage: syncBotGateway,
   },
   {
+    name: "qwen-asr",
+    include: ["plugin.json", "package.json", "mcp"],
+  },
+  {
     name: "next-ai-gateway",
     include: ["plugin.json", "package.json", "gateway"],
     beforePackage: buildNextAiGateway,

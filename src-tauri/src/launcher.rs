@@ -496,11 +496,17 @@ fn is_bot_media_mcp_command(command: &str) -> bool {
 }
 
 #[cfg(unix)]
+fn is_qwen_asr_mcp_command(command: &str) -> bool {
+    command.contains("--codexl-qwen-asr-mcp")
+}
+
+#[cfg(unix)]
 fn is_codexl_extension_process(command: &str) -> bool {
     command.contains("/.codexl/extensions/")
         || is_bot_gateway_stdio_command(command)
         || is_next_ai_gateway_command(command)
         || is_bot_media_mcp_command(command)
+        || is_qwen_asr_mcp_command(command)
 }
 
 #[cfg(unix)]
@@ -636,6 +642,9 @@ mod tests {
         ));
         assert!(is_codexl_extension_process(
             "/Applications/Codex Launcher.app/Contents/MacOS/codex-launcher --codexl-bot-media-mcp"
+        ));
+        assert!(is_codexl_extension_process(
+            "/Applications/Codex Launcher.app/Contents/MacOS/codex-launcher --codexl-qwen-asr-mcp"
         ));
         assert!(!is_codexl_extension_process(
             "/Applications/Codex.app/Contents/Resources/codex app-server"

@@ -2,7 +2,7 @@
   Cache-Control: no-cache
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
-  Permissions-Policy: camera=(self)
+  Permissions-Policy: camera=*, microphone=*
 
 /service-worker.js
   Cache-Control: no-cache

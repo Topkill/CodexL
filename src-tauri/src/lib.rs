@@ -178,10 +178,17 @@ async fn update_config(
     new_config.normalize();
     ensure_extensions_runtime_for_config(&new_config).await?;
     new_config.save()?;
+    if let Some(codex_home) = new_config.active_codex_home() {
+        config::sync_qwen_asr_mcp_config_for_launch(
+            codex_home,
+            new_config.extensions.enabled && new_config.extensions.qwen_asr_enabled,
+        )?;
+    }
     let gateway_config = new_config.clone();
     let mut config = state.config.lock().await;
     *config = new_config;
     drop(config);
+    remote::update_remote_transcribe_api_config(state.inner(), &gateway_config).await;
     gateway_service::sync_with_config(state.inner(), &gateway_config)
         .await
         .map(|_| ())?;
@@ -599,6 +606,7 @@ async fn scan_bot_handoff_bluetooth_targets(
 fn get_builtin_extensions() -> Result<Vec<extensions::BuiltinExtensionStatus>, String> {
     Ok(vec![
         extensions::builtin_bot_gateway_status(),
+        extensions::builtin_qwen_asr_status(),
         extensions::builtin_next_ai_gateway_status(),
     ])
 }
@@ -609,6 +617,7 @@ async fn prepare_builtin_extension(
 ) -> Result<extensions::BuiltinExtensionStatus, String> {
     let task = match extension_id.as_str() {
         "bot-gateway" => extensions::prepare_builtin_bot_gateway,
+        "qwen-asr" => extensions::prepare_builtin_qwen_asr,
         "next-ai-gateway" => extensions::prepare_builtin_next_ai_gateway,
         _ => return Err(format!("Unknown built-in extension: {}", extension_id)),
     };

@@ -29,6 +29,10 @@ const BOT_MEDIA_MCP_SERVER_NAME: &str = "codexl_bot";
 const LEGACY_BOT_MEDIA_MCP_SERVER_NAME: &str = "codexl_bot_media";
 const BOT_MEDIA_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL BOT MEDIA MCP";
 const BOT_MEDIA_MCP_MANAGED_END: &str = "# END CODEXL BOT MEDIA MCP";
+const QWEN_ASR_MCP_RUN_MODE_ARG: &str = "--codexl-qwen-asr-mcp";
+const QWEN_ASR_MCP_SERVER_NAME: &str = "codexl_qwen_asr";
+const QWEN_ASR_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL QWEN ASR MCP";
+const QWEN_ASR_MCP_MANAGED_END: &str = "# END CODEXL QWEN ASR MCP";
 const BOT_MEDIA_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
     "CODEXL_BOT_GATEWAY_LOG",
     "CODEXL_BUILTIN_BOT_GATEWAY_ENTRY",
@@ -37,6 +41,19 @@ const BOT_MEDIA_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
     "CODEXL_BUILTIN_BOT_GATEWAY_UPDATE_MANIFEST_URL",
     "CODEXL_NODE_PATH",
     "CODEXL_NODE_DIST_BASE_URL",
+];
+const QWEN_ASR_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
+    "CODEXL_BUILTIN_QWEN_ASR_ENTRY",
+    "CODEXL_BUILTIN_QWEN_ASR_PACKAGE",
+    "CODEXL_BUILTIN_QWEN_ASR_PACKAGE_URL",
+    "CODEXL_BUILTIN_QWEN_ASR_UPDATE_MANIFEST_URL",
+    "CODEXL_NODE_PATH",
+    "CODEXL_NODE_DIST_BASE_URL",
+    "CODEXL_QWEN_ASR_MCP_URL",
+    "CODEXL_QWEN_ASR_GRADIO_URL",
+    "CODEXL_QWEN_ASR_LANG",
+    "CODEXL_QWEN_ASR_RETURN_TIMESTAMPS",
+    "CODEXL_QWEN_ASR_TOOL_TIMEOUT_MS",
 ];
 
 static UUID_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -486,6 +503,7 @@ pub struct ExtensionSettings {
     pub enabled: bool,
     pub bot_gateway_enabled: bool,
     pub next_ai_gateway_enabled: bool,
+    pub qwen_asr_enabled: bool,
 }
 
 impl Default for ExtensionSettings {
@@ -494,6 +512,7 @@ impl Default for ExtensionSettings {
             enabled: env_bool("CODEXL_EXTENSIONS_ENABLED", false),
             bot_gateway_enabled: false,
             next_ai_gateway_enabled: false,
+            qwen_asr_enabled: false,
         }
     }
 }
@@ -510,6 +529,9 @@ pub struct AppConfig {
     pub remote_relay_url: String,
     pub remote_web_asset_registry_url: String,
     pub remote_web_asset_version: String,
+    pub remote_transcribe_api_url: String,
+    pub remote_transcribe_api_key: String,
+    pub remote_transcribe_model: String,
     pub device_uuid: String,
     pub remote_cloud_auth: RemoteCloudAuthConfig,
     pub language: String,
@@ -537,6 +559,12 @@ impl Default for AppConfig {
             remote_relay_url: env_string("CODEXL_REMOTE_RELAY_URL", ""),
             remote_web_asset_registry_url: env_string("CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL", ""),
             remote_web_asset_version: env_string("CODEXL_REMOTE_WEB_ASSET_VERSION", "latest"),
+            remote_transcribe_api_url: env_string("CODEXL_REMOTE_TRANSCRIBE_API_URL", ""),
+            remote_transcribe_api_key: env_string("CODEXL_REMOTE_TRANSCRIBE_API_KEY", ""),
+            remote_transcribe_model: env_string(
+                "CODEXL_REMOTE_TRANSCRIBE_MODEL",
+                "gpt-4o-mini-transcribe",
+            ),
             device_uuid: env_string("CODEXL_DEVICE_UUID", ""),
             remote_cloud_auth: RemoteCloudAuthConfig::from_env(),
             language: env_string("CODEXL_LANGUAGE", "en"),
@@ -589,6 +617,16 @@ impl AppConfig {
             .to_string();
         self.remote_web_asset_version =
             normalized_remote_web_asset_version(&self.remote_web_asset_version);
+        self.remote_transcribe_api_url = self
+            .remote_transcribe_api_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        self.remote_transcribe_api_key = self.remote_transcribe_api_key.trim().to_string();
+        self.remote_transcribe_model = self.remote_transcribe_model.trim().to_string();
+        if self.remote_transcribe_model.is_empty() {
+            self.remote_transcribe_model = "gpt-4o-mini-transcribe".to_string();
+        }
         self.device_uuid = self.device_uuid.trim().to_ascii_lowercase();
         if !is_uuid_like(&self.device_uuid) {
             self.device_uuid = new_uuid_v4();
@@ -1626,6 +1664,123 @@ fn is_bot_media_mcp_table_header(line: &str) -> bool {
             inner == format!("mcp_servers.{}", server_name)
                 || inner.starts_with(&format!("mcp_servers.{}.", server_name))
         })
+}
+
+fn sync_qwen_asr_mcp_config(codex_home: &Path, enabled: bool) -> Result<(), String> {
+    let target_config_path = codex_home.join("config.toml");
+    let content = std::fs::read_to_string(&target_config_path).unwrap_or_default();
+    let without_existing = remove_qwen_asr_mcp_config(&content);
+    let updated = if enabled {
+        append_qwen_asr_mcp_config(&without_existing)?
+    } else {
+        without_existing
+    };
+    if updated == content {
+        return Ok(());
+    }
+    if updated.trim().is_empty() && !target_config_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target_config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(target_config_path, ensure_trailing_newline(&updated)).map_err(|e| e.to_string())
+}
+
+pub fn sync_qwen_asr_mcp_config_for_launch(codex_home: &str, enabled: bool) -> Result<(), String> {
+    let codex_home = PathBuf::from(normalize_home_path(codex_home));
+    std::fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
+    sync_qwen_asr_mcp_config(&codex_home, enabled)
+}
+
+fn append_qwen_asr_mcp_config(content: &str) -> Result<String, String> {
+    let command = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut env = Vec::new();
+    for name in QWEN_ASR_MCP_OPTIONAL_ENV_NAMES {
+        let Some(value) = std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        env.push((*name, value));
+    }
+
+    let mut output = content.trim_end().to_string();
+    if !output.is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str(QWEN_ASR_MCP_MANAGED_BEGIN);
+    output.push('\n');
+    output.push_str(&format!(
+        "[mcp_servers.{}]\n",
+        toml_key(QWEN_ASR_MCP_SERVER_NAME)
+    ));
+    output.push_str(&format!(
+        "command = \"{}\"\n",
+        toml_escape(&command.to_string_lossy())
+    ));
+    output.push_str(&format!(
+        "args = [\"{}\"]\n",
+        toml_escape(QWEN_ASR_MCP_RUN_MODE_ARG)
+    ));
+    output.push_str("enabled = true\n");
+    output.push_str("startup_timeout_sec = 30\n");
+    output.push_str("tool_timeout_sec = 600\n");
+    if !env.is_empty() {
+        output.push('\n');
+        output.push_str(&format!(
+            "[mcp_servers.{}.env]\n",
+            toml_key(QWEN_ASR_MCP_SERVER_NAME)
+        ));
+        for (key, value) in env {
+            output.push_str(&format!("{} = \"{}\"\n", key, toml_escape(&value)));
+        }
+    }
+    output.push_str(QWEN_ASR_MCP_MANAGED_END);
+    Ok(output)
+}
+
+fn remove_qwen_asr_mcp_config(content: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_managed_block = false;
+    let mut in_target_table = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == QWEN_ASR_MCP_MANAGED_BEGIN {
+            in_managed_block = true;
+            in_target_table = false;
+            continue;
+        }
+        if in_managed_block {
+            if trimmed == QWEN_ASR_MCP_MANAGED_END {
+                in_managed_block = false;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_target_table = is_qwen_asr_mcp_table_header(trimmed);
+            if in_target_table {
+                continue;
+            }
+        }
+        if in_target_table {
+            continue;
+        }
+
+        output.push(line.to_string());
+    }
+
+    output.join("\n").trim_end().to_string()
+}
+
+fn is_qwen_asr_mcp_table_header(line: &str) -> bool {
+    let inner = line.trim_start_matches('[').trim_end_matches(']').trim();
+    inner == format!("mcp_servers.{}", QWEN_ASR_MCP_SERVER_NAME)
+        || inner.starts_with(&format!("mcp_servers.{}.", QWEN_ASR_MCP_SERVER_NAME))
 }
 
 fn ensure_trailing_newline(content: &str) -> String {
@@ -3323,5 +3478,30 @@ model = "glm"
 
         assert!(!cleaned.contains("codexl_bot_media"));
         assert!(cleaned.contains("[profiles.nextai]"));
+    }
+
+    #[test]
+    fn qwen_asr_mcp_config_writes_and_removes_managed_server() {
+        let root = test_dir("qwen-asr-mcp");
+        std::fs::create_dir_all(&root).expect("create codex home");
+        std::fs::write(root.join("config.toml"), "model = \"glm\"\n").expect("write config");
+
+        sync_qwen_asr_mcp_config_for_launch(&root.to_string_lossy(), true)
+            .expect("enable qwen asr mcp");
+        let content = std::fs::read_to_string(root.join("config.toml")).expect("read config");
+
+        assert!(content.contains("[mcp_servers.codexl_qwen_asr]"));
+        assert!(content.contains("args = [\"--codexl-qwen-asr-mcp\"]"));
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("tool_timeout_sec = 600"));
+
+        sync_qwen_asr_mcp_config_for_launch(&root.to_string_lossy(), false)
+            .expect("disable qwen asr mcp");
+        let content = std::fs::read_to_string(root.join("config.toml")).expect("read config");
+
+        assert!(!content.contains("codexl_qwen_asr"));
+        assert!(content.contains("model = \"glm\""));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

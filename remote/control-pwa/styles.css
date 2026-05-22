@@ -474,6 +474,13 @@ textarea {
   min-width: 116px;
 }
 
+.secure-web-button {
+  background-image: none;
+  cursor: pointer;
+  min-width: 98px;
+  padding: 0 10px;
+}
+
 .zoom-control {
   align-items: center;
   display: inline-flex;

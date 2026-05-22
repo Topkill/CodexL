@@ -210,6 +210,10 @@ pub async fn launch_codex_instance(
                 .unwrap_or(false),
         )?;
     }
+    config::sync_qwen_asr_mcp_config_for_launch(
+        &requested_config.codex_home,
+        requested_config.extensions.enabled && requested_config.extensions.qwen_asr_enabled,
+    )?;
     let launch = launcher::launch_codex(
         &executable,
         actual_port,

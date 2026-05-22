@@ -85,11 +85,12 @@ The token in the remote URL is sensitive. For more details about scanning, cache
 
 ## Built-In Extensions
 
-This repository includes two optional extensions:
+This repository includes optional extensions:
 
 | Extension | Purpose |
 | --- | --- |
 | Bot Gateway | Connect Codex to IM platforms, with Bot login, message forwarding, and handoff settings. |
+| Qwen ASR | Add Qwen3-ASR transcription tools to Codex through a built-in MCP server. |
 | NeXT AI Gateway | Convert other protocol interfaces into providers that Codex can use. |
 
 Extensions are disabled by default and can be enabled in app settings. When extensions are enabled, the runtime requires Node.js 20+.

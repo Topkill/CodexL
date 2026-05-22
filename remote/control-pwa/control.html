@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" href="icon.png" />
     <link rel="apple-touch-icon" href="icon.png" />
     <link rel="manifest" href="manifest.webmanifest" />
-    <link rel="stylesheet" href="styles.css?v=20260516-codex-web-registry-v2" />
+    <link rel="stylesheet" href="styles.css?v=20260518-voice-permissions-v1" />
   </head>
   <body>
     <div id="controlView" class="control-view">
@@ -21,6 +21,7 @@
           <select id="remoteModeSelect" class="mode-select" aria-label="Remote mode" hidden>
             <option value="web">Web</option>
           </select>
+          <button id="secureWebButton" class="mode-select secure-web-button" type="button" title="Use HTTPS for microphone" aria-label="Use HTTPS for microphone" hidden>Use HTTPS</button>
           <select id="webAssetVersionSelect" class="mode-select web-asset-version-select" aria-label="Codex app web bundle version" title="Codex app web bundle version" hidden>
             <option value="latest">Latest</option>
           </select>
@@ -65,7 +66,7 @@
       <main class="viewport">
         <div id="screenWrap" class="screen-wrap">
           <canvas id="screen" class="screen" aria-label="Codex app screen" hidden></canvas>
-          <iframe id="webFrame" class="web-frame" title="Codex web bridge" hidden></iframe>
+          <iframe id="webFrame" class="web-frame" title="Codex web bridge" allow="camera *; microphone *" hidden></iframe>
           <div id="emptyState" class="empty-state">Waiting for CDP screencast</div>
         </div>
       </main>
@@ -99,7 +100,7 @@
       ></textarea>
     </div>
 
-    <script src="vendor/jsQR.js?v=20260516-codex-web-registry-v2"></script>
-    <script src="app.js?v=20260516-codex-web-registry-v2" type="module"></script>
+    <script src="vendor/jsQR.js?v=20260518-voice-permissions-v1"></script>
+    <script src="app.js?v=20260518-voice-permissions-v1" type="module"></script>
   </body>
 </html>

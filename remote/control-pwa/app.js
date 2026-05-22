@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260516-codex-web-registry-v2";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260516-codex-web-registry-v2";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260518-voice-permissions-v1";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260518-voice-permissions-v1";
 
 const urlParams = new URLSearchParams(location.search);
 const initialConnection = connectionFromUrlParams(urlParams);
@@ -14,6 +14,7 @@ const WEB_BRIDGE_STATUS_MESSAGE = "codex-web-bridge-status";
 const WEB_RECONNECT_MAX_MS = 8000;
 const WEB_RECONNECT_MIN_MS = 1000;
 const WEB_CACHE_PREPARE_TIMEOUT_MS = 120000;
+const DEFAULT_WEB_ASSET_REGISTRY_URL = "https://codexl-codex-app-web.pages.dev";
 const VIEWPORT_SEND_DEBOUNCE_MS = 120;
 const PAGE_ZOOM_SEND_DEBOUNCE_MS = 120;
 const PAGE_ZOOM_STORAGE_KEY = "codex-app-remotely.pageZoomScale";
@@ -34,7 +35,7 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260516-codex-web-registry-v2";
+const PWA_BUILD = "20260518-voice-permissions-v1";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
 const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
 const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
@@ -161,6 +162,7 @@ const passwordInput = document.querySelector("#passwordInput");
 const passwordStatus = document.querySelector("#passwordStatus");
 const qualitySelect = document.querySelector("#qualitySelect");
 const remoteModeSelect = document.querySelector("#remoteModeSelect");
+const secureWebButton = document.querySelector("#secureWebButton");
 const scanButton = document.querySelector("#scanButton");
 const scanStatus = document.querySelector("#scanStatus");
 const scanVideo = document.querySelector("#scanVideo");
@@ -422,6 +424,10 @@ function setupControlEventHandlers() {
     switchRemoteMode(remoteModeSelect.value, { remember: true });
   });
 
+  secureWebButton?.addEventListener("click", () => {
+    openSecureRegistryWeb();
+  });
+
   webAssetVersionSelect?.addEventListener("change", () => {
     const nextVersion = normalizeWebAssetVersion(webAssetVersionSelect.value);
     if (!webAssetRegistryEnabled() || nextVersion === webAssetVersion) {
@@ -429,6 +435,7 @@ function setupControlEventHandlers() {
     }
     webAssetVersion = nextVersion;
     persistActiveWebAssetSelection();
+    updateSecureWebButton();
     void connectWebBridgeMode();
   });
 
@@ -828,6 +835,7 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   webAssetBaseUrl = connectionWebAssetBaseUrl(connection, connectionUrl, remoteInfo);
   webAssetVersion = connectionWebAssetVersion(connection, connectionUrl, remoteInfo);
   configureWebAssetVersionSelect();
+  updateSecureWebButton();
   if (webAssetRegistryEnabled()) {
     void refreshWebAssetVersions();
   }
@@ -975,6 +983,7 @@ function applyRemoteModeLayout() {
     emptyState.hidden = webMode ? state.webFrameLoaded : state.frameConnected;
     emptyState.textContent = webMode ? "Loading web bridge" : "Waiting for CDP screencast";
   }
+  updateSecureWebButton();
 }
 
 async function connectWebBridgeMode() {
@@ -2465,9 +2474,55 @@ async function refreshWebAssetVersions() {
       return;
     }
     configureWebAssetVersionSelect(manifest?.versions || [], manifest?.latest || "");
+    updateSecureWebButton();
   } catch (error) {
     console.warn("[web-assets] unable to load versions.json", error);
   }
+}
+
+function defaultWebAssetRegistryUrl() {
+  return normalizeWebAssetBaseUrl(
+    urlParams.get("defaultWebAssetBaseUrl") ||
+      urlParams.get("default_web_asset_base_url") ||
+      DEFAULT_WEB_ASSET_REGISTRY_URL,
+  );
+}
+
+function secureRegistryWebAvailable() {
+  return Boolean(webAssetBaseUrl || defaultWebAssetRegistryUrl());
+}
+
+function shouldShowSecureWebButton() {
+  return state.remoteMode === REMOTE_MODE_WEB && !window.isSecureContext && secureRegistryWebAvailable();
+}
+
+function updateSecureWebButton() {
+  if (!secureWebButton) {
+    return;
+  }
+  secureWebButton.hidden = !shouldShowSecureWebButton();
+}
+
+function openSecureRegistryWeb() {
+  const nextBaseUrl = webAssetBaseUrl || defaultWebAssetRegistryUrl();
+  if (!nextBaseUrl) {
+    setStatus("HTTPS app bundle unavailable");
+    return;
+  }
+
+  webAssetBaseUrl = nextBaseUrl;
+  webAssetVersion = normalizeWebAssetVersion(webAssetVersion || urlParams.get("webAssetVersion") || "latest");
+  persistActiveWebAssetSelection();
+  configureWebAssetVersionSelect();
+  updateSecureWebButton();
+
+  if (window.isSecureContext) {
+    void refreshWebAssetVersions();
+    void connectWebBridgeMode();
+    return;
+  }
+
+  openRegistryStandalonePage();
 }
 
 function persistActiveWebAssetSelection() {
@@ -2514,6 +2569,20 @@ function webBridgeUrl() {
     url.searchParams.set("codexBridgeParent", "1");
     url.searchParams.set("codexBridgeParentOrigin", location.origin);
   }
+  const bridgeTransportUrl = webBridgeWebTransportUrl();
+  if (bridgeTransportUrl) {
+    url.searchParams.set("codexBridgeTransportUrl", bridgeTransportUrl);
+  }
+  url.searchParams.set("transport", transportPreference || "auto");
+  return url.toString();
+}
+
+function registryStandaloneUrl() {
+  const url = webAssetFrameUrl();
+  url.searchParams.set("hostId", "local");
+  url.searchParams.set("token", token);
+  applyWebEndpointCryptoParams(url.searchParams);
+  url.searchParams.set(WEB_BRIDGE_URL_PARAM, webBridgeSocketUrl());
   const bridgeTransportUrl = webBridgeWebTransportUrl();
   if (bridgeTransportUrl) {
     url.searchParams.set("codexBridgeTransportUrl", bridgeTransportUrl);
@@ -2583,7 +2652,7 @@ function canLoadWebFrameDirectly() {
 }
 
 function shouldOpenRemoteControlPageDirectly() {
-  return location.protocol === "https:" && remoteOrigin.startsWith("http:");
+  return location.protocol === "https:" && remoteOrigin.startsWith("http:") && !webAssetRegistryEnabled();
 }
 
 function openRemoteControlPageDirectly() {
@@ -2604,6 +2673,17 @@ function openRemoteControlPageDirectly() {
     updateInstanceStatus(activeInstanceId, "Opening LAN remote");
   }
   location.href = url.toString();
+}
+
+function openRegistryStandalonePage() {
+  setStatus(`Opening HTTPS app bundle (${webAssetVersion})`);
+  if (activeInstanceId) {
+    updateInstanceStatus(activeInstanceId, `Opening HTTPS app bundle (${webAssetVersion})`, {
+      webAssetBaseUrl,
+      webAssetVersion,
+    });
+  }
+  location.href = registryStandaloneUrl();
 }
 
 async function prepareWebCache(iframeUrl) {

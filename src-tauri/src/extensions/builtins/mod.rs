@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BOT_GATEWAY_EXTENSION_ID: &str = "bot-gateway";
@@ -30,6 +30,16 @@ const NEXT_AI_GATEWAY_PACKAGE_ENV: &str = "CODEXL_BUILTIN_NEXT_AI_GATEWAY_PACKAG
 const NEXT_AI_GATEWAY_PACKAGE_URL_ENV: &str = "CODEXL_BUILTIN_NEXT_AI_GATEWAY_PACKAGE_URL";
 const NEXT_AI_GATEWAY_UPDATE_MANIFEST_URL_ENV: &str =
     "CODEXL_BUILTIN_NEXT_AI_GATEWAY_UPDATE_MANIFEST_URL";
+const QWEN_ASR_EXTENSION_ID: &str = "qwen-asr";
+const QWEN_ASR_EXTENSION_NAME: &str = "Qwen ASR";
+const QWEN_ASR_EXTENSION_DESCRIPTION: &str =
+    "Transcribe audio through the Qwen3-ASR Gradio MCP service.";
+const QWEN_ASR_EXTENSION_VERSION: &str = "1.0.0";
+const QWEN_ASR_BUNDLED_PACKAGE_FILE: &str = "qwen-asr-1.0.0.tar.gz";
+const QWEN_ASR_ENTRY_ENV: &str = "CODEXL_BUILTIN_QWEN_ASR_ENTRY";
+const QWEN_ASR_PACKAGE_ENV: &str = "CODEXL_BUILTIN_QWEN_ASR_PACKAGE";
+const QWEN_ASR_PACKAGE_URL_ENV: &str = "CODEXL_BUILTIN_QWEN_ASR_PACKAGE_URL";
+const QWEN_ASR_UPDATE_MANIFEST_URL_ENV: &str = "CODEXL_BUILTIN_QWEN_ASR_UPDATE_MANIFEST_URL";
 const CODEXL_HOME_ENV: &str = "CODEXL_HOME";
 const NODE_PATH_ENV: &str = "CODEXL_NODE_PATH";
 const NODE_DIST_BASE_ENV: &str = "CODEXL_NODE_DIST_BASE_URL";
@@ -75,6 +85,19 @@ const NEXT_AI_GATEWAY_SPEC: BuiltinNodeExtensionSpec = BuiltinNodeExtensionSpec 
     package_env: NEXT_AI_GATEWAY_PACKAGE_ENV,
     package_url_env: NEXT_AI_GATEWAY_PACKAGE_URL_ENV,
     update_manifest_url_env: NEXT_AI_GATEWAY_UPDATE_MANIFEST_URL_ENV,
+};
+
+const QWEN_ASR_SPEC: BuiltinNodeExtensionSpec = BuiltinNodeExtensionSpec {
+    id: QWEN_ASR_EXTENSION_ID,
+    name: QWEN_ASR_EXTENSION_NAME,
+    description: QWEN_ASR_EXTENSION_DESCRIPTION,
+    version: QWEN_ASR_EXTENSION_VERSION,
+    bundled_package_file: QWEN_ASR_BUNDLED_PACKAGE_FILE,
+    entry: "mcp/server.js",
+    entry_env: QWEN_ASR_ENTRY_ENV,
+    package_env: QWEN_ASR_PACKAGE_ENV,
+    package_url_env: QWEN_ASR_PACKAGE_URL_ENV,
+    update_manifest_url_env: QWEN_ASR_UPDATE_MANIFEST_URL_ENV,
 };
 
 #[derive(Debug, Clone)]
@@ -186,6 +209,10 @@ pub fn builtin_next_ai_gateway_status() -> BuiltinExtensionStatus {
     builtin_node_extension_status(NEXT_AI_GATEWAY_SPEC)
 }
 
+pub fn builtin_qwen_asr_status() -> BuiltinExtensionStatus {
+    builtin_node_extension_status(QWEN_ASR_SPEC)
+}
+
 fn builtin_node_extension_status(spec: BuiltinNodeExtensionSpec) -> BuiltinExtensionStatus {
     let installed_result = resolve_installed_plugin_package(spec);
     let installed = installed_result
@@ -234,6 +261,10 @@ pub fn prepare_builtin_next_ai_gateway() -> Result<BuiltinExtensionStatus, Strin
     prepare_builtin_node_extension(NEXT_AI_GATEWAY_SPEC)
 }
 
+pub fn prepare_builtin_qwen_asr() -> Result<BuiltinExtensionStatus, String> {
+    prepare_builtin_node_extension(QWEN_ASR_SPEC)
+}
+
 pub fn prepare_builtin_extensions_runtime() -> Result<RuntimeStatus, String> {
     let node = ensure_node_runtime()?;
     Ok(runtime_status(Some(&node)))
@@ -261,6 +292,23 @@ pub fn resolve_builtin_bot_gateway_extension() -> Result<BuiltinNodeExtension, S
 
 pub fn resolve_builtin_next_ai_gateway_extension() -> Result<BuiltinNodeExtension, String> {
     resolve_builtin_node_extension(NEXT_AI_GATEWAY_SPEC)
+}
+
+pub fn resolve_builtin_qwen_asr_extension() -> Result<BuiltinNodeExtension, String> {
+    resolve_builtin_node_extension(QWEN_ASR_SPEC)
+}
+
+pub fn run_builtin_qwen_asr_mcp_stdio() -> Result<i32, String> {
+    let extension = resolve_builtin_qwen_asr_extension()?;
+    let status = Command::new(&extension.node.executable)
+        .arg(&extension.entry_path)
+        .current_dir(&extension.root_dir)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| format!("failed to start Qwen ASR MCP stdio: {}", err))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn resolve_builtin_node_extension(

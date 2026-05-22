@@ -6,7 +6,13 @@ use crate::{
     },
     launcher, ports, server, AppState,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE,
+        URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+    },
+    Engine as _,
+};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
@@ -64,6 +70,13 @@ const CLI_READ_FILE_BINARY_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const CLI_APP_SERVER_RESUME_TURNS_LIMIT: u64 = 5;
 const CLI_APP_SERVER_REQUEST_ID_PREFIX: &str = "codexl-remote-cli-";
 const CLI_APP_SERVER_PROTOCOL_VERSION: &str = "2025-11-25";
+const CODEX_DESKTOP_API_PROD_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const CODEX_DESKTOP_API_DEV_BASE_URL: &str = "http://localhost:8000/api";
+const CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+const DEFAULT_TRANSCRIBE_MODEL: &str = "gpt-4o-mini-transcribe";
+const DEFAULT_QWEN_ASR_GRADIO_URL: &str = "https://qwen-qwen3-asr.ms.show/";
+const DEFAULT_QWEN_ASR_LANG: &str = "Auto";
+const QWEN_ASR_TRANSCRIBE_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const CLI_ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const CLI_PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
 const CLI_THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
@@ -172,6 +185,30 @@ struct RemoteServerConfig {
 enum RemoteBackend {
     App,
     Cli(Arc<CliAppBridge>),
+}
+
+#[derive(Debug, Clone)]
+struct TranscribeApiConfig {
+    url: String,
+    api_key: String,
+    model: String,
+    qwen_asr_enabled: bool,
+}
+
+impl TranscribeApiConfig {
+    fn from_app_config(config: &AppConfig) -> Self {
+        Self {
+            url: config.remote_transcribe_api_url.trim().to_string(),
+            api_key: config.remote_transcribe_api_key.trim().to_string(),
+            model: non_empty_string(&config.remote_transcribe_model)
+                .unwrap_or_else(|| DEFAULT_TRANSCRIBE_MODEL.to_string()),
+            qwen_asr_enabled: config.extensions.enabled && config.extensions.qwen_asr_enabled,
+        }
+    }
+
+    fn is_custom(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
 }
 
 impl RemoteBackend {
@@ -422,6 +459,20 @@ pub async fn stop_remote_control(state: &AppState, profile_name: &str) -> Result
         handle.stop().await;
     }
     Ok(())
+}
+
+pub(crate) async fn update_remote_transcribe_api_config(state: &AppState, config: &AppConfig) {
+    let transcribe_api = TranscribeApiConfig::from_app_config(config);
+    let bridges: Vec<Arc<CliAppBridge>> = {
+        let controls = state.remote_controls.lock().await;
+        controls
+            .values()
+            .filter_map(|handle| handle.runtime.backend.cli_bridge())
+            .collect()
+    };
+    for bridge in bridges {
+        bridge.set_transcribe_api(transcribe_api.clone()).await;
+    }
 }
 
 pub async fn remote_control_status_map(state: &AppState) -> HashMap<String, RemoteControlInfo> {
@@ -2124,6 +2175,10 @@ async fn start_cli_app_server_bridge(
             false,
         )?;
     }
+    config::sync_qwen_asr_mcp_config_for_launch(
+        &requested_config.codex_home,
+        requested_config.extensions.enabled && requested_config.extensions.qwen_asr_enabled,
+    )?;
 
     let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
     let active_cli_profile = requested_config.active_cli_profile();
@@ -2132,6 +2187,7 @@ async fn start_cli_app_server_bridge(
         .as_ref()
         .map(|profile| profile.proxy_url.clone())
         .unwrap_or_default();
+    let transcribe_api = TranscribeApiConfig::from_app_config(&requested_config);
     let bridge = CliAppBridge::spawn(
         executable,
         requested_config.codex_home.clone(),
@@ -2139,6 +2195,7 @@ async fn start_cli_app_server_bridge(
         active_cli_profile,
         active_cli_model_provider,
         proxy_url,
+        transcribe_api,
     )
     .await?;
 
@@ -2159,6 +2216,7 @@ struct CliAppBridge {
     next_subscription_id: AtomicUsize,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     subscribers: Mutex<HashMap<usize, mpsc::UnboundedSender<Value>>>,
+    transcribe_api: Mutex<TranscribeApiConfig>,
     workspace_name: String,
     writer: Mutex<ChildStdin>,
 }
@@ -2171,6 +2229,7 @@ impl CliAppBridge {
         cli_profile: Option<String>,
         cli_model_provider: Option<String>,
         proxy_url: String,
+        transcribe_api: TranscribeApiConfig,
     ) -> Result<Arc<Self>, String> {
         let mut command = TokioCommand::new(&executable);
         if let Some(profile) = cli_profile.as_deref() {
@@ -2215,6 +2274,7 @@ impl CliAppBridge {
             next_subscription_id: AtomicUsize::new(1),
             pending: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
+            transcribe_api: Mutex::new(transcribe_api),
             workspace_name,
             writer: Mutex::new(stdin),
         });
@@ -2224,6 +2284,10 @@ impl CliAppBridge {
             return Err(err);
         }
         Ok(bridge)
+    }
+
+    async fn set_transcribe_api(&self, transcribe_api: TranscribeApiConfig) {
+        *self.transcribe_api.lock().await = transcribe_api;
     }
 
     fn spawn_stdout_reader(self: Arc<Self>, stdout: tokio::process::ChildStdout) {
@@ -2630,6 +2694,14 @@ impl CliAppBridge {
                     "messages": [fetch_response_body_success(&request_id, response)],
                 }));
             }
+            if let Some(response) = self
+                .dispatch_desktop_api_fetch_request(&request_id, &message)
+                .await
+            {
+                return Ok(json!({
+                    "messages": [response],
+                }));
+            }
             return Ok(json!({
                 "messages": [fetch_response_error(
                     &request_id,
@@ -2761,6 +2833,28 @@ impl CliAppBridge {
             cli_bridge_message_labels(&messages)
         );
         Ok(json!({ "messages": messages }))
+    }
+
+    async fn dispatch_desktop_api_fetch_request(
+        &self,
+        request_id: &str,
+        message: &Value,
+    ) -> Option<Value> {
+        if !cli_is_supported_desktop_api_fetch_request(message) {
+            return None;
+        }
+        let transcribe_api = self.transcribe_api.lock().await.clone();
+        match cli_desktop_api_fetch_response(
+            message,
+            &self.codex_home,
+            &self.workspace_name,
+            &transcribe_api,
+        )
+        .await
+        {
+            Ok(response) => Some(response),
+            Err((status, error)) => Some(fetch_response_error_status(request_id, status, &error)),
+        }
     }
 
     async fn dispatch_cli_fetch_endpoint(
@@ -3505,6 +3599,906 @@ fn bridge_fetch_request(message: &Value) -> Option<BridgeFetchRequest> {
     })
 }
 
+fn cli_is_supported_desktop_api_fetch_request(message: &Value) -> bool {
+    if message.get("type").and_then(Value::as_str) != Some("fetch") {
+        return false;
+    }
+    if !message
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+    {
+        return false;
+    }
+    message
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(cli_desktop_api_fetch_path)
+        .is_some()
+}
+
+fn cli_desktop_api_fetch_path(url: &str) -> Option<&'static str> {
+    match url.trim() {
+        "/transcribe" => Some("/transcribe"),
+        _ => None,
+    }
+}
+
+async fn cli_desktop_api_fetch_response(
+    message: &Value,
+    codex_home: &str,
+    workspace_name: &str,
+    transcribe_api: &TranscribeApiConfig,
+) -> Result<Value, (u16, String)> {
+    let request_id = message
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let url = message
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(cli_desktop_api_fetch_path)
+        .ok_or_else(|| (500, "Unsupported desktop API fetch endpoint".to_string()))?;
+    if transcribe_api.is_custom() {
+        return cli_custom_transcribe_fetch_response(message, transcribe_api).await;
+    }
+    if transcribe_api.qwen_asr_enabled {
+        return cli_qwen_asr_transcribe_fetch_response(message).await;
+    }
+
+    let url = cli_desktop_api_url(url);
+    let (request_headers, request_body) = cli_desktop_api_fetch_init(message)?;
+    let auth_token = cli_chatgpt_auth_token(codex_home, workspace_name).ok_or_else(|| {
+        (
+            432,
+            "Sign in to ChatGPT in Codex Desktop to transcribe audio.".to_string(),
+        )
+    })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(CLI_APP_SERVER_FETCH_TIMEOUT_MS))
+        .build()
+        .map_err(|e| (500, e.to_string()))?;
+    let mut request = client
+        .request(reqwest::Method::POST, url)
+        .header(AUTHORIZATION.as_str(), format!("Bearer {}", auth_token))
+        .header("originator", CODEX_DESKTOP_ORIGINATOR)
+        .header("User-Agent", cli_desktop_user_agent());
+    if let Some(account_id) = cli_chatgpt_account_id_from_access_token(&auth_token) {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+    for (name, value) in request_headers {
+        request = request.header(name, value);
+    }
+
+    let response = request
+        .body(request_body)
+        .send()
+        .await
+        .map_err(|e| (500, e.to_string()))?;
+    let status = response.status();
+    let response_headers = cli_reqwest_headers_json(response.headers());
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response.bytes().await.map_err(|e| (500, e.to_string()))?;
+
+    if status.is_success() {
+        let body = if content_type.contains("application/json") {
+            serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!(String::from_utf8_lossy(&body).to_string()))
+        } else {
+            json!({
+                "base64": BASE64_STANDARD.encode(&body),
+                "contentType": content_type,
+            })
+        };
+        Ok(fetch_response_body_success_status(
+            request_id,
+            status.as_u16(),
+            response_headers,
+            body,
+        ))
+    } else {
+        let error = String::from_utf8_lossy(&body).to_string();
+        Err((
+            status.as_u16(),
+            if error.trim().is_empty() {
+                format!("Request failed with status {}", status.as_u16())
+            } else {
+                error
+            },
+        ))
+    }
+}
+
+async fn cli_custom_transcribe_fetch_response(
+    message: &Value,
+    transcribe_api: &TranscribeApiConfig,
+) -> Result<Value, (u16, String)> {
+    let request_id = message
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let url = reqwest::Url::parse(&transcribe_api.url)
+        .map_err(|e| (500, format!("Invalid transcribe API URL: {}", e)))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err((500, "Transcribe API URL must use http or https".to_string()));
+    }
+
+    let (request_headers, request_body) =
+        cli_openai_transcribe_fetch_init(message, &transcribe_api.model)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(CLI_APP_SERVER_FETCH_TIMEOUT_MS))
+        .build()
+        .map_err(|e| (500, e.to_string()))?;
+    let mut request = client.request(reqwest::Method::POST, url);
+    if !transcribe_api.api_key.trim().is_empty() {
+        request = request.header(
+            AUTHORIZATION.as_str(),
+            format!("Bearer {}", transcribe_api.api_key.trim()),
+        );
+    }
+    for (name, value) in request_headers {
+        request = request.header(name, value);
+    }
+
+    let response = request
+        .body(request_body)
+        .send()
+        .await
+        .map_err(|e| (500, e.to_string()))?;
+    let status = response.status();
+    let response_headers = cli_reqwest_headers_json(response.headers());
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response.bytes().await.map_err(|e| (500, e.to_string()))?;
+
+    if status.is_success() {
+        let body = if content_type.contains("application/json") {
+            serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!(String::from_utf8_lossy(&body).to_string()))
+        } else {
+            json!({
+                "text": String::from_utf8_lossy(&body).to_string(),
+            })
+        };
+        Ok(fetch_response_body_success_status(
+            request_id,
+            status.as_u16(),
+            response_headers,
+            body,
+        ))
+    } else {
+        let error = String::from_utf8_lossy(&body).to_string();
+        Err((
+            status.as_u16(),
+            if error.trim().is_empty() {
+                format!("Request failed with status {}", status.as_u16())
+            } else {
+                error
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliTranscribeAudioFile {
+    filename: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+async fn cli_qwen_asr_transcribe_fetch_response(message: &Value) -> Result<Value, (u16, String)> {
+    let request_id = message
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let (headers, body) = cli_desktop_api_fetch_init(message)?;
+    let audio = cli_transcribe_audio_file_from_request(&headers, body)?;
+    let uploaded_file = qwen_asr_upload_audio(audio).await?;
+    let result = qwen_asr_call_transcribe(uploaded_file).await?;
+    let body = qwen_asr_openai_transcribe_body(result);
+
+    Ok(fetch_response_body_success_status(
+        request_id,
+        200,
+        json!({ "content-type": "application/json" }),
+        body,
+    ))
+}
+
+fn cli_transcribe_audio_file_from_request(
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+    body: Vec<u8>,
+) -> Result<CliTranscribeAudioFile, (u16, String)> {
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name == reqwest::header::CONTENT_TYPE)
+        .and_then(|(_, value)| value.to_str().ok())
+        .unwrap_or("application/octet-stream");
+
+    if let Some(boundary) = cli_multipart_boundary(content_type) {
+        return cli_multipart_audio_file(&body, &boundary);
+    }
+
+    if body.is_empty() {
+        return Err((500, "Transcribe request body is empty".to_string()));
+    }
+
+    Ok(CliTranscribeAudioFile {
+        filename: format!(
+            "codex{}",
+            audio_extension_for_content_type(content_type).unwrap_or(".webm")
+        ),
+        content_type: content_type.to_string(),
+        bytes: body,
+    })
+}
+
+fn cli_multipart_audio_file(
+    body: &[u8],
+    boundary: &str,
+) -> Result<CliTranscribeAudioFile, (u16, String)> {
+    let delimiter = format!("--{}", boundary).into_bytes();
+    let mut candidate: Option<CliTranscribeAudioFile> = None;
+
+    for raw_part in split_by_subslice(body, &delimiter) {
+        let part = trim_multipart_part(raw_part);
+        if part.is_empty() || part.starts_with(b"--") {
+            continue;
+        }
+        let Some(header_end) = find_subslice(part, b"\r\n\r\n") else {
+            continue;
+        };
+        let header_text = String::from_utf8_lossy(&part[..header_end]);
+        let mut content_disposition = "";
+        let mut content_type = "application/octet-stream";
+        for line in header_text.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("content-disposition") {
+                content_disposition = value.trim();
+            } else if name.trim().eq_ignore_ascii_case("content-type") {
+                content_type = value.trim();
+            }
+        }
+        if !content_disposition
+            .to_ascii_lowercase()
+            .contains("form-data")
+        {
+            continue;
+        }
+
+        let field_name = multipart_header_param(content_disposition, "name").unwrap_or_default();
+        let filename = multipart_header_param(content_disposition, "filename")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    if field_name.is_empty() {
+                        "codex"
+                    } else {
+                        &field_name
+                    },
+                    audio_extension_for_content_type(content_type).unwrap_or(".webm")
+                )
+            });
+        let bytes = trim_single_trailing_crlf(&part[header_end + 4..]).to_vec();
+        if bytes.is_empty() {
+            continue;
+        }
+
+        let file = CliTranscribeAudioFile {
+            filename,
+            content_type: content_type.to_string(),
+            bytes,
+        };
+        if field_name == "file" || field_name == "audio" || field_name == "audio_upload" {
+            return Ok(file);
+        }
+        if candidate.is_none()
+            && !multipart_header_param(content_disposition, "filename")
+                .unwrap_or_default()
+                .is_empty()
+        {
+            candidate = Some(file);
+        }
+    }
+
+    candidate.ok_or_else(|| {
+        (
+            500,
+            "Transcribe request is missing an audio file".to_string(),
+        )
+    })
+}
+
+async fn qwen_asr_upload_audio(audio: CliTranscribeAudioFile) -> Result<Value, (u16, String)> {
+    let upload_url = qwen_asr_upload_url()?;
+    let filename = audio.filename.clone();
+    let content_type = audio.content_type.clone();
+    let mime_type = audio
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim();
+    let part = reqwest::multipart::Part::bytes(audio.bytes)
+        .file_name(filename.clone())
+        .mime_str(mime_type)
+        .map_err(|err| (500, format!("Invalid audio MIME type: {}", err)))?;
+    let form = reqwest::multipart::Form::new().part("files", part);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(QWEN_ASR_TRANSCRIBE_TIMEOUT_MS))
+        .build()
+        .map_err(|e| (500, e.to_string()))?;
+    let response = client
+        .post(upload_url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| (500, format!("Qwen ASR upload failed: {}", e)))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| (500, e.to_string()))?;
+    if !status.is_success() {
+        return Err((
+            status.as_u16(),
+            format!("Qwen ASR upload failed: {}", truncate_for_error(&body)),
+        ));
+    }
+    let path = qwen_asr_uploaded_path(&body).ok_or_else(|| {
+        (
+            500,
+            format!(
+                "Qwen ASR upload returned an unsupported response: {}",
+                truncate_for_error(&body)
+            ),
+        )
+    })?;
+    Ok(json!({
+        "path": path,
+        "orig_name": filename,
+        "mime_type": content_type,
+        "meta": { "_type": "gradio.FileData" }
+    }))
+}
+
+async fn qwen_asr_call_transcribe(audio_upload: Value) -> Result<Value, (u16, String)> {
+    let call_url = qwen_asr_api_call_url("transcribe")?;
+    let request = json!({
+        "data": [audio_upload, qwen_asr_language(), false]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(QWEN_ASR_TRANSCRIBE_TIMEOUT_MS))
+        .build()
+        .map_err(|e| (500, e.to_string()))?;
+    let response = client
+        .post(call_url)
+        .header(CONTENT_TYPE.as_str(), "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| (500, format!("Qwen ASR transcription failed: {}", e)))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| (500, e.to_string()))?;
+    if !status.is_success() {
+        return Err((
+            status.as_u16(),
+            format!(
+                "Qwen ASR transcription failed: {}",
+                truncate_for_error(&body)
+            ),
+        ));
+    }
+    let event_id = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("event_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            (
+                500,
+                format!(
+                    "Qwen ASR returned an unsupported response: {}",
+                    truncate_for_error(&body)
+                ),
+            )
+        })?;
+
+    let event_url = qwen_asr_api_event_url("transcribe", &event_id)?;
+    let response = client
+        .get(event_url)
+        .send()
+        .await
+        .map_err(|e| (500, format!("Qwen ASR transcription failed: {}", e)))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| (500, e.to_string()))?;
+    if !status.is_success() {
+        return Err((
+            status.as_u16(),
+            format!(
+                "Qwen ASR transcription failed: {}",
+                truncate_for_error(&body)
+            ),
+        ));
+    }
+    parse_gradio_event_response(&body).map_err(|err| (500, err))
+}
+
+fn qwen_asr_openai_transcribe_body(result: Value) -> Value {
+    let text = qwen_asr_result_text(&result);
+    json!({ "text": text })
+}
+
+fn qwen_asr_result_text(value: &Value) -> String {
+    if let Some(items) = value.as_array() {
+        if let Some(text) = items.get(1).and_then(Value::as_str) {
+            return text.trim().to_string();
+        }
+        if let Some(text) = items.iter().find_map(Value::as_str) {
+            return text.trim().to_string();
+        }
+    }
+    if let Some(text) = value
+        .get("structuredContent")
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+    {
+        return text.trim().to_string();
+    }
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return text.trim().to_string();
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        let mut parts = Vec::new();
+        for item in content {
+            let Some(text) = item.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            parts.push(qwen_asr_text_content_text(text));
+        }
+        return parts
+            .into_iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+fn qwen_asr_text_content_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            return text.to_string();
+        }
+        if let Some(text) = value.as_str() {
+            return text.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn qwen_asr_uploaded_path(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    if let Some(items) = value.as_array() {
+        return items
+            .first()
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+    value
+        .get("path")
+        .or_else(|| value.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("files")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn parse_gradio_event_response(body: &str) -> Result<Value, String> {
+    let mut messages = Vec::new();
+    let mut data = Vec::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push(rest.trim_start());
+            continue;
+        }
+        if line.trim().is_empty() && !data.is_empty() {
+            messages.push(data.join("\n"));
+            data.clear();
+        }
+    }
+    if !data.is_empty() {
+        messages.push(data.join("\n"));
+    }
+
+    messages
+        .last()
+        .ok_or_else(|| "Qwen ASR returned an empty response".to_string())
+        .and_then(|message| serde_json::from_str(message).map_err(|err| err.to_string()))
+}
+
+fn qwen_asr_gradio_url() -> Result<reqwest::Url, (u16, String)> {
+    let base = std::env::var("CODEXL_QWEN_ASR_GRADIO_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_QWEN_ASR_GRADIO_URL.to_string());
+    reqwest::Url::parse(&base).map_err(|err| (500, format!("Invalid Qwen ASR Gradio URL: {}", err)))
+}
+
+fn qwen_asr_upload_url() -> Result<String, (u16, String)> {
+    qwen_asr_gradio_url()?
+        .join("/gradio_api/upload")
+        .map(|url| url.to_string())
+        .map_err(|err| (500, format!("Invalid Qwen ASR upload URL: {}", err)))
+}
+
+fn qwen_asr_api_call_url(endpoint: &str) -> Result<String, (u16, String)> {
+    qwen_asr_gradio_url()?
+        .join(&format!("/gradio_api/call/{}", endpoint))
+        .map(|url| url.to_string())
+        .map_err(|err| (500, format!("Invalid Qwen ASR API URL: {}", err)))
+}
+
+fn qwen_asr_api_event_url(endpoint: &str, event_id: &str) -> Result<String, (u16, String)> {
+    qwen_asr_gradio_url()?
+        .join(&format!("/gradio_api/call/{}/{}", endpoint, event_id))
+        .map(|url| url.to_string())
+        .map_err(|err| (500, format!("Invalid Qwen ASR event URL: {}", err)))
+}
+
+fn qwen_asr_language() -> String {
+    std::env::var("CODEXL_QWEN_ASR_LANG")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_QWEN_ASR_LANG.to_string())
+}
+
+fn split_by_subslice<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
+    if needle.is_empty() {
+        return vec![haystack];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while let Some(relative_index) = find_subslice(&haystack[start..], needle) {
+        let index = start + relative_index;
+        parts.push(&haystack[start..index]);
+        start = index + needle.len();
+    }
+    parts.push(&haystack[start..]);
+    parts
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn trim_multipart_part(mut value: &[u8]) -> &[u8] {
+    if value.starts_with(b"\r\n") {
+        value = &value[2..];
+    }
+    trim_single_trailing_crlf(value)
+}
+
+fn trim_single_trailing_crlf(value: &[u8]) -> &[u8] {
+    if value.ends_with(b"\r\n") {
+        &value[..value.len() - 2]
+    } else {
+        value
+    }
+}
+
+fn multipart_header_param(header: &str, name: &str) -> Option<String> {
+    for part in header.split(';').skip(1) {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn audio_extension_for_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "audio/aac" => Some(".aac"),
+        "audio/flac" => Some(".flac"),
+        "audio/mp4" | "audio/m4a" => Some(".m4a"),
+        "audio/mpeg" | "audio/mp3" => Some(".mp3"),
+        "audio/ogg" | "audio/opus" => Some(".ogg"),
+        "audio/wav" | "audio/wave" | "audio/x-wav" => Some(".wav"),
+        "audio/webm" => Some(".webm"),
+        _ => None,
+    }
+}
+
+fn truncate_for_error(value: &str) -> String {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.len() > 500 {
+        format!("{}...", &text[..500])
+    } else {
+        text
+    }
+}
+
+fn cli_desktop_api_fetch_init(
+    message: &Value,
+) -> Result<
+    (
+        Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+        Vec<u8>,
+    ),
+    (u16, String),
+> {
+    let mut headers = Vec::new();
+    let mut base64_body = false;
+    if let Some(header_map) = message.get("headers").and_then(Value::as_object) {
+        for (key, value) in header_map {
+            if key.eq_ignore_ascii_case("x-codex-base64") {
+                base64_body = value.as_str() == Some("1");
+                continue;
+            }
+            if cli_should_skip_desktop_api_request_header(key) {
+                continue;
+            }
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+                continue;
+            };
+            headers.push((name, value));
+        }
+    }
+
+    let body = match message.get("body") {
+        Some(Value::String(raw)) if base64_body => BASE64_STANDARD
+            .decode(raw)
+            .map_err(|e| (500, format!("Failed to decode base64 request body: {}", e)))?,
+        Some(Value::String(raw)) => raw.as_bytes().to_vec(),
+        Some(Value::Null) | None => Vec::new(),
+        Some(other) => serde_json::to_vec(other).map_err(|e| (500, e.to_string()))?,
+    };
+    Ok((headers, body))
+}
+
+fn cli_openai_transcribe_fetch_init(
+    message: &Value,
+    model: &str,
+) -> Result<
+    (
+        Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+        Vec<u8>,
+    ),
+    (u16, String),
+> {
+    let (headers, body) = cli_desktop_api_fetch_init(message)?;
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name == reqwest::header::CONTENT_TYPE)
+        .and_then(|(_, value)| value.to_str().ok())
+        .ok_or_else(|| {
+            (
+                500,
+                "Transcribe request is missing multipart Content-Type".to_string(),
+            )
+        })?;
+    let boundary = cli_multipart_boundary(content_type).ok_or_else(|| {
+        (
+            500,
+            "Transcribe request is missing multipart boundary".to_string(),
+        )
+    })?;
+    let model = non_empty_string(model).unwrap_or_else(|| DEFAULT_TRANSCRIBE_MODEL.to_string());
+    let body = cli_multipart_body_with_text_field(body, &boundary, "model", &model)?;
+    Ok((headers, body))
+}
+
+fn cli_multipart_boundary(content_type: &str) -> Option<String> {
+    content_type
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case("boundary"))
+        .map(|(_, value)| value.trim().trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cli_multipart_body_with_text_field(
+    body: Vec<u8>,
+    boundary: &str,
+    field_name: &str,
+    value: &str,
+) -> Result<Vec<u8>, (u16, String)> {
+    if cli_multipart_body_has_field(&body, field_name) {
+        return Ok(body);
+    }
+    let closing = format!("--{}--", boundary).into_bytes();
+    let Some(index) = find_last_subslice(&body, &closing) else {
+        return Err((
+            500,
+            "Transcribe request multipart body is incomplete".to_string(),
+        ));
+    };
+
+    let mut output = Vec::with_capacity(body.len() + boundary.len() + value.len() + 96);
+    output.extend_from_slice(&body[..index]);
+    if !output.ends_with(b"\r\n") {
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    output.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+            field_name
+        )
+        .as_bytes(),
+    );
+    output.extend_from_slice(value.as_bytes());
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(&body[index..]);
+    Ok(output)
+}
+
+fn cli_multipart_body_has_field(body: &[u8], field_name: &str) -> bool {
+    let needle = format!("name=\"{}\"", field_name);
+    body.windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+fn cli_should_skip_desktop_api_request_header(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "chatgpt-account-id"
+            | "connection"
+            | "content-length"
+            | "host"
+            | "originator"
+            | "user-agent"
+            | "x-codex-base64"
+    )
+}
+
+fn cli_desktop_api_url(path: &str) -> String {
+    let base = cli_desktop_api_base_url();
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn cli_desktop_api_base_url() -> String {
+    std::env::var("CODEX_API_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if std::env::var("CODEX_API_ENDPOINT")
+                .ok()
+                .map(|value| value.trim().eq_ignore_ascii_case("localhost"))
+                .unwrap_or(false)
+            {
+                CODEX_DESKTOP_API_DEV_BASE_URL.to_string()
+            } else {
+                CODEX_DESKTOP_API_PROD_BASE_URL.to_string()
+            }
+        })
+}
+
+fn cli_chatgpt_auth_token(codex_home: &str, workspace_name: &str) -> Option<String> {
+    let auth = cli_middleware::ChatGptAuth::load_for_codex_home(codex_home, workspace_name);
+    auth.auth_status_result(true)
+        .get("authToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn cli_chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
+    let claims = cli_jwt_payload_claims(token)?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.as_object())
+        .and_then(|auth| {
+            auth.get("chatgpt_account_id")
+                .or_else(|| auth.get("account_id"))
+        })
+        .and_then(Value::as_str)
+        .filter(|account_id| !account_id.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn cli_jwt_payload_claims(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| BASE64_URL_SAFE.decode(payload))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn cli_desktop_user_agent() -> String {
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X"
+    } else if cfg!(target_os = "windows") {
+        "Windows NT 10.0"
+    } else if cfg!(target_os = "linux") {
+        "X11; Linux"
+    } else {
+        std::env::consts::OS
+    };
+    format!(
+        "Codex Desktop/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
+        platform,
+        std::env::consts::ARCH
+    )
+}
+
+fn cli_reqwest_headers_json(headers: &reqwest::header::HeaderMap) -> Value {
+    let mut map = Map::new();
+    for (name, value) in headers {
+        if let Ok(value) = value.to_str() {
+            map.insert(name.as_str().to_string(), json!(value));
+        }
+    }
+    Value::Object(map)
+}
+
 fn strip_host_id(value: Value) -> Value {
     match value {
         Value::Object(mut map) => {
@@ -3974,7 +4968,10 @@ fn cli_statsig_initialize_response() -> Value {
     json!({
         "has_updates": true,
         "time": now_millis(),
-        "feature_gates": {},
+        "feature_gates": {
+            "4100906017": cli_enabled_feature_gate("4100906017"),
+            "2380644311": cli_enabled_feature_gate("2380644311"),
+        },
         "dynamic_configs": {},
         "layer_configs": {},
         "param_stores": {},
@@ -3983,6 +4980,16 @@ fn cli_statsig_initialize_response() -> Value {
         "hash_used": "djb2",
         "full_checksum": "",
         "derived_fields": {},
+    })
+}
+
+fn cli_enabled_feature_gate(name: &str) -> Value {
+    json!({
+        "name": name,
+        "value": true,
+        "rule_id": "codexl-cli-enabled",
+        "secondary_exposures": [],
+        "id_type": "userID",
     })
 }
 
@@ -5146,6 +6153,15 @@ fn non_empty_json_string(value: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn first_workspace_root(params: &Value) -> Option<String> {
     params
         .get("workspaceRoots")
@@ -5332,6 +6348,22 @@ fn fetch_response_body_success(request_id: &str, body: Value) -> Value {
     })
 }
 
+fn fetch_response_body_success_status(
+    request_id: &str,
+    status: u16,
+    headers: Value,
+    body: Value,
+) -> Value {
+    json!({
+        "type": "fetch-response",
+        "requestId": request_id,
+        "responseType": "success",
+        "status": status,
+        "headers": headers,
+        "bodyJsonString": body.to_string(),
+    })
+}
+
 fn fetch_response_success(request_id: &str, app_request_id: &str, response: Value) -> Value {
     let body = match response.get("error") {
         Some(error) => json!({
@@ -5363,6 +6395,16 @@ fn fetch_response_error(request_id: &str, error: &str) -> Value {
         "requestId": request_id,
         "responseType": "error",
         "status": 500,
+        "error": error,
+    })
+}
+
+fn fetch_response_error_status(request_id: &str, status: u16, error: &str) -> Value {
+    json!({
+        "type": "fetch-response",
+        "requestId": request_id,
+        "responseType": "error",
+        "status": status,
         "error": error,
     })
 }
@@ -6685,6 +7727,140 @@ mod tests {
     }
 
     #[test]
+    fn cli_desktop_api_fetch_supports_only_transcribe_post() {
+        assert!(cli_is_supported_desktop_api_fetch_request(&json!({
+            "type": "fetch",
+            "method": "POST",
+            "url": "/transcribe",
+        })));
+        assert!(!cli_is_supported_desktop_api_fetch_request(&json!({
+            "type": "fetch",
+            "method": "GET",
+            "url": "/transcribe",
+        })));
+        assert!(!cli_is_supported_desktop_api_fetch_request(&json!({
+            "type": "fetch",
+            "method": "POST",
+            "url": "https://example.com/transcribe",
+        })));
+    }
+
+    #[test]
+    fn cli_desktop_api_fetch_init_decodes_base64_body_and_strips_internal_header() {
+        let (headers, body) = cli_desktop_api_fetch_init(&json!({
+            "headers": {
+                "Content-Type": "audio/webm",
+                "X-Codex-Base64": "1",
+                "Authorization": "Bearer caller",
+            },
+            "body": BASE64_STANDARD.encode("audio-bytes"),
+        }))
+        .expect("fetch init");
+
+        assert_eq!(body, b"audio-bytes");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0.as_str(), "content-type");
+        assert_eq!(headers[0].1.to_str().ok(), Some("audio/webm"));
+    }
+
+    #[test]
+    fn cli_openai_transcribe_fetch_init_appends_official_model_field() {
+        let boundary = "codex-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"codex.webm\"\r\nContent-Type: audio/webm\r\n\r\naudio\r\n--{boundary}--\r\n"
+        );
+        let (_headers, body) = cli_openai_transcribe_fetch_init(
+            &json!({
+                "headers": {
+                    "Content-Type": format!("multipart/form-data; boundary={}", boundary),
+                    "X-Codex-Base64": "1",
+                },
+                "body": BASE64_STANDARD.encode(body),
+            }),
+            "whisper-1",
+        )
+        .expect("openai transcribe fetch init");
+        let body = String::from_utf8(body).expect("utf8 multipart");
+
+        assert!(body.contains("name=\"file\""));
+        assert!(body.contains("name=\"model\"\r\n\r\nwhisper-1"));
+        assert!(body.ends_with(&format!("--{}--\r\n", boundary)));
+    }
+
+    #[test]
+    fn cli_openai_transcribe_fetch_init_preserves_existing_model_field() {
+        let boundary = "codex-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"codex.webm\"\r\n\r\naudio\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ncustom-model\r\n--{boundary}--\r\n"
+        );
+        let (_headers, body) = cli_openai_transcribe_fetch_init(
+            &json!({
+                "headers": {
+                    "Content-Type": format!("multipart/form-data; boundary=\"{}\"", boundary),
+                    "X-Codex-Base64": "1",
+                },
+                "body": BASE64_STANDARD.encode(body),
+            }),
+            "whisper-1",
+        )
+        .expect("openai transcribe fetch init");
+        let body = String::from_utf8(body).expect("utf8 multipart");
+
+        assert_eq!(body.matches("name=\"model\"").count(), 1);
+        assert!(body.contains("custom-model"));
+    }
+
+    #[test]
+    fn cli_qwen_asr_extracts_multipart_audio_file() {
+        let boundary = "codex-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"codex.webm\"\r\nContent-Type: audio/webm\r\n\r\naudio\r\n--{boundary}--\r\n"
+        );
+        let headers = vec![(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_str(&format!(
+                "multipart/form-data; boundary={}",
+                boundary
+            ))
+            .expect("header"),
+        )];
+
+        let audio = cli_transcribe_audio_file_from_request(&headers, body.into_bytes())
+            .expect("audio file");
+
+        assert_eq!(audio.filename, "codex.webm");
+        assert_eq!(audio.content_type, "audio/webm");
+        assert_eq!(audio.bytes, b"audio");
+    }
+
+    #[test]
+    fn qwen_asr_result_text_reads_mcp_content_text() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "{\"text\":\"hello from qwen\"}"
+                }
+            ]
+        });
+
+        assert_eq!(qwen_asr_result_text(&result), "hello from qwen");
+    }
+
+    #[test]
+    fn cli_chatgpt_account_id_from_access_token_reads_jwt_claim() {
+        let header = BASE64_URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-1"}}"#);
+        let token = format!("{}.{}.", header, payload);
+
+        assert_eq!(
+            cli_chatgpt_account_id_from_access_token(&token),
+            Some("account-1".to_string())
+        );
+    }
+
+    #[test]
     fn cli_codex_fetch_endpoint_params_unwraps_app_action_body() {
         let body = json!({
             "params": {
@@ -6910,7 +8086,24 @@ mod tests {
             response.get("has_updates").and_then(Value::as_bool),
             Some(true)
         );
-        assert!(response.get("feature_gates").is_some_and(Value::is_object));
+        let feature_gates = response
+            .get("feature_gates")
+            .and_then(Value::as_object)
+            .expect("feature gates");
+        assert_eq!(
+            feature_gates
+                .get("4100906017")
+                .and_then(|gate| gate.get("value"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            feature_gates
+                .get("2380644311")
+                .and_then(|gate| gate.get("value"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(response
             .get("dynamic_configs")
             .is_some_and(Value::is_object));

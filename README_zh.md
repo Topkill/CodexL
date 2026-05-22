@@ -85,11 +85,12 @@ http://192.168.1.10:3147/?token=...
 
 ## 内置扩展
 
-仓库内置两个可选扩展：
+仓库内置以下可选扩展：
 
 | 扩展 | 用途 |
 | --- | --- |
 | Bot Gateway | 将 Codex 连接到 IM 平台，并支持 Bot 登录、消息转发和 handoff 配置。 |
+| Qwen ASR | 通过内置 MCP Server 为 Codex 添加 Qwen3-ASR 语音转录工具。 |
 | NeXT AI Gateway | 将其他协议接口转换为 Codex 可使用的 provider。 |
 
 扩展默认关闭，可在应用设置中启用。启用扩展时，运行时需要 Node.js 20+。
