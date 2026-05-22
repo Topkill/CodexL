@@ -34,7 +34,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "resources": ["builtin-plugin-packages/**/*"],
     "macOS": {
       "entitlements": "Entitlements.plist",
