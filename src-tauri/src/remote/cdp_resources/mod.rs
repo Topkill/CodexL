@@ -19,6 +19,7 @@ mod bridge;
 mod bridge_script;
 mod cdp;
 mod file_picker;
+mod plugin_runtime;
 mod resource;
 
 #[cfg(test)]
@@ -32,6 +33,9 @@ pub(crate) use bridge::{
     is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message, web_bridge_socket_response,
 };
 pub(crate) use file_picker::{dispatch_web_file_picker_message, is_web_file_picker_message};
+pub use plugin_runtime::{
+    handle_plugin_bridge_websocket, plugin_bridge_token_valid, spawn_codex_plugin_injector,
+};
 pub use resource::{
     dispatch_web_resource_socket_payload, get_web_resource, handle_web_resource_websocket,
 };

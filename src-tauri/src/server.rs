@@ -21,7 +21,7 @@ use std::convert::Infallible;
 use std::process::Child;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
 type HttpBody = Full<Bytes>;
 
@@ -160,7 +160,14 @@ pub async fn launch_codex_instance(
     if let Some(instance) = instances.get_mut(&profile_name) {
         if let Some(pid) = running_child_pid(&mut instance.child)? {
             if !requires_new_process(&instance.info, &requested_config) {
-                return Ok(launch_info_from_instance(&instance.info, Some(pid)));
+                let info = launch_info_from_instance(&instance.info, Some(pid));
+                cdp_resources::spawn_codex_plugin_injector(
+                    info.cdp_host.clone(),
+                    info.cdp_port,
+                    info.http_host.clone(),
+                    info.http_port,
+                );
+                return Ok(info);
             }
         }
 
@@ -230,6 +237,12 @@ pub async fn launch_codex_instance(
     .map_err(|e| format!("Failed to launch Codex: {}", e))?;
     let pid = launch.child.id();
     let info = launch_info(&requested_config, Some(pid), launch.cli_stdio_path);
+    cdp_resources::spawn_codex_plugin_injector(
+        info.cdp_host.clone(),
+        info.cdp_port,
+        info.http_host.clone(),
+        info.http_port,
+    );
 
     instances.insert(
         profile_name.clone(),
@@ -451,6 +464,10 @@ async fn route_request(
         (&Method::GET, "/web/_bridge") if is_websocket_upgrade(request) => {
             proxy_codex_web_bridge_websocket(request, state).await
         }
+        (&Method::GET, "/plugin/_bridge") if is_websocket_upgrade(request) => {
+            proxy_codex_plugin_bridge_websocket(request).await
+        }
+        (&Method::GET, "/plugin/_bridge") => probe_codex_plugin_bridge(request).await,
         (&Method::POST, "/web/_bridge") => proxy_codex_web_bridge(request, state).await,
         _ if path.starts_with("/web/") => proxy_codex_web_resource(request, state).await,
         _ if path.starts_with("/json") => proxy_cdp_http(request, state).await,
@@ -463,6 +480,87 @@ async fn route_request(
             json!({ "error": "not found" }),
         )),
     }
+}
+
+async fn probe_codex_plugin_bridge(
+    request: &Request<Incoming>,
+) -> Result<Response<HttpBody>, String> {
+    let token_present = request
+        .uri()
+        .query()
+        .map(|query| query.contains("token="))
+        .unwrap_or(false);
+    let token_valid = cdp_resources::plugin_bridge_token_valid(request.uri().query());
+    let status = if token_valid {
+        StatusCode::OK
+    } else {
+        StatusCode::UNAUTHORIZED
+    };
+    Ok(json_response(
+        status,
+        json!({
+            "ok": token_valid,
+            "tokenPresent": token_present,
+            "tokenValid": token_valid,
+            "error": if token_valid { Value::Null } else { Value::String("invalid plugin bridge token".to_string()) },
+        }),
+    ))
+}
+
+async fn proxy_codex_plugin_bridge_websocket(
+    request: &mut Request<Incoming>,
+) -> Result<Response<HttpBody>, String> {
+    if !cdp_resources::plugin_bridge_token_valid(request.uri().query()) {
+        return Ok(json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({ "error": "invalid plugin bridge token" }),
+        ));
+    }
+    let key = request
+        .headers()
+        .get(SEC_WEBSOCKET_KEY)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing Sec-WebSocket-Key".to_string())?
+        .to_string();
+    let token = request.uri().query().and_then(plugin_bridge_query_token);
+    let on_upgrade = hyper::upgrade::on(request);
+
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                let websocket =
+                    tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None)
+                        .await;
+                if let Err(err) =
+                    cdp_resources::handle_plugin_bridge_websocket(websocket, token).await
+                {
+                    eprintln!("Codex plugin bridge WebSocket failed: {}", err);
+                }
+            }
+            Err(err) => eprintln!("Codex plugin bridge WebSocket upgrade failed: {}", err),
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(UPGRADE, "websocket")
+        .header(CONNECTION, "Upgrade")
+        .header(SEC_WEBSOCKET_ACCEPT, derive_accept_key(key.as_bytes()))
+        .body(Full::new(Bytes::new()))
+        .map(add_cors)
+        .map_err(|e| e.to_string())
+}
+
+fn plugin_bridge_query_token(query: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if key == "token" && !value.is_empty() {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 async fn proxy_codex_web_resource(
@@ -493,9 +591,149 @@ async fn proxy_codex_web_bridge(
         .map_err(|e| e.to_string())?
         .to_bytes();
     let message = serde_json::from_slice::<Value>(&body).map_err(|e| e.to_string())?;
-    let response =
-        cdp_resources::dispatch_web_bridge_message(&info.cdp_host, info.cdp_port, message).await?;
+    let response = dispatch_codex_web_bridge_message(&state, &info, message).await?;
     Ok(json_response(StatusCode::OK, response))
+}
+
+async fn dispatch_codex_web_bridge_message(
+    state: &AppState,
+    info: &LaunchInfo,
+    message: Value,
+) -> Result<Value, String> {
+    let config = state.config.lock().await.clone();
+    if let Some(response) =
+        remote::custom_transcribe_fetch_response_for_config(&message, &config, "local-app").await
+    {
+        return Ok(json!({ "messages": [response] }));
+    }
+    cdp_resources::dispatch_web_bridge_message(&info.cdp_host, info.cdp_port, message).await
+}
+
+async fn dispatch_codex_web_bridge_socket_payload_with_emitter<F>(
+    state: &AppState,
+    cdp_host: &str,
+    cdp_port: u16,
+    raw: &str,
+    emit: F,
+) -> Value
+where
+    F: Fn(Value) + Send + Sync,
+{
+    let (id, message) = cdp_resources::parse_web_bridge_socket_message(raw);
+    if let Ok(message) = &message {
+        let config = state.config.lock().await.clone();
+        if let Some(response) =
+            remote::custom_transcribe_fetch_response_for_config(message, &config, "local-app").await
+        {
+            return cdp_resources::web_bridge_socket_response(
+                id,
+                Ok(json!({ "messages": [response] })),
+            );
+        }
+    }
+
+    cdp_resources::dispatch_web_bridge_socket_payload_with_emitter(cdp_host, cdp_port, raw, emit)
+        .await
+}
+
+fn handle_codex_web_bridge_socket_text(
+    state: AppState,
+    tx: &tokio::sync::mpsc::UnboundedSender<Message>,
+    cdp_host: String,
+    cdp_port: u16,
+    raw: String,
+) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let partial_tx = tx.clone();
+        let response = dispatch_codex_web_bridge_socket_payload_with_emitter(
+            &state,
+            &cdp_host,
+            cdp_port,
+            &raw,
+            move |partial| {
+                let _ = partial_tx.send(Message::Text(partial.to_string()));
+            },
+        )
+        .await;
+        let _ = tx.send(Message::Text(response.to_string()));
+    });
+}
+
+async fn handle_codex_web_bridge_websocket(
+    websocket: tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+    state: AppState,
+    cdp_host: String,
+    cdp_port: u16,
+) -> Result<(), String> {
+    eprintln!(
+        "[codex-web] local bridge websocket opened: cdp=http://{}:{}",
+        cdp_host, cdp_port
+    );
+    let (mut write, mut read) = websocket.split();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let pump_tx = tx.clone();
+    cdp_resources::spawn_web_bridge_notification_pump(cdp_host.clone(), cdp_port, move |partial| {
+        let _ = pump_tx.send(Message::Text(partial.to_string()));
+    });
+
+    let writer = async {
+        while let Some(message) = rx.recv().await {
+            write.send(message).await.map_err(|e| e.to_string())?;
+        }
+        Ok::<(), String>(())
+    };
+
+    let reader = async {
+        while let Some(message) = read.next().await {
+            match message.map_err(|e| e.to_string())? {
+                Message::Text(raw) => {
+                    handle_codex_web_bridge_socket_text(
+                        state.clone(),
+                        &tx,
+                        cdp_host.clone(),
+                        cdp_port,
+                        raw,
+                    );
+                }
+                Message::Binary(bytes) => match String::from_utf8(bytes) {
+                    Ok(raw) => {
+                        handle_codex_web_bridge_socket_text(
+                            state.clone(),
+                            &tx,
+                            cdp_host.clone(),
+                            cdp_port,
+                            raw,
+                        );
+                    }
+                    Err(err) => {
+                        let response =
+                            cdp_resources::web_bridge_socket_response(None, Err(err.to_string()));
+                        let _ = tx.send(Message::Text(response.to_string()));
+                    }
+                },
+                Message::Ping(payload) => {
+                    let _ = tx.send(Message::Pong(payload));
+                }
+                Message::Close(frame) => {
+                    let _ = tx.send(Message::Close(frame));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), String>(())
+    };
+
+    let result = tokio::select! {
+        result = writer => result,
+        result = reader => result,
+    };
+    eprintln!(
+        "[codex-web] local bridge websocket closed: cdp=http://{}:{}",
+        cdp_host, cdp_port
+    );
+    result
 }
 
 async fn proxy_codex_web_bridge_websocket(
@@ -521,8 +759,7 @@ async fn proxy_codex_web_bridge_websocket(
                     tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None)
                         .await;
                 if let Err(err) =
-                    cdp_resources::handle_web_bridge_websocket(websocket, cdp_host, cdp_port, None)
-                        .await
+                    handle_codex_web_bridge_websocket(websocket, state, cdp_host, cdp_port).await
                 {
                     eprintln!("Codex web bridge WebSocket failed: {}", err);
                 }

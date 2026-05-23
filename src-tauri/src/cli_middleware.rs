@@ -8,6 +8,7 @@ use std::thread;
 
 use crate::extensions;
 use crate::extensions::builtins::bot_bridge;
+use crate::{config::AppConfig, remote};
 use serde_json::{json, Value};
 
 const DISABLE_ENV: &str = "CODEXL_DISABLE_CLI_MIDDLEWARE";
@@ -26,6 +27,7 @@ const QWEN_ASR_MCP_RUN_MODE_ARG: &str = "--codexl-qwen-asr-mcp";
 
 type RequestMap = Arc<Mutex<std::collections::HashMap<String, RequestInfo>>>;
 type SharedChildStdin = Arc<Mutex<ChildStdin>>;
+type SharedOutput<W> = Arc<Mutex<W>>;
 
 #[cfg(windows)]
 const MIDDLEWARE_FILE_NAME: &str = "codexl-codex-cli-middleware.cmd";
@@ -432,15 +434,19 @@ where
     let request_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let chatgpt_auth = ChatGptAuth::load();
     let shared_child_stdin = Arc::new(Mutex::new(child_stdin));
+    let shared_output = Arc::new(Mutex::new(output));
     let bridge_stdout_tx = bot_bridge::spawn_app_stdio_bot_bridge(Arc::clone(&shared_child_stdin));
     let stdin_request_map = Arc::clone(&request_map);
     let stdout_request_map = Arc::clone(&request_map);
-    let _stdin_handle =
-        thread::spawn(move || copy_stdin_and_track(input, shared_child_stdin, stdin_request_map));
+    let stdin_output = Arc::clone(&shared_output);
+    let stdout_output = Arc::clone(&shared_output);
+    let _stdin_handle = thread::spawn(move || {
+        copy_stdin_and_track(input, shared_child_stdin, stdin_request_map, stdin_output)
+    });
     let stdout_handle = thread::spawn(move || {
         copy_stdout_and_rewrite(
             child_stdout,
-            output,
+            stdout_output,
             stdout_request_map,
             chatgpt_auth,
             bridge_stdout_tx,
@@ -511,13 +517,15 @@ fn open_log_file_from_env(env_name: &str) -> Option<File> {
         .ok()
 }
 
-fn copy_stdin_and_track<R>(
+fn copy_stdin_and_track<R, W>(
     reader: R,
     writer: SharedChildStdin,
     request_map: RequestMap,
+    output: SharedOutput<W>,
 ) -> std::io::Result<u64>
 where
     R: Read,
+    W: Write,
 {
     let mut copied = 0;
     let mut reader = BufReader::new(reader);
@@ -528,6 +536,12 @@ where
         let size = reader.read_until(b'\n', &mut line)?;
         if size == 0 {
             break;
+        }
+
+        if let Some(response) = custom_transcribe_response_for_app_server_line(&line) {
+            write_json_line_to_output(&output, &response, line_ending(&line))?;
+            copied += size as u64;
+            continue;
         }
 
         track_request_line(&line, &request_map);
@@ -544,7 +558,7 @@ where
 
 fn copy_stdout_and_rewrite<R, W>(
     reader: R,
-    mut writer: W,
+    writer: SharedOutput<W>,
     request_map: RequestMap,
     chatgpt_auth: ChatGptAuth,
     bridge_stdout_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
@@ -570,6 +584,9 @@ where
             let _ = tx.send(rewritten.clone());
         }
         if !suppress_for_app {
+            let mut writer = writer.lock().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "stdout mutex poisoned")
+            })?;
             writer.write_all(&rewritten)?;
             writer.flush()?;
         }
@@ -577,6 +594,75 @@ where
     }
 
     Ok(copied)
+}
+
+fn custom_transcribe_response_for_app_server_line(line: &[u8]) -> Option<Value> {
+    let message = app_server_fetch_message_from_line(line)?;
+    let request_id = message
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let config = AppConfig::load();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let response = runtime.block_on(remote::custom_transcribe_fetch_response_for_config(
+        &message,
+        &config,
+        "desktop-app-server",
+    ))?;
+    eprintln!(
+        "[codexl-cli] intercepted desktop transcribe requestId={}",
+        request_id
+    );
+    Some(response)
+}
+
+fn app_server_fetch_message_from_line(line: &[u8]) -> Option<Value> {
+    let value = serde_json::from_slice::<Value>(trim_json_line(line)).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("fetch") {
+        return None;
+    }
+    if !value
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+    {
+        return None;
+    }
+    if !value
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(app_server_fetch_url_is_transcribe)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn app_server_fetch_url_is_transcribe(url: &str) -> bool {
+    let url = url.trim();
+    if url == "/transcribe" {
+        return true;
+    }
+    reqwest::Url::parse(url)
+        .map(|url| url.path() == "/transcribe" && matches!(url.scheme(), "app" | "http" | "https"))
+        .unwrap_or(false)
+}
+
+fn write_json_line_to_output<W: Write>(
+    output: &SharedOutput<W>,
+    value: &Value,
+    ending: &[u8],
+) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    line.extend_from_slice(ending);
+    let mut writer = output
+        .lock()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "stdout mutex poisoned"))?;
+    writer.write_all(&line)?;
+    writer.flush()
 }
 
 fn track_request_line(line: &[u8], request_map: &RequestMap) {
@@ -1065,6 +1151,29 @@ printf ':stdin=%s\n' "$first_line"
         assert_eq!(
             external_stdio_args(vec![OsString::from("exec")]),
             vec![OsString::from("exec")]
+        );
+    }
+
+    #[test]
+    fn detects_app_server_fetch_messages_for_middleware_intercept() {
+        let message = app_server_fetch_message_from_line(
+            br#"{"type":"fetch","requestId":"voice-1","method":"POST","url":"/transcribe"}"#,
+        )
+        .expect("fetch message");
+
+        assert_eq!(
+            message.get("requestId").and_then(Value::as_str),
+            Some("voice-1")
+        );
+        assert_eq!(
+            app_server_fetch_message_from_line(br#"{"method":"initialize"}"#),
+            None
+        );
+        assert_eq!(
+            app_server_fetch_message_from_line(
+                br#"{"type":"fetch","requestId":"ipc-1","method":"POST","url":"vscode://codex/ipc-request"}"#
+            ),
+            None
         );
     }
 
