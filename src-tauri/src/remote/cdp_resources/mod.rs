@@ -36,6 +36,7 @@ pub(crate) use file_picker::{dispatch_web_file_picker_message, is_web_file_picke
 pub use plugin_runtime::{
     handle_plugin_bridge_websocket, plugin_bridge_token_valid, spawn_codex_plugin_injector,
 };
+pub(crate) use plugin_runtime::{renderer_core_plugin_bool_setting, SHOW_ALL_SESSIONS_KEY};
 pub use resource::{
     dispatch_web_resource_socket_payload, get_web_resource, handle_web_resource_websocket,
 };

@@ -14,6 +14,8 @@ const CODEXL_PLUGIN_INJECT_TIMEOUT_MS: u64 = 20_000;
 const CODEXL_PLUGIN_INJECT_RETRY_MS: u64 = 150;
 const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.8";
 const CODEXL_RENDERER_PLUGIN_ENTRY_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
+const CODEXL_CORE_PLUGIN_ID: &str = "codexl.core";
+pub(crate) const SHOW_ALL_SESSIONS_KEY: &str = "showAllSessions";
 
 static CODEXL_PLUGIN_BRIDGE_TOKENS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 
@@ -582,6 +584,13 @@ fn renderer_plugin_storage_get(request: &Value) -> Result<Value, String> {
     }))
 }
 
+pub(crate) fn renderer_core_plugin_bool_setting(key: &str) -> bool {
+    read_renderer_plugin_storage(CODEXL_CORE_PLUGIN_ID)
+        .ok()
+        .and_then(|data| data.get(key).and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn renderer_plugin_storage_set(request: &Value) -> Result<Value, String> {
     let plugin_id = request_plugin_id(request)?;
     let key = request_storage_key(request)?;
@@ -699,6 +708,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
   const SHOW_CONTEXT_INDICATORS_KEY = "showContextIndicators";
+  const SHOW_ALL_SESSIONS_KEY = "showAllSessions";
   const SETTINGS_STYLE_ID = "codexl-plugin-global-style";
   const SETTINGS_NAV_ATTR = "data-codexl-settings-nav";
   const SETTINGS_PANEL_ATTR = "data-codexl-settings-panel";
@@ -726,6 +736,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     build: RUNTIME_BUILD,
     cleanup: [],
     codexlSettings: {
+      showAllSessions: false,
       showContextIndicators: false,
     },
     contextUsageByThread: new Map(),
@@ -1549,11 +1560,18 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     runtime.coreSettingsLoaded = true;
     try {
-      const response = await request("storage:get", {
-        key: SHOW_CONTEXT_INDICATORS_KEY,
-        pluginId: CORE_PLUGIN_ID,
-      });
-      runtime.codexlSettings.showContextIndicators = response?.value === true;
+      const [showContextResponse, showAllSessionsResponse] = await Promise.all([
+        request("storage:get", {
+          key: SHOW_CONTEXT_INDICATORS_KEY,
+          pluginId: CORE_PLUGIN_ID,
+        }),
+        request("storage:get", {
+          key: SHOW_ALL_SESSIONS_KEY,
+          pluginId: CORE_PLUGIN_ID,
+        }),
+      ]);
+      runtime.codexlSettings.showContextIndicators = showContextResponse?.value === true;
+      runtime.codexlSettings.showAllSessions = showAllSessionsResponse?.value === true;
     } catch (error) {
       runtime.coreSettingsLoaded = false;
       throw error;
@@ -1571,6 +1589,18 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       key: SHOW_CONTEXT_INDICATORS_KEY,
       pluginId: CORE_PLUGIN_ID,
       value: runtime.codexlSettings.showContextIndicators,
+    }).catch((error) =>
+      log("error", "CodexL settings save failed", String(error))
+    );
+  }
+
+  function setShowAllSessions(enabled) {
+    runtime.codexlSettings.showAllSessions = !!enabled;
+    updateSettingsUi();
+    request("storage:set", {
+      key: SHOW_ALL_SESSIONS_KEY,
+      pluginId: CORE_PLUGIN_ID,
+      value: runtime.codexlSettings.showAllSessions,
     }).catch((error) =>
       log("error", "CodexL settings save failed", String(error))
     );
@@ -2282,11 +2312,6 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         </div>
         <div class="flex flex-col gap-[var(--padding-panel)]">
           <section class="flex flex-col gap-2">
-            <div class="flex h-toolbar items-center justify-between gap-2 px-0 py-0">
-              <div class="flex min-w-0 flex-1 flex-col gap-1">
-                <div class="text-base font-medium text-token-text-primary">General</div>
-              </div>
-            </div>
             <div class="flex flex-col divide-y-[0.5px] divide-token-border overflow-hidden rounded-lg border border-token-border" style="background-color: var(--color-background-panel, var(--color-token-bg-fog));">
               <div class="flex items-center justify-between gap-4 p-3">
                 <div class="flex min-w-0 items-center gap-3">
@@ -2295,7 +2320,21 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
                   </div>
                 </div>
                 <div class="flex shrink-0 items-center gap-2">
-                  <button class="codexl-settings-switch inline-flex items-center text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border focus-visible:rounded-full cursor-interaction" type="button" role="switch" aria-label="Show Context Indicators" aria-checked="false" data-state="unchecked">
+                  <button class="codexl-settings-switch inline-flex items-center text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border focus-visible:rounded-full cursor-interaction" type="button" role="switch" aria-label="Show Context Indicators" aria-checked="false" data-state="unchecked" data-codexl-setting="showContextIndicators">
+                    <span class="codexl-settings-switch-track relative inline-flex shrink-0 items-center rounded-full transition-colors duration-200 ease-out bg-token-foreground/10 h-5 w-8" data-state="unchecked">
+                      <span class="codexl-settings-switch-thumb rounded-full border border-[color:var(--gray-0)] bg-[color:var(--gray-0)] shadow-sm transition-transform duration-200 ease-out data-[state=unchecked]:translate-x-[2px] data-[state=checked]:translate-x-[14px] h-4 w-4" data-state="unchecked"></span>
+                    </span>
+                  </button>
+                </div>
+              </div>
+              <div class="flex items-center justify-between gap-4 p-3">
+                <div class="flex min-w-0 items-center gap-3">
+                  <div class="flex min-w-0 flex-col gap-1">
+                    <div class="min-w-0 text-sm text-token-text-primary">Show All Sessions</div>
+                  </div>
+                </div>
+                <div class="flex shrink-0 items-center gap-2">
+                  <button class="codexl-settings-switch inline-flex items-center text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border focus-visible:rounded-full cursor-interaction" type="button" role="switch" aria-label="Show All Sessions" aria-checked="false" data-state="unchecked" data-codexl-setting="showAllSessions">
                     <span class="codexl-settings-switch-track relative inline-flex shrink-0 items-center rounded-full transition-colors duration-200 ease-out bg-token-foreground/10 h-5 w-8" data-state="unchecked">
                       <span class="codexl-settings-switch-thumb rounded-full border border-[color:var(--gray-0)] bg-[color:var(--gray-0)] shadow-sm transition-transform duration-200 ease-out data-[state=unchecked]:translate-x-[2px] data-[state=checked]:translate-x-[14px] h-4 w-4" data-state="unchecked"></span>
                     </span>
@@ -2307,10 +2346,16 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         </div>
       </div>
     `;
-    const toggle = panel.querySelector(".codexl-settings-switch");
-    toggle.addEventListener("click", () => {
-      setShowContextIndicators(!runtime.codexlSettings.showContextIndicators);
-    });
+    panel
+      .querySelector('[data-codexl-setting="showContextIndicators"]')
+      ?.addEventListener("click", () => {
+        setShowContextIndicators(!runtime.codexlSettings.showContextIndicators);
+      });
+    panel
+      .querySelector('[data-codexl-setting="showAllSessions"]')
+      ?.addEventListener("click", () => {
+        setShowAllSessions(!runtime.codexlSettings.showAllSessions);
+      });
     updateSettingsUi();
   }
 
@@ -2362,10 +2407,15 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   }
 
   function updateSettingsUi() {
-    const state = runtime.codexlSettings.showContextIndicators ? "checked" : "unchecked";
     document
       .querySelectorAll(".codexl-settings-switch")
       .forEach((toggle) => {
+        const setting = toggle.getAttribute("data-codexl-setting") || "showContextIndicators";
+        const enabled =
+          setting === "showAllSessions"
+            ? runtime.codexlSettings.showAllSessions
+            : runtime.codexlSettings.showContextIndicators;
+        const state = enabled ? "checked" : "unchecked";
         toggle.setAttribute("aria-checked", state === "checked" ? "true" : "false");
         toggle.setAttribute("data-state", state);
         toggle
@@ -3424,7 +3474,9 @@ mod tests {
 
         assert!(script.contains("CodexL"));
         assert!(script.contains("Show Context Indicators"));
+        assert!(script.contains("Show All Sessions"));
         assert!(script.contains("showContextIndicators"));
+        assert!(script.contains("showAllSessions"));
         assert!(script.contains("codexl-context-indicator"));
         assert!(script.contains("findComposerSendButton"));
         assert!(script.contains("container.insertBefore(indicator, sendButton)"));

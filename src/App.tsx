@@ -2935,7 +2935,7 @@ function AppSettingsDialog({
         ? strings.gateway
         : activeSection === "updates"
           ? strings.updates
-          : strings.general;
+          : strings.appSettingsTitle;
   const sectionDescription =
     activeSection === "extensions"
       ? strings.extensionSettingsDescription

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -5,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::extensions::builtins::bot_bridge;
 use crate::{config::AppConfig, remote};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 const DISABLE_ENV: &str = "CODEXL_DISABLE_CLI_MIDDLEWARE";
 const REAL_CLI_ENV: &str = "CODEXL_REAL_CODEX_CLI_PATH";
@@ -22,9 +24,11 @@ const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const RUN_MODE_ARG: &str = "--codexl-cli-middleware";
 const STDIO_RUN_MODE_ARG: &str = "--codexl-cli-stdio";
 const BOT_MEDIA_MCP_RUN_MODE_ARG: &str = "--codexl-bot-media-mcp";
+const CODEXL_WORKSPACE_CWD_FILTER_KEY: &str = "codexlWorkspaceCwd";
 
 type RequestMap = Arc<Mutex<std::collections::HashMap<String, RequestInfo>>>;
 type SharedChildStdin = Arc<Mutex<ChildStdin>>;
+type SharedCurrentCwd = Arc<Mutex<Option<String>>>;
 type SharedOutput<W> = Arc<Mutex<W>>;
 
 #[cfg(windows)]
@@ -52,6 +56,19 @@ pub struct MiddlewareEnv {
 struct RequestInfo {
     method: String,
     include_token: bool,
+    params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionHome {
+    profile_name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct SessionFile {
+    profile_name: String,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -430,13 +447,21 @@ where
     let chatgpt_auth = ChatGptAuth::load();
     let shared_child_stdin = Arc::new(Mutex::new(child_stdin));
     let shared_output = Arc::new(Mutex::new(output));
+    let current_cwd = Arc::new(Mutex::new(None));
     let bridge_stdout_tx = bot_bridge::spawn_app_stdio_bot_bridge(Arc::clone(&shared_child_stdin));
     let stdin_request_map = Arc::clone(&request_map);
     let stdout_request_map = Arc::clone(&request_map);
     let stdin_output = Arc::clone(&shared_output);
     let stdout_output = Arc::clone(&shared_output);
+    let stdin_current_cwd = Arc::clone(&current_cwd);
     let _stdin_handle = thread::spawn(move || {
-        copy_stdin_and_track(input, shared_child_stdin, stdin_request_map, stdin_output)
+        copy_stdin_and_track(
+            input,
+            shared_child_stdin,
+            stdin_request_map,
+            stdin_output,
+            stdin_current_cwd,
+        )
     });
     let stdout_handle = thread::spawn(move || {
         copy_stdout_and_rewrite(
@@ -517,6 +542,7 @@ fn copy_stdin_and_track<R, W>(
     writer: SharedChildStdin,
     request_map: RequestMap,
     output: SharedOutput<W>,
+    current_cwd: SharedCurrentCwd,
 ) -> std::io::Result<u64>
 where
     R: Read,
@@ -533,13 +559,19 @@ where
             break;
         }
 
+        if let Some(response) = custom_session_response_for_app_server_line(&line) {
+            write_json_line_to_output(&output, &response, line_ending(&line))?;
+            copied += size as u64;
+            continue;
+        }
+
         if let Some(response) = custom_transcribe_response_for_app_server_line(&line) {
             write_json_line_to_output(&output, &response, line_ending(&line))?;
             copied += size as u64;
             continue;
         }
 
-        track_request_line(&line, &request_map);
+        track_request_line_with_workspace(&line, &request_map, Some(&current_cwd));
         let mut writer = writer
             .lock()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "stdin mutex poisoned"))?;
@@ -614,6 +646,32 @@ fn custom_transcribe_response_for_app_server_line(line: &[u8]) -> Option<Value> 
     Some(response)
 }
 
+fn custom_session_response_for_app_server_line(line: &[u8]) -> Option<Value> {
+    if !show_all_sessions_enabled() {
+        return None;
+    }
+
+    let request = serde_json::from_slice::<Value>(trim_json_line(line)).ok()?;
+    let method = request.get("method").and_then(Value::as_str)?;
+    if !matches!(
+        method,
+        "thread/read" | "thread/resume" | "thread/turns/list"
+    ) {
+        return None;
+    }
+
+    let session = foreign_session_file_for_request(&request)?;
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let params = request.get("params").cloned().unwrap_or(Value::Null);
+    let response = match method {
+        "thread/read" => thread_read_response(id, &session, &params)?,
+        "thread/resume" => thread_resume_response(id, &session)?,
+        "thread/turns/list" => thread_turns_list_response(id, &session)?,
+        _ => return None,
+    };
+    Some(response)
+}
+
 fn app_server_fetch_message_from_line(line: &[u8]) -> Option<Value> {
     let value = serde_json::from_slice::<Value>(trim_json_line(line)).ok()?;
     if value.get("type").and_then(Value::as_str) != Some("fetch") {
@@ -660,7 +718,11 @@ fn write_json_line_to_output<W: Write>(
     writer.flush()
 }
 
-fn track_request_line(line: &[u8], request_map: &RequestMap) {
+fn track_request_line_with_workspace(
+    line: &[u8],
+    request_map: &RequestMap,
+    current_cwd: Option<&SharedCurrentCwd>,
+) {
     let Ok(value) = serde_json::from_slice::<Value>(trim_json_line(line)) else {
         return;
     };
@@ -671,7 +733,9 @@ fn track_request_line(line: &[u8], request_map: &RequestMap) {
         return;
     };
 
-    if !matches!(method, "account/read" | "getAuthStatus") {
+    update_current_cwd_from_request(&value, method, current_cwd);
+
+    if !matches!(method, "account/read" | "getAuthStatus" | "thread/list") {
         return;
     }
 
@@ -687,8 +751,76 @@ fn track_request_line(line: &[u8], request_map: &RequestMap) {
             RequestInfo {
                 method: method.to_string(),
                 include_token,
+                params: request_params_with_workspace_fallback(&value, method, current_cwd),
             },
         );
+    }
+}
+
+fn update_current_cwd_from_request(
+    value: &Value,
+    method: &str,
+    current_cwd: Option<&SharedCurrentCwd>,
+) {
+    let Some(current_cwd) = current_cwd else {
+        return;
+    };
+    let Some(cwd) = request_workspace_cwd(value, method) else {
+        return;
+    };
+    if let Ok(mut current) = current_cwd.lock() {
+        *current = Some(cwd);
+    }
+}
+
+fn request_params_with_workspace_fallback(
+    value: &Value,
+    method: &str,
+    current_cwd: Option<&SharedCurrentCwd>,
+) -> Value {
+    let mut params = value.get("params").cloned().unwrap_or(Value::Null);
+    if method != "thread/list" || list_cwd_filter(&params).is_some() {
+        return params;
+    }
+    let Some(cwd) = current_cwd
+        .and_then(|current| current.lock().ok().and_then(|value| value.clone()))
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return params;
+    };
+
+    if let Some(object) = params.as_object_mut() {
+        object.insert(CODEXL_WORKSPACE_CWD_FILTER_KEY.to_string(), json!(cwd));
+        params
+    } else {
+        json!({ CODEXL_WORKSPACE_CWD_FILTER_KEY: cwd })
+    }
+}
+
+fn request_workspace_cwd(value: &Value, method: &str) -> Option<String> {
+    let params = value.get("params")?;
+    match method {
+        "config/read" | "thread/resume" | "turn/start" => params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        "hooks/list" => {
+            let cwds = params.get("cwds").and_then(Value::as_array)?;
+            let values = cwds
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            if values.len() == 1 {
+                Some(values[0].to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -719,6 +851,7 @@ fn rewrite_stdout_line(
     match request.method.as_str() {
         "account/read" => value["result"] = chatgpt_auth.account_read_result(),
         "getAuthStatus" => value["result"] = chatgpt_auth.auth_status_result(request.include_token),
+        "thread/list" => rewrite_thread_list_response(&mut value, &request.params),
         _ => return line.to_vec(),
     }
 
@@ -727,6 +860,1056 @@ fn rewrite_stdout_line(
     };
     rewritten.extend_from_slice(line_ending(line));
     rewritten
+}
+
+fn rewrite_thread_list_response(value: &mut Value, params: &Value) {
+    if !show_all_sessions_enabled() {
+        return;
+    }
+    let homes = session_homes_for_all_providers();
+    if homes.is_empty() {
+        return;
+    }
+    merge_session_files_into_thread_list(value, &homes, params);
+}
+
+fn show_all_sessions_enabled() -> bool {
+    remote::cdp_resources::renderer_core_plugin_bool_setting(
+        remote::cdp_resources::SHOW_ALL_SESSIONS_KEY,
+    )
+}
+
+fn session_homes_for_all_providers() -> Vec<SessionHome> {
+    let config = AppConfig::load();
+    let mut homes = Vec::new();
+    let mut seen = HashSet::new();
+    let current_home_key = current_codex_home_path().map(|path| session_home_key(&path));
+
+    if !config.codex_home.trim().is_empty() {
+        push_session_home(
+            &mut homes,
+            &mut seen,
+            &current_home_key,
+            "Active".to_string(),
+            expand_home_path(&config.codex_home),
+        );
+    }
+
+    for profile in &config.codex_home_profiles {
+        let path = profile.path.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        push_session_home(
+            &mut homes,
+            &mut seen,
+            &current_home_key,
+            profile.name.clone(),
+            expand_home_path(&path),
+        );
+    }
+
+    for profile in config.provider_profiles {
+        let path = profile.codex_home.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        push_session_home(
+            &mut homes,
+            &mut seen,
+            &current_home_key,
+            profile.name.clone(),
+            expand_home_path(&path),
+        );
+    }
+
+    for path in discovered_codex_home_dirs() {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Codex Home")
+            .to_string();
+        push_session_home(&mut homes, &mut seen, &current_home_key, name, path);
+    }
+
+    homes
+}
+
+fn current_codex_home_path() -> Option<PathBuf> {
+    std::env::var(CODEX_HOME_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_home_path(&value))
+}
+
+fn push_session_home(
+    homes: &mut Vec<SessionHome>,
+    seen: &mut HashSet<String>,
+    current_home_key: &Option<String>,
+    profile_name: String,
+    path: PathBuf,
+) {
+    let key = session_home_key(&path);
+    if current_home_key
+        .as_ref()
+        .is_some_and(|current| current == &key)
+    {
+        return;
+    }
+    if !seen.insert(key) {
+        return;
+    }
+    homes.push(SessionHome { profile_name, path });
+}
+
+fn discovered_codex_home_dirs() -> Vec<PathBuf> {
+    let root = codexl_home_dir().join("codex-homes");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("sessions").is_dir())
+        .collect()
+}
+
+fn session_home_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn merge_session_files_into_thread_list(value: &mut Value, homes: &[SessionHome], params: &Value) {
+    if let Some(result) = value.get_mut("result").and_then(Value::as_object_mut) {
+        result
+            .entry("nextCursor".to_string())
+            .or_insert(Value::Null);
+        result
+            .entry("backwardsCursor".to_string())
+            .or_insert(Value::Null);
+    }
+
+    let Some(threads) = value
+        .get_mut("result")
+        .and_then(|result| result.get_mut("data"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    let mut seen_ids = threads
+        .iter()
+        .filter_map(|thread| thread.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect::<HashSet<_>>();
+
+    for session in session_files_from_homes(homes, params) {
+        let Some(thread) = thread_summary_from_session_file(&session.path, &session.profile_name)
+        else {
+            continue;
+        };
+        if !thread_matches_list_params(&thread, params) {
+            continue;
+        }
+        let Some(id) = thread.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen_ids.insert(id.to_string()) {
+            threads.push(thread);
+        }
+    }
+
+    sort_thread_list(threads, params);
+}
+
+fn thread_list_per_home_session_limit(params: &Value) -> usize {
+    let requested = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(50);
+    requested.min(100)
+}
+
+fn foreign_session_file_for_request(request: &Value) -> Option<SessionFile> {
+    let params = request.get("params").unwrap_or(&Value::Null);
+    let requested_path = params
+        .get("path")
+        .or_else(|| params.get("rolloutPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(expand_home_path);
+    let thread_id = params
+        .get("threadId")
+        .or_else(|| params.get("conversationId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let current_home_key = current_codex_home_path().map(|path| session_home_key(&path));
+
+    for home in session_homes_for_all_providers() {
+        if current_home_key
+            .as_ref()
+            .is_some_and(|key| *key == session_home_key(&home.path))
+        {
+            continue;
+        }
+
+        if let Some(path) = requested_path.as_ref() {
+            if path_is_under(path, &home.path) && path.is_file() {
+                return Some(SessionFile {
+                    profile_name: home.profile_name,
+                    path: path.clone(),
+                });
+            }
+        }
+
+        let Some(thread_id) = thread_id.as_deref() else {
+            continue;
+        };
+        if let Some(path) = session_file_for_thread_id(&home.path, thread_id) {
+            return Some(SessionFile {
+                profile_name: home.profile_name,
+                path,
+            });
+        }
+    }
+
+    None
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    path.strip_prefix(root).is_ok()
+}
+
+fn session_file_for_thread_id(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
+    let sessions_dir = codex_home.join("sessions");
+    let mut files = Vec::new();
+    collect_session_jsonl_files(&sessions_dir, &mut files);
+    files.into_iter().find(|path| {
+        session_meta_payload(path)
+            .and_then(|payload| {
+                payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|id| id == thread_id)
+    })
+}
+
+fn thread_read_response(id: Value, session: &SessionFile, params: &Value) -> Option<Value> {
+    let include_turns = params
+        .get("includeTurns")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut thread = thread_summary_from_session_file(&session.path, &session.profile_name)?;
+    if include_turns {
+        add_session_turns_to_thread(&mut thread, &session.path);
+    }
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "thread": thread,
+        },
+    }))
+}
+
+fn thread_resume_response(id: Value, session: &SessionFile) -> Option<Value> {
+    let mut thread = thread_summary_from_session_file(&session.path, &session.profile_name)?;
+    add_session_turns_to_thread(&mut thread, &session.path);
+    let payload = session_meta_payload(&session.path)?;
+    let model = session_model_from_payload(&payload);
+    let model_provider = session_model_provider_from_payload(&payload);
+    let cwd = thread.get("cwd").cloned().unwrap_or_else(|| json!("/"));
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "thread": thread,
+            "model": model,
+            "modelProvider": model_provider,
+            "serviceTier": Value::Null,
+            "cwd": cwd,
+            "instructionSources": [],
+            "reasoningEffort": Value::Null,
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false,
+            },
+        },
+    }))
+}
+
+fn add_session_turns_to_thread(thread: &mut Value, path: &Path) {
+    if let Value::Object(map) = thread {
+        map.insert(
+            "turns".to_string(),
+            Value::Array(thread_turns_from_session_file(path)),
+        );
+    }
+}
+
+fn thread_turns_list_response(id: Value, session: &SessionFile) -> Option<Value> {
+    Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "data": thread_turns_from_session_file(&session.path),
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null,
+        },
+    }))
+}
+
+fn session_files_from_homes(homes: &[SessionHome], params: &Value) -> Vec<SessionFile> {
+    let mut files = Vec::new();
+    let per_home_limit = thread_list_per_home_session_limit(params);
+    let take_limit = if has_thread_workspace_filter(params) {
+        usize::MAX
+    } else {
+        per_home_limit
+    };
+    for home in homes {
+        let mut paths = Vec::new();
+        collect_session_jsonl_files(&home.path.join("sessions"), &mut paths);
+        paths.sort_by(|first, second| {
+            let first_updated = session_file_updated_at(first);
+            let second_updated = session_file_updated_at(second);
+            second_updated.cmp(&first_updated)
+        });
+        files.extend(paths.into_iter().take(take_limit).map(|path| SessionFile {
+            profile_name: home.profile_name.clone(),
+            path,
+        }));
+    }
+    files.sort_by(|first, second| {
+        let first_updated = session_file_updated_at(&first.path);
+        let second_updated = session_file_updated_at(&second.path);
+        second_updated.cmp(&first_updated)
+    });
+    files
+}
+
+fn thread_matches_list_params(thread: &Value, params: &Value) -> bool {
+    if params
+        .get("archived")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    if let Some(cwd_filter) = list_cwd_filter(params) {
+        let cwd = thread.get("cwd").and_then(Value::as_str).unwrap_or("");
+        if !cwd_filter.iter().any(|candidate| candidate == cwd) {
+            return false;
+        }
+    } else if let Some(cwd_filter) = list_inherited_workspace_cwd_filter(params) {
+        let cwd = thread.get("cwd").and_then(Value::as_str).unwrap_or("");
+        if !cwd_filter.iter().any(|candidate| candidate == cwd) && !is_projectless_cwd(cwd) {
+            return false;
+        }
+    }
+
+    if let Some(providers) = non_empty_string_array(params.get("modelProviders")) {
+        let provider = thread
+            .get("modelProvider")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !providers.iter().any(|candidate| candidate == provider) {
+            return false;
+        }
+    }
+
+    if let Some(sources) = non_empty_string_array(params.get("sourceKinds")) {
+        let source = thread.get("source").and_then(Value::as_str).unwrap_or("");
+        if !sources.iter().any(|candidate| candidate == source) {
+            return false;
+        }
+    }
+
+    if let Some(search_term) = params
+        .get("searchTerm")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+    {
+        let haystack = [
+            thread.get("id").and_then(Value::as_str).unwrap_or(""),
+            thread.get("name").and_then(Value::as_str).unwrap_or(""),
+            thread.get("preview").and_then(Value::as_str).unwrap_or(""),
+        ]
+        .join("\n")
+        .to_ascii_lowercase();
+        if !haystack.contains(&search_term) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn has_thread_workspace_filter(params: &Value) -> bool {
+    list_cwd_filter(params).is_some() || list_inherited_workspace_cwd_filter(params).is_some()
+}
+
+fn list_cwd_filter(params: &Value) -> Option<Vec<String>> {
+    match params.get("cwd")? {
+        Value::String(cwd) if !cwd.trim().is_empty() => Some(vec![cwd.to_string()]),
+        Value::Array(items) => {
+            let values = items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(values)
+        }
+        _ => None,
+    }
+}
+
+fn list_inherited_workspace_cwd_filter(params: &Value) -> Option<Vec<String>> {
+    let cwd = params
+        .get(CODEXL_WORKSPACE_CWD_FILTER_KEY)?
+        .as_str()?
+        .trim();
+    (!cwd.is_empty()).then(|| vec![cwd.to_string()])
+}
+
+fn is_projectless_cwd(cwd: &str) -> bool {
+    let Some(workspace_root) = projectless_workspace_root() else {
+        return false;
+    };
+    is_projectless_cwd_under_root(Path::new(cwd.trim()), &workspace_root)
+}
+
+fn projectless_workspace_root() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .map(|home| home.join("Documents").join("Codex"))
+}
+
+fn is_projectless_cwd_under_root(cwd: &Path, workspace_root: &Path) -> bool {
+    let Ok(relative) = cwd.strip_prefix(workspace_root) else {
+        return false;
+    };
+    let segments = relative
+        .iter()
+        .map(|segment| segment.to_string_lossy())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [date_slug] => is_projectless_date_slug_segment(date_slug),
+        [date, slug] => is_projectless_date_segment(date) && !slug.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn is_projectless_date_slug_segment(segment: &str) -> bool {
+    let Some(date) = segment.get(..10) else {
+        return false;
+    };
+    segment.as_bytes().get(10).is_some_and(|byte| *byte == b'-')
+        && is_projectless_date_segment(date)
+        && segment.len() > 11
+}
+
+fn is_projectless_date_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn non_empty_string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    let values = value?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
+}
+
+fn sort_thread_list(threads: &mut [Value], params: &Value) {
+    let sort_key = match params.get("sortKey").and_then(Value::as_str) {
+        Some("created_at") => "createdAt",
+        _ => "updatedAt",
+    };
+    let ascending = params
+        .get("sortDirection")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "asc");
+    threads.sort_by(|first, second| {
+        let ordering = json_number(first.get(sort_key))
+            .partial_cmp(&json_number(second.get(sort_key)))
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+}
+
+fn collect_session_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_jsonl_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn thread_summary_from_session_file(path: &Path, _profile_name: &str) -> Option<Value> {
+    let payload = session_meta_payload(path)?;
+    let id = payload.get("id").and_then(Value::as_str)?.trim();
+    if id.is_empty() {
+        return None;
+    }
+
+    let (created_at, updated_at) = session_file_times(path);
+    let preview = session_file_preview(path);
+    let mut thread = Map::new();
+    thread.insert("id".to_string(), json!(id));
+    thread.insert(
+        "sessionId".to_string(),
+        json!(payload
+            .get("sessionId")
+            .or_else(|| payload.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(id)),
+    );
+    thread.insert(
+        "forkedFromId".to_string(),
+        payload
+            .get("forkedFromId")
+            .or_else(|| payload.get("forked_from_id"))
+            .and_then(Value::as_str)
+            .map(|value| json!(value))
+            .unwrap_or(Value::Null),
+    );
+    thread.insert(
+        "preview".to_string(),
+        json!(preview.clone().unwrap_or_default()),
+    );
+    thread.insert("ephemeral".to_string(), json!(false));
+    thread.insert(
+        "modelProvider".to_string(),
+        json!(session_model_provider_from_payload(&payload)),
+    );
+    thread.insert("createdAt".to_string(), json!(created_at));
+    thread.insert("updatedAt".to_string(), json!(updated_at));
+    thread.insert("status".to_string(), json!({ "type": "notLoaded" }));
+    thread.insert(
+        "path".to_string(),
+        json!(path.to_string_lossy().to_string()),
+    );
+    thread.insert(
+        "cwd".to_string(),
+        json!(session_cwd_from_payload(&payload, path)),
+    );
+    thread.insert(
+        "cliVersion".to_string(),
+        json!(payload
+            .get("cliVersion")
+            .or_else(|| payload.get("cli_version"))
+            .and_then(Value::as_str)
+            .unwrap_or("")),
+    );
+    thread.insert("source".to_string(), normalized_session_source(&payload));
+    thread.insert(
+        "threadSource".to_string(),
+        normalized_thread_source(&payload),
+    );
+    thread.insert("agentNickname".to_string(), Value::Null);
+    thread.insert("agentRole".to_string(), Value::Null);
+    thread.insert("gitInfo".to_string(), Value::Null);
+    thread.insert(
+        "name".to_string(),
+        payload
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|value| json!(value))
+            .or_else(|| preview.map(|value| json!(value)))
+            .unwrap_or(Value::Null),
+    );
+    thread.insert("turns".to_string(), Value::Array(Vec::new()));
+
+    Some(Value::Object(thread))
+}
+
+fn session_model_from_payload(payload: &Value) -> String {
+    payload
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn session_model_provider_from_payload(payload: &Value) -> String {
+    payload
+        .get("modelProvider")
+        .or_else(|| payload.get("model_provider"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn session_cwd_from_payload(payload: &Value, path: &Path) -> String {
+    payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            path.parent()
+                .map(|parent| parent.to_string_lossy().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "/".to_string())
+}
+
+fn normalized_session_source(payload: &Value) -> Value {
+    match payload.get("source").and_then(Value::as_str) {
+        Some("cli" | "vscode" | "exec" | "appServer" | "unknown") => {
+            json!(payload.get("source").and_then(Value::as_str).unwrap())
+        }
+        Some("codex_cli_rs") => json!("cli"),
+        Some(value) if value.to_ascii_lowercase().contains("vscode") => json!("vscode"),
+        Some(value) if value.to_ascii_lowercase().contains("app") => json!("appServer"),
+        Some(value) if !value.trim().is_empty() => json!("cli"),
+        _ => json!("unknown"),
+    }
+}
+
+fn normalized_thread_source(payload: &Value) -> Value {
+    match payload
+        .get("threadSource")
+        .or_else(|| payload.get("thread_source"))
+        .and_then(Value::as_str)
+    {
+        Some("user" | "subagent" | "memory_consolidation") => {
+            json!(payload
+                .get("threadSource")
+                .or_else(|| payload.get("thread_source"))
+                .and_then(Value::as_str)
+                .unwrap())
+        }
+        _ => Value::Null,
+    }
+}
+
+fn session_meta_payload(path: &Path) -> Option<Value> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let meta: Value = serde_json::from_str(line.trim_end()).ok()?;
+    if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    meta.get("payload").cloned()
+}
+
+fn session_file_preview(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok).skip(1).take(400) {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(text) = session_line_preview(&value) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn thread_turns_from_session_file(path: &Path) -> Vec<Value> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let reader = BufReader::new(file);
+    let mut turns = Vec::new();
+    let mut current_items = Vec::new();
+    let mut current_turn_id = String::new();
+    let mut current_started_at = Value::Null;
+    let mut current_completed_at = Value::Null;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some((turn_id, started_at)) = task_started_turn(&value) {
+            push_session_turn(
+                &mut turns,
+                &mut current_items,
+                &current_turn_id,
+                &current_started_at,
+                &current_completed_at,
+            );
+            current_turn_id = turn_id;
+            current_started_at = started_at;
+            current_completed_at = Value::Null;
+            continue;
+        }
+        if let Some(completed_at) = task_completed_at(&value) {
+            current_completed_at = completed_at;
+            continue;
+        }
+        let Some(item) = session_turn_item(&value) else {
+            continue;
+        };
+        if item.get("type").and_then(Value::as_str) == Some("userMessage")
+            && !current_items.is_empty()
+        {
+            push_session_turn(
+                &mut turns,
+                &mut current_items,
+                &current_turn_id,
+                &current_started_at,
+                &current_completed_at,
+            );
+            current_turn_id.clear();
+            current_started_at = Value::Null;
+            current_completed_at = Value::Null;
+        }
+        current_items.push(item);
+    }
+
+    push_session_turn(
+        &mut turns,
+        &mut current_items,
+        &current_turn_id,
+        &current_started_at,
+        &current_completed_at,
+    );
+    turns
+}
+
+fn push_session_turn(
+    turns: &mut Vec<Value>,
+    current_items: &mut Vec<Value>,
+    current_turn_id: &str,
+    current_started_at: &Value,
+    current_completed_at: &Value,
+) {
+    if current_items.is_empty() {
+        return;
+    }
+    let index = turns.len() + 1;
+    let turn_id = if current_turn_id.trim().is_empty() {
+        format!("codexl-session-turn-{index}")
+    } else {
+        current_turn_id.to_string()
+    };
+    turns.push(json!({
+        "id": turn_id,
+        "items": std::mem::take(current_items),
+        "itemsView": "full",
+        "status": "completed",
+        "error": Value::Null,
+        "startedAt": current_started_at.clone(),
+        "completedAt": current_completed_at.clone(),
+        "durationMs": Value::Null,
+    }));
+}
+
+fn task_started_turn(value: &Value) -> Option<(String, Value)> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("task_started") {
+        return None;
+    }
+    let turn_id = payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("codexl-session-turn")
+        .to_string();
+    let started_at = payload
+        .get("started_at")
+        .or_else(|| payload.get("startedAt"))
+        .and_then(timestamp_seconds_value)
+        .unwrap_or(Value::Null);
+    Some((turn_id, started_at))
+}
+
+fn task_completed_at(value: &Value) -> Option<Value> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+        return None;
+    }
+    payload
+        .get("completed_at")
+        .or_else(|| payload.get("completedAt"))
+        .and_then(timestamp_seconds_value)
+}
+
+fn timestamp_seconds_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Number(number) => number.as_i64().map(|value| json!(value)),
+        Value::String(text) => text.trim().parse::<i64>().ok().map(|value| json!(value)),
+        _ => None,
+    }
+}
+
+fn session_turn_item(value: &Value) -> Option<Value> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    match payload.get("role").and_then(Value::as_str) {
+        Some("user") => {
+            let text = session_message_text(payload.get("content"))?;
+            if is_synthetic_user_message(&text) {
+                return None;
+            }
+            let content = normalize_session_message_content(payload.get("content"));
+            if content.as_array().is_some_and(|items| items.is_empty()) {
+                return None;
+            }
+            Some(json!({
+                "type": "userMessage",
+                "id": session_message_id(payload, "user"),
+                "content": content,
+            }))
+        }
+        Some("assistant") => Some(json!({
+            "type": "agentMessage",
+            "id": session_message_id(payload, "assistant"),
+            "text": session_message_text(payload.get("content")).unwrap_or_default(),
+            "phase": "final_answer",
+            "memoryCitation": Value::Null,
+        })),
+        _ => None,
+    }
+}
+
+fn session_message_id(payload: &Value, prefix: &str) -> String {
+    payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("codexl-session-{prefix}-item"))
+}
+
+fn normalize_session_message_content(value: Option<&Value>) -> Value {
+    let Some(value) = value else {
+        return json!([]);
+    };
+    match value {
+        Value::String(text) => json!([{ "type": "text", "text": text, "text_elements": [] }]),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .filter_map(normalized_session_content_part)
+                .collect(),
+        ),
+        _ => json!([]),
+    }
+}
+
+fn normalized_session_content_part(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let text = object
+        .get("text")
+        .or_else(|| object.get("input_text"))
+        .and_then(Value::as_str)?;
+    if is_synthetic_user_message(text) {
+        return None;
+    }
+    Some(json!({
+        "type": "text",
+        "text": text,
+        "text_elements": [],
+    }))
+}
+
+fn session_message_text(value: Option<&Value>) -> Option<String> {
+    text_from_json_value(value?)
+}
+
+fn session_file_times(path: &Path) -> (u64, u64) {
+    let metadata = std::fs::metadata(path).ok();
+    let updated_at = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_seconds)
+        .unwrap_or(0);
+    let created_at = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(system_time_seconds)
+        .unwrap_or(updated_at);
+    (created_at, updated_at)
+}
+
+fn session_file_updated_at(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_seconds)
+        .unwrap_or(0)
+}
+
+fn system_time_seconds(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn session_line_preview(value: &Value) -> Option<String> {
+    if let Some(message) = value
+        .get("payload")
+        .filter(|_| value.get("type").and_then(Value::as_str) == Some("event_msg"))
+        .filter(|payload| payload.get("type").and_then(Value::as_str) == Some("user_message"))
+        .and_then(|payload| payload.get("message"))
+        .and_then(text_from_json_value)
+    {
+        return real_user_message_preview(&message);
+    }
+
+    let payload = value.get("payload").unwrap_or(value);
+    if payload.get("role").and_then(Value::as_str) == Some("user") {
+        return payload
+            .get("content")
+            .and_then(text_from_json_value)
+            .or_else(|| payload.get("text").and_then(text_from_json_value))
+            .and_then(|text| real_user_message_preview(&text));
+    }
+    let item = payload.get("item").unwrap_or(payload);
+    if item.get("role").and_then(Value::as_str) == Some("user") {
+        return item
+            .get("content")
+            .and_then(text_from_json_value)
+            .or_else(|| item.get("text").and_then(text_from_json_value))
+            .and_then(|text| real_user_message_preview(&text));
+    }
+    None
+}
+
+fn text_from_json_value(value: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_text_from_json_value(value, &mut parts);
+    let text = parts.join("\n");
+    non_empty_text(&text)
+}
+
+fn collect_text_from_json_value(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => parts.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_text_from_json_value(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = map
+                .get("text")
+                .or_else(|| map.get("input_text"))
+                .and_then(Value::as_str)
+            {
+                parts.push(text.to_string());
+            } else if let Some(content) = map.get("content") {
+                collect_text_from_json_value(content, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn real_user_message_preview(text: &str) -> Option<String> {
+    if is_synthetic_user_message(text) {
+        None
+    } else {
+        non_empty_preview(text)
+    }
+}
+
+fn is_synthetic_user_message(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    [
+        "<environment_context>",
+        "<system",
+        "<developer",
+        "<permissions instructions>",
+        "<app-context>",
+        "<collaboration_mode>",
+        "<skills_instructions>",
+        "<plugins_instructions>",
+        "<apps_instructions>",
+        "You are ChatGPT",
+        "You are Codex",
+        "You are a coding agent",
+        "You are a helpful assistant",
+        "Knowledge cutoff:",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn non_empty_text(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn non_empty_preview(text: &str) -> Option<String> {
+    let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.is_empty() {
+        None
+    } else {
+        let mut chars = preview.chars();
+        let truncated = chars.by_ref().take(120).collect::<String>();
+        if chars.next().is_some() {
+            Some(format!("{}...", truncated))
+        } else {
+            Some(preview)
+        }
+    }
+}
+
+fn json_number(value: Option<&Value>) -> f64 {
+    value.and_then(Value::as_f64).unwrap_or(0.0)
 }
 
 fn trim_json_line(line: &[u8]) -> &[u8] {
@@ -1240,10 +2423,11 @@ printf ':stdin=%s\n' "$first_line"
         let auth = ChatGptAuth::from_auth_json_path(&auth_path).expect("load auth");
         let request_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        track_request_line(
+        track_request_line_with_workspace(
             br#"{"id":"account-id","method":"account/read","params":{"refreshToken":false}}
 "#,
             &request_map,
+            None,
         );
         let account_line = rewrite_stdout_line(
             br#"{"id":"account-id","result":{"account":null,"requiresOpenaiAuth":false}}
@@ -1257,10 +2441,11 @@ printf ':stdin=%s\n' "$first_line"
         assert_eq!(account["result"]["account"]["planType"], "plus");
         assert_eq!(account["result"]["requiresOpenaiAuth"], true);
 
-        track_request_line(
+        track_request_line_with_workspace(
             br#"{"id":"auth-id","method":"getAuthStatus","params":{"includeToken":true,"refreshToken":false}}
 "#,
             &request_map,
+            None,
         );
         let auth_line = rewrite_stdout_line(
             br#"{"id":"auth-id","result":{"authMethod":null,"authToken":null,"requiresOpenaiAuth":false}}
@@ -1274,6 +2459,42 @@ printf ':stdin=%s\n' "$first_line"
         assert_eq!(status["result"]["requiresOpenaiAuth"], true);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_list_request_inherits_recent_workspace_cwd() {
+        let request_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let current_cwd = Arc::new(Mutex::new(None));
+
+        track_request_line_with_workspace(
+            br#"{"id":"config-id","method":"config/read","params":{"includeLayers":false,"cwd":"/tmp/current-project"}}
+"#,
+            &request_map,
+            Some(&current_cwd),
+        );
+        track_request_line_with_workspace(
+            br#"{"id":"plugin-id","method":"plugin/list","params":{"cwds":["/tmp/marketplace-cache"]}}
+"#,
+            &request_map,
+            Some(&current_cwd),
+        );
+        track_request_line_with_workspace(
+            br#"{"id":"list-id","method":"thread/list","params":{"limit":50,"cursor":null,"sortKey":"updated_at","modelProviders":null,"archived":false,"sourceKinds":[]}}
+"#,
+            &request_map,
+            Some(&current_cwd),
+        );
+
+        let requests = request_map.lock().expect("request map");
+        let request = requests.get("list-id").expect("tracked thread/list");
+        assert_eq!(
+            request
+                .params
+                .get(CODEXL_WORKSPACE_CWD_FILTER_KEY)
+                .and_then(Value::as_str),
+            Some("/tmp/current-project")
+        );
+        assert!(request.params.get("cwd").is_none());
     }
 
     #[test]
@@ -1346,6 +2567,310 @@ printf ':stdin=%s\n' "$first_line"
         } else {
             std::env::remove_var(CODEX_HOME_ENV);
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_list_merge_reads_sessions_from_other_provider_homes() {
+        let root = test_dir("all-sessions");
+        let other_home = root.join("other-provider");
+        let session_dir = other_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("23");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        let session_path = session_dir.join("thread-other.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session_meta","payload":{"id":"thread-other","cwd":"/tmp/other","source":"codex_cli_rs","model_provider":"openai"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello from another provider"}]}}
+"#,
+        )
+        .expect("write session");
+        std::fs::write(
+            session_dir.join("thread-different-project.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"thread-different-project","cwd":"/tmp/different","source":"vscode","model_provider":"openai"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"not this project"}]}}
+"#,
+        )
+        .expect("write different project session");
+
+        let mut response = json!({
+            "id": "list-1",
+            "result": {
+                "data": [{
+                    "id": "thread-current",
+                    "cwd": "/tmp/current",
+                    "updatedAt": 1
+                }],
+                "nextCursor": Value::Null
+            }
+        });
+        let homes = vec![SessionHome {
+            profile_name: "Other Provider".to_string(),
+            path: other_home,
+        }];
+
+        merge_session_files_into_thread_list(
+            &mut response,
+            &homes,
+            &json!({ "cwd": "/tmp/other" }),
+        );
+        let threads = response
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .expect("threads");
+        let other = threads
+            .iter()
+            .find(|thread| thread.get("id").and_then(Value::as_str) == Some("thread-other"))
+            .expect("other provider thread");
+
+        assert_eq!(threads.len(), 2);
+        assert!(threads.iter().all(|thread| {
+            thread.get("id").and_then(Value::as_str) != Some("thread-different-project")
+        }));
+        assert_eq!(other.get("cwd").and_then(Value::as_str), Some("/tmp/other"));
+        assert_eq!(
+            other.get("sessionId").and_then(Value::as_str),
+            Some("thread-other")
+        );
+        assert_eq!(other.get("ephemeral").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            other.pointer("/status/type").and_then(Value::as_str),
+            Some("notLoaded")
+        );
+        assert_eq!(other.get("cliVersion").and_then(Value::as_str), Some(""));
+        assert_eq!(other.get("source").and_then(Value::as_str), Some("cli"));
+        assert!(other.get("codexlProviderName").is_none());
+        assert!(other.get("workspaceName").is_none());
+        assert_eq!(
+            other.get("path").and_then(Value::as_str),
+            Some(session_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            other.get("preview").and_then(Value::as_str),
+            Some("hello from another provider")
+        );
+        assert_eq!(
+            other.get("modelProvider").and_then(Value::as_str),
+            Some("openai")
+        );
+
+        let session = SessionFile {
+            profile_name: "Other Provider".to_string(),
+            path: session_path.clone(),
+        };
+        let read =
+            thread_read_response(json!("read-1"), &session, &json!({ "includeTurns": true }))
+                .expect("thread read response");
+        assert_eq!(read.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert_eq!(
+            read.pointer("/result/thread/turns/0/items/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello from another provider")
+        );
+        assert_eq!(
+            read.pointer("/result/thread/turns/0/itemsView")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+
+        let turns =
+            thread_turns_list_response(json!("turns-1"), &session).expect("turns list response");
+        assert_eq!(turns.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert!(turns.pointer("/result/backwardsCursor").is_some());
+        assert_eq!(
+            turns
+                .pointer("/result/data/0/items/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello from another provider")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_list_collects_sessions_per_provider_home_fairly() {
+        let root = test_dir("all-sessions-fairness");
+        let busy_home = root.join("busy-provider");
+        let quiet_home = root.join("quiet-provider");
+        let busy_dir = busy_home.join("sessions").join("2026").join("05").join("23");
+        let quiet_dir = quiet_home.join("sessions").join("2026").join("05").join("23");
+        std::fs::create_dir_all(&busy_dir).expect("create busy session dir");
+        std::fs::create_dir_all(&quiet_dir).expect("create quiet session dir");
+
+        for index in 0..5 {
+            std::fs::write(
+                busy_dir.join(format!("busy-{index}.jsonl")),
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"id":"busy-{index}","cwd":"/tmp/busy","model_provider":"openai"}}}}
+"#
+                ),
+            )
+            .expect("write busy session");
+        }
+        std::fs::write(
+            quiet_dir.join("quiet-0.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"quiet-0","cwd":"/tmp/quiet","model_provider":"openai"}}
+"#,
+        )
+        .expect("write quiet session");
+
+        let homes = vec![
+            SessionHome {
+                profile_name: "Busy".to_string(),
+                path: busy_home,
+            },
+            SessionHome {
+                profile_name: "Quiet".to_string(),
+                path: quiet_home,
+            },
+        ];
+
+        let files = session_files_from_homes(&homes, &json!({ "limit": 1 }));
+        let busy_count = files
+            .iter()
+            .filter(|file| file.profile_name == "Busy")
+            .count();
+        let quiet_count = files
+            .iter()
+            .filter(|file| file.profile_name == "Quiet")
+            .count();
+
+        assert_eq!(busy_count, 1);
+        assert_eq!(quiet_count, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inherited_workspace_filter_keeps_projectless_sessions() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("all-sessions-projectless");
+        let home_dir = root.join("home");
+        let other_home = root.join("other-provider");
+        let session_dir = other_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("23");
+        let projectless_cwd = home_dir
+            .join("Documents")
+            .join("Codex")
+            .join("2026-05-23")
+            .join("chat-0");
+        let old_home = std::env::var("HOME").ok();
+
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        std::env::set_var("HOME", &home_dir);
+        std::fs::write(
+            session_dir.join("thread-current.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"thread-current","cwd":"/tmp/current","model_provider":"openai"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"current project"}]}}
+"#,
+        )
+        .expect("write current session");
+        std::fs::write(
+            session_dir.join("thread-projectless.jsonl"),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"thread-projectless","cwd":"{}","model_provider":"openai"}}}}
+{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"projectless chat"}}]}}}}
+"#,
+                projectless_cwd.to_string_lossy()
+            ),
+        )
+        .expect("write projectless session");
+        std::fs::write(
+            session_dir.join("thread-different.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"thread-different","cwd":"/tmp/different","model_provider":"openai"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"different project"}]}}
+"#,
+        )
+        .expect("write different session");
+
+        let mut response = json!({ "result": { "data": [] } });
+        let homes = vec![SessionHome {
+            profile_name: "Other Provider".to_string(),
+            path: other_home,
+        }];
+
+        merge_session_files_into_thread_list(
+            &mut response,
+            &homes,
+            &json!({ CODEXL_WORKSPACE_CWD_FILTER_KEY: "/tmp/current" }),
+        );
+        let ids = response
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .expect("threads")
+            .iter()
+            .filter_map(|thread| thread.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"thread-current"));
+        assert!(ids.contains(&"thread-projectless"));
+        assert!(!ids.contains(&"thread-different"));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_summary_skips_synthetic_context_and_resume_includes_turns() {
+        let root = test_dir("all-sessions-context-skip");
+        let session_dir = root.join("sessions").join("2026").join("05").join("23");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        let session_path = session_dir.join("thread-context.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session_meta","payload":{"id":"thread-context","cwd":"/tmp/current","model_provider":"openai"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/tmp/current</cwd></environment_context>"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Fix session restore"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix session restore"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}
+"#,
+        )
+        .expect("write session");
+
+        let thread = thread_summary_from_session_file(&session_path, "Other Provider")
+            .expect("thread summary");
+        assert_eq!(
+            thread.get("preview").and_then(Value::as_str),
+            Some("Fix session restore")
+        );
+        assert_eq!(
+            thread.get("name").and_then(Value::as_str),
+            Some("Fix session restore")
+        );
+
+        let session = SessionFile {
+            profile_name: "Other Provider".to_string(),
+            path: session_path.clone(),
+        };
+        let resume = thread_resume_response(json!("resume-1"), &session).expect("resume response");
+        let turns = resume
+            .pointer("/result/thread/turns")
+            .and_then(Value::as_array)
+            .expect("turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            resume
+                .pointer("/result/thread/turns/0/items/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("Fix session restore")
+        );
+        assert_eq!(
+            resume
+                .pointer("/result/thread/turns/0/items/1/text")
+                .and_then(Value::as_str),
+            Some("Done")
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
