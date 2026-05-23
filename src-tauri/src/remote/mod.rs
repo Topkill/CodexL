@@ -74,6 +74,7 @@ const CODEX_DESKTOP_API_PROD_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_DESKTOP_API_DEV_BASE_URL: &str = "http://localhost:8000/api";
 const CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
 const DEFAULT_TRANSCRIBE_MODEL: &str = "gpt-4o-mini-transcribe";
+const OPENAI_TRANSCRIBE_ENDPOINT_SUFFIX: &str = "/audio/transcriptions";
 const CLI_ACTIVE_WORKSPACE_ROOTS_KEY: &str = "active-workspace-roots";
 const CLI_PROJECTLESS_THREAD_IDS_KEY: &str = "projectless-thread-ids";
 const CLI_THREAD_WORKSPACE_ROOT_HINTS_KEY: &str = "thread-workspace-root-hints";
@@ -2314,11 +2315,6 @@ async fn start_cli_app_server_bridge(
             false,
         )?;
     }
-    config::sync_qwen_asr_mcp_config_for_launch(
-        &requested_config.codex_home,
-        requested_config.extensions.enabled && requested_config.extensions.qwen_asr_enabled,
-    )?;
-
     let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
     let active_cli_profile = requested_config.active_cli_profile();
     let active_cli_model_provider = requested_config.active_cli_model_provider();
@@ -3905,8 +3901,7 @@ async fn cli_custom_transcribe_fetch_response(
         .get("requestId")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let url = reqwest::Url::parse(&transcribe_api.url)
-        .map_err(|e| (500, format!("Invalid transcribe API URL: {}", e)))?;
+    let url = custom_transcribe_endpoint_url(&transcribe_api.url)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err((500, "Transcribe API URL must use http or https".to_string()));
     }
@@ -3969,6 +3964,27 @@ async fn cli_custom_transcribe_fetch_response(
             },
         ))
     }
+}
+
+fn custom_transcribe_endpoint_url(base_url: &str) -> Result<reqwest::Url, (u16, String)> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|e| (500, format!("Invalid transcribe API URL: {}", e)))?;
+    let path = url.path().trim_end_matches('/').to_string();
+    if path
+        .to_ascii_lowercase()
+        .ends_with(OPENAI_TRANSCRIBE_ENDPOINT_SUFFIX)
+    {
+        url.set_path(&path);
+        return Ok(url);
+    }
+
+    let next_path = if path.is_empty() {
+        OPENAI_TRANSCRIBE_ENDPOINT_SUFFIX.to_string()
+    } else {
+        format!("{}{}", path, OPENAI_TRANSCRIBE_ENDPOINT_SUFFIX)
+    };
+    url.set_path(&next_path);
+    Ok(url)
 }
 
 fn cli_desktop_api_fetch_init(
@@ -7653,6 +7669,28 @@ mod tests {
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0.as_str(), "content-type");
         assert_eq!(headers[0].1.to_str().ok(), Some("audio/webm"));
+    }
+
+    #[test]
+    fn custom_transcribe_endpoint_url_appends_openai_path_to_base_url() {
+        let url = custom_transcribe_endpoint_url("https://api.openai.com/v1")
+            .expect("transcribe endpoint url");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn custom_transcribe_endpoint_url_accepts_full_endpoint_url() {
+        let url = custom_transcribe_endpoint_url("https://api.openai.com/v1/audio/transcriptions/")
+            .expect("transcribe endpoint url");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
     }
 
     #[test]

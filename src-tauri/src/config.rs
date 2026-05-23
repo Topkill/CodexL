@@ -29,9 +29,6 @@ const BOT_MEDIA_MCP_SERVER_NAME: &str = "codexl_bot";
 const LEGACY_BOT_MEDIA_MCP_SERVER_NAME: &str = "codexl_bot_media";
 const BOT_MEDIA_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL BOT MEDIA MCP";
 const BOT_MEDIA_MCP_MANAGED_END: &str = "# END CODEXL BOT MEDIA MCP";
-const RETIRED_QWEN_ASR_MCP_SERVER_NAME: &str = "codexl_qwen_asr";
-const RETIRED_QWEN_ASR_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL QWEN ASR MCP";
-const RETIRED_QWEN_ASR_MCP_MANAGED_END: &str = "# END CODEXL QWEN ASR MCP";
 const RETIRED_DOUBAO_IME_MCP_SERVER_NAME: &str = "codexl_doubao_ime";
 const RETIRED_DOUBAO_IME_MCP_MANAGED_BEGIN: &str = "# BEGIN CODEXL DOUBAO IME MCP";
 const RETIRED_DOUBAO_IME_MCP_MANAGED_END: &str = "# END CODEXL DOUBAO IME MCP";
@@ -1673,12 +1670,6 @@ fn remove_retired_builtin_mcp_configs(codex_home: &Path) -> Result<(), String> {
     let content = std::fs::read_to_string(&target_config_path).unwrap_or_default();
     let updated = remove_retired_mcp_config(
         &content,
-        RETIRED_QWEN_ASR_MCP_SERVER_NAME,
-        RETIRED_QWEN_ASR_MCP_MANAGED_BEGIN,
-        RETIRED_QWEN_ASR_MCP_MANAGED_END,
-    );
-    let updated = remove_retired_mcp_config(
-        &updated,
         RETIRED_DOUBAO_IME_MCP_SERVER_NAME,
         RETIRED_DOUBAO_IME_MCP_MANAGED_BEGIN,
         RETIRED_DOUBAO_IME_MCP_MANAGED_END,
@@ -3454,19 +3445,12 @@ model = "glm"
     }
 
     #[test]
-    fn retired_builtin_mcp_cleanup_removes_qwen_asr_and_doubao_ime_servers() {
+    fn retired_builtin_mcp_cleanup_removes_doubao_ime_server() {
         let root = test_dir("retired-builtins-mcp");
         std::fs::create_dir_all(&root).expect("create codex home");
         std::fs::write(
             root.join("config.toml"),
             r#"model = "glm"
-
-# BEGIN CODEXL QWEN ASR MCP
-[mcp_servers.codexl_qwen_asr]
-command = "/Applications/Codex Launcher.app/Contents/MacOS/codex-launcher"
-args = ["--codexl-qwen-asr-mcp"]
-enabled = true
-# END CODEXL QWEN ASR MCP
 
 [mcp_servers.codexl_doubao_ime]
 command = "/Applications/Codex Launcher.app/Contents/MacOS/codex-launcher"
@@ -3483,8 +3467,6 @@ model = "glm"
             .expect("cleanup retired mcp configs");
         let content = std::fs::read_to_string(root.join("config.toml")).expect("read config");
 
-        assert!(!content.contains("codexl_qwen_asr"));
-        assert!(!content.contains("--codexl-qwen-asr-mcp"));
         assert!(!content.contains("codexl_doubao_ime"));
         assert!(!content.contains("--codexl-doubao-ime-mcp"));
         assert!(content.contains("[profiles.default]"));
