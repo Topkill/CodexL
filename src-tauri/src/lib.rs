@@ -54,7 +54,15 @@ impl AppState {
 }
 
 #[tauri::command]
-fn find_codex() -> Result<String, String> {
+async fn find_codex(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let configured_path = {
+        let config = state.config.lock().await;
+        config.codex_path.trim().to_string()
+    };
+    if !configured_path.is_empty() {
+        return Ok(configured_path);
+    }
+
     launcher::find_codex_app().ok_or_else(|| "Codex app not found".to_string())
 }
 
