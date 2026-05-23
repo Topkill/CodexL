@@ -731,7 +731,10 @@ impl AppConfig {
             return None;
         }
         let codex_profile_name = profile.codex_profile_name.trim();
-        if codex_profile_name.is_empty() || codex_profile_name == DEFAULT_PROVIDER_PROFILE_NAME {
+        if codex_profile_name.is_empty()
+            || codex_profile_name == DEFAULT_PROVIDER_PROFILE_NAME
+            || !codex_home_uses_profile_table(&profile, codex_profile_name)
+        {
             None
         } else {
             Some(codex_profile_name.to_string())
@@ -745,7 +748,9 @@ impl AppConfig {
 
         let profile = self.provider_profile(&self.active_provider)?;
         let provider_name = profile.provider_name.trim();
-        if provider_name.is_empty() {
+        if provider_name.is_empty()
+            || !codex_home_uses_profile_table(&profile, profile.codex_profile_name.trim())
+        {
             None
         } else {
             Some(provider_name.to_string())
@@ -1472,8 +1477,11 @@ fn write_codex_home_config(
         std::fs::read_to_string(default_codex_config_path()).unwrap_or_default()
     };
 
-    let updated = upsert_provider_profile_content(&content, profile, force_defaults);
-    let updated = set_top_level_model_config(&updated, &profile.model);
+    let updated = if profile_table_exists(&content, &profile.name) {
+        upsert_provider_profile_content(&content, profile, force_defaults)
+    } else {
+        upsert_default_provider_selection_content(&content, profile)
+    };
     std::fs::write(target_config_path, updated).map_err(|e| e.to_string())
 }
 
@@ -2676,6 +2684,22 @@ fn profile_codex_home(profile: &ProviderProfile) -> String {
     }
 }
 
+fn codex_home_uses_profile_table(profile: &ProviderProfile, profile_name: &str) -> bool {
+    let profile_name = profile_name.trim();
+    if profile_name.is_empty() {
+        return false;
+    }
+
+    let codex_home = if profile.codex_home.trim().is_empty() {
+        profile_codex_home(profile)
+    } else {
+        normalize_home_path(&profile.codex_home)
+    };
+    let content =
+        std::fs::read_to_string(PathBuf::from(codex_home).join("config.toml")).unwrap_or_default();
+    profile_table_exists(&content, profile_name)
+}
+
 fn slugify(value: &str) -> String {
     let slug: String = value
         .chars()
@@ -2879,6 +2903,69 @@ model_provider = "custom"
     }
 
     #[test]
+    fn ensure_provider_home_uses_top_level_shape_without_profiles_table() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("provider-home-top-level-shape");
+        let old_home = std::env::var("HOME").ok();
+        let old_codex_home = std::env::var("CODEXL_CODEX_HOME").ok();
+
+        std::fs::create_dir_all(root.join(".codex")).expect("create default codex home");
+        std::fs::write(
+            root.join(".codex").join("config.toml"),
+            r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "custom"
+base_url = "http://source.example/v1"
+"#,
+        )
+        .expect("write default config");
+
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let profile = ProviderProfile {
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            name: "custom".to_string(),
+            codex_profile_name: "custom".to_string(),
+            provider_name: "custom".to_string(),
+            base_url: "http://new.example/v1".to_string(),
+            model: "gpt-5.5".to_string(),
+            proxy_url: String::new(),
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: "latest".to_string(),
+            codex_home: String::new(),
+            start_remote_on_launch: false,
+            start_remote_cloud_on_launch: false,
+            start_remote_e2ee_on_launch: false,
+            remote_e2ee_password: String::new(),
+            bot: BotProfileConfig::default(),
+        };
+        let path = ensure_provider_codex_home(&profile).expect("ensure provider home");
+        let content = std::fs::read_to_string(PathBuf::from(path).join("config.toml"))
+            .expect("read generated config");
+
+        assert!(content.contains("model_provider = \"custom\""));
+        assert!(content.contains("model = \"gpt-5.5\""));
+        assert!(content.contains("[model_providers.custom]"));
+        assert!(!content.contains("[profiles.custom]"));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_codex_home {
+            std::env::set_var("CODEXL_CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEXL_CODEX_HOME");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn app_config_load_applies_codex_path_env_override() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         let root = test_dir("app-config-load-codex-path-env");
@@ -3025,7 +3112,33 @@ model_provider = "custom"
 
     #[test]
     fn non_default_provider_injects_cli_profile_overrides() {
-        let config = AppConfig {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("non-default-provider-profile-table");
+        let old_home = std::env::var("HOME").ok();
+        let old_codex_home = std::env::var("CODEXL_CODEX_HOME").ok();
+
+        std::fs::create_dir_all(root.join(".codexl").join("codex-homes").join("custom"))
+            .expect("create generated home");
+        std::fs::write(
+            root.join(".codexl")
+                .join("codex-homes")
+                .join("custom")
+                .join("config.toml"),
+            r#"[model_providers.custom-provider]
+name = "custom-provider"
+base_url = "http://example/v1"
+
+[profiles.codex-profile]
+model = "custom-model"
+model_provider = "custom-provider"
+"#,
+        )
+        .expect("write generated config");
+
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let mut config = AppConfig {
             active_provider: "custom".to_string(),
             provider_profiles: vec![ProviderProfile {
                 name: "custom".to_string(),
@@ -3036,6 +3149,7 @@ model_provider = "custom"
             }],
             ..AppConfig::default()
         };
+        config.normalize();
 
         assert_eq!(
             config.active_cli_profile(),
@@ -3045,6 +3159,74 @@ model_provider = "custom"
             config.active_cli_model_provider(),
             Some("custom-provider".to_string())
         );
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_codex_home {
+            std::env::set_var("CODEXL_CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEXL_CODEX_HOME");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_default_provider_without_profile_table_does_not_inject_cli_overrides() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("non-default-provider-top-level-only");
+        let old_home = std::env::var("HOME").ok();
+        let old_codex_home = std::env::var("CODEXL_CODEX_HOME").ok();
+
+        std::fs::create_dir_all(root.join(".codexl").join("codex-homes").join("custom"))
+            .expect("create generated home");
+        std::fs::write(
+            root.join(".codexl")
+                .join("codex-homes")
+                .join("custom")
+                .join("config.toml"),
+            r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "custom"
+base_url = "http://example/v1"
+"#,
+        )
+        .expect("write generated config");
+
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let mut config = AppConfig {
+            active_provider: "custom".to_string(),
+            provider_profiles: vec![ProviderProfile {
+                name: "custom".to_string(),
+                codex_profile_name: "custom".to_string(),
+                provider_name: "custom".to_string(),
+                model: "gpt-5.5".to_string(),
+                ..ProviderProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.normalize();
+
+        assert_eq!(config.active_cli_profile(), None);
+        assert_eq!(config.active_cli_model_provider(), None);
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_codex_home {
+            std::env::set_var("CODEXL_CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEXL_CODEX_HOME");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
