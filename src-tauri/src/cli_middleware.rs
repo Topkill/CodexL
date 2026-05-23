@@ -6,6 +6,7 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::config;
 use crate::extensions::builtins::bot_bridge;
 use serde_json::{json, Value};
 
@@ -260,13 +261,16 @@ fn default_log_path() -> PathBuf {
 fn expand_home_path(path: &str) -> PathBuf {
     let trimmed = path.trim();
     if trimmed == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(trimmed));
+        return config::user_home_dir_path().unwrap_or_else(|| PathBuf::from(trimmed));
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = config::user_home_dir_path() {
+            return home.join(rest);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("~\\") {
+        if let Some(home) = config::user_home_dir_path() {
+            return home.join(rest);
         }
     }
     PathBuf::from(trimmed)
@@ -280,9 +284,7 @@ fn normalize_profile(profile: Option<&str>) -> Option<String> {
 }
 
 fn codexl_home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
+    config::user_home_dir_path()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codexl")
 }

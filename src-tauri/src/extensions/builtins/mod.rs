@@ -1264,17 +1264,29 @@ pub(crate) fn codexl_home_dir() -> PathBuf {
         .join(".codexl")
 }
 
-fn user_home_dir() -> Option<PathBuf> {
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    if let Some(home) = env_path_os("HOME") {
+        return Some(home);
+    }
     if cfg!(windows) {
-        env_path_without_home_expansion("USERPROFILE")
-            .or_else(|| {
-                let drive = env_string("HOMEDRIVE")?;
-                let path = env_string("HOMEPATH")?;
-                Some(PathBuf::from(format!("{}{}", drive, path)))
-            })
-            .or_else(|| env_path_without_home_expansion("HOME"))
+        env_path_os("USERPROFILE").or_else(|| {
+            let drive = env_path_os("HOMEDRIVE")?;
+            let path = env_path_os("HOMEPATH")?;
+            let mut home = drive;
+            home.push(path);
+            Some(home)
+        })
     } else {
-        env_path_without_home_expansion("HOME")
+        None
+    }
+}
+
+fn env_path_os(name: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
     }
 }
 

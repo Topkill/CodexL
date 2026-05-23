@@ -1016,12 +1016,36 @@ impl RemoteCloudAuthConfig {
         }
     }
 }
-fn sys_home_dir() -> Option<String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+pub fn user_home_dir_path() -> Option<PathBuf> {
+    if let Some(home) = env_path_os("HOME") {
+        return Some(home);
+    }
+
+    if cfg!(windows) {
+        if let Some(userprofile) = env_path_os("USERPROFILE") {
+            return Some(userprofile);
+        }
+        if let (Some(drive), Some(path)) = (env_path_os("HOMEDRIVE"), env_path_os("HOMEPATH")) {
+            let mut home = drive;
+            home.push(path);
+            return Some(home);
+        }
+    }
+
+    None
+}
+
+fn env_path_os(name: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+pub fn sys_home_dir() -> Option<String> {
+    user_home_dir_path().and_then(|path| path.to_str().map(ToString::to_string))
 }
 fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CODEXL_CONFIG_PATH") {
@@ -3067,6 +3091,56 @@ model_provider = "custom"
         assert!(updated.contains("model = \"gpt-5.5\""));
         assert!(updated.contains("model_provider = \"custom\""));
         assert!(updated.contains("base_url = \"http://new.example/v1\""));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_userprofile {
+            std::env::set_var("USERPROFILE", value);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+    }
+
+    #[test]
+    fn user_home_dir_prefers_home_over_userprofile() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let home = test_dir("user-home-home");
+        let userprofile = test_dir("user-home-userprofile");
+
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &userprofile);
+
+        assert_eq!(user_home_dir_path().as_deref(), Some(home.as_path()));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_userprofile {
+            std::env::set_var("USERPROFILE", value);
+        } else {
+            std::env::remove_var("USERPROFILE");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_home_dir_falls_back_to_userprofile_on_windows() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let userprofile = test_dir("user-home-userprofile-fallback");
+
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", &userprofile);
+
+        assert_eq!(user_home_dir_path().as_deref(), Some(userprofile.as_path()));
 
         if let Some(value) = old_home {
             std::env::set_var("HOME", value);

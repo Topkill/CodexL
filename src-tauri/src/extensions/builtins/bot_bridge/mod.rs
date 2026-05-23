@@ -5028,7 +5028,7 @@ impl AppServerBridge {
     }
 
     fn create_projectless_cwd(&self, prompt_seed: &str) -> Result<String, String> {
-        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+        let home = super::user_home_dir().ok_or_else(|| "home directory is not set".to_string())?;
         let seconds = unix_seconds();
         let (year, month, day) = utc_date_from_unix_seconds(seconds);
         let date = format!("{:04}-{:02}-{:02}", year, month, day);
@@ -5038,7 +5038,7 @@ impl AppServerBridge {
         } else {
             prompt_slug
         };
-        let dir = PathBuf::from(home)
+        let dir = home
             .join("Documents")
             .join("Codex")
             .join(date)
