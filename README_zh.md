@@ -13,6 +13,7 @@ CodexL 面向需要同时维护多个 Codex 工作空间的本地开发者。它
 主要能力：
 
 - 管理多个 Codex workspace，并为非默认 workspace 生成独立的 Codex home。
+- 如果使用默认工作区，可能会更改你的用户目录下的全局codex配置，建议新建一个工作区使用
 - 启动 Codex App 时注入 CDP、CLI middleware、模型供应商、代理和语言等运行参数。
 - 为 workspace 启动手机远控服务，支持 LAN QR URL、访问 token、可选密码和云中继端到端加密。
 - 内置 Bot Gateway 和 NeXT AI Gateway 扩展，用于连接 IM 平台或将其他协议接口转换给 Codex 使用。
@@ -143,7 +144,9 @@ https://github.com/musistudio/codexl/releases/latest/download/latest.json
 | --- | --- | --- |
 | `CODEXL_CONFIG_PATH` | `~/.codexl/config.json` | 覆盖 CodexL 配置文件路径。 |
 | `CODEXL_CODEX_HOME` / `CODEX_HOME` | `~/.codex` | 覆盖默认 Codex home。 |
-| `CODEXL_CODEX_PATH` | 空 | 手动指定 Codex App 可执行文件路径。 |
+| `CODEXL_CODEX_PATH` | 空 | 指定 Codex App 可执行文件路径。如果有此环境变量，会覆盖`~/.codexl/config.json`  中手动填写的  `codex_path` 的值。优先级: `CODEXL_CODEX_PATH` > `config.json` 里的 `codex_path` |
+| `CODEXL_REAL_CODEX_CLI_PATH` | 空 | 指定Codex Cli的可执行文件路径。优先级: `CODEXL_REAL_CODEX_CLI_PATH` > `CODEX_CLI_PATH >` 由传入的 Codex App 路径推导出来的  CLI路径 |
+| `CODEX_CLI_PATH` | 空 | 指定Codex Cli的可执行文件路径。优先级: `CODEXL_REAL_CODEX_CLI_PATH` > `CODEX_CLI_PATH` > 由传入的 Codex App 路径推导出来的 CLI路径 |
 | `CODEXL_CDP_HOST` | `127.0.0.1` | Codex CDP host。 |
 | `CODEXL_CDP_PORT` | `9222` | Codex CDP 起始端口。 |
 | `CODEXL_HTTP_HOST` | `0.0.0.0` | 本地 HTTP 代理 host。 |
