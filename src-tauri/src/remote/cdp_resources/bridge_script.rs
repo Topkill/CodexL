@@ -1337,6 +1337,184 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
 	    return pendingResponse;
 	  }
 
+  function deliverCodexLPluginBridgeResponse(response, fallbackId = null) {
+    const normalized =
+      response && typeof response === "object"
+        ? response
+        : {
+            id: fallbackId,
+            ok: false,
+            error: "Invalid CodexL plugin bridge response",
+          };
+    const deliver = () => {
+      const runtime = window.__codexlPluginRuntime;
+      if (!runtime || typeof runtime.acceptCdpResponse !== "function") {
+        return false;
+      }
+      runtime.acceptCdpResponse(normalized);
+      return true;
+    };
+    if (!deliver()) {
+      window.setTimeout(deliver, 0);
+    }
+  }
+
+  function installCodexLPluginBridge() {
+    if (window.__codexlPluginBridge?.__codexlRemoteWebBridge) {
+      return;
+    }
+    const bridge = (raw) => {
+      let pluginRequest;
+      let pluginRequestId = null;
+      try {
+        pluginRequest = JSON.parse(String(raw || "{}"));
+        if (pluginRequest && pluginRequest.id != null) {
+          pluginRequestId = String(pluginRequest.id);
+        }
+      } catch (error) {
+        deliverCodexLPluginBridgeResponse({
+          id: null,
+          ok: false,
+          error: `Invalid CodexL plugin request: ${error?.message || String(error)}`,
+        });
+        return false;
+      }
+      void sendBridgeRequest({
+        type: "codexl-plugin-bridge",
+        pluginRequest,
+      })
+        .then((payload) => {
+          deliverCodexLPluginBridgeResponse(payload?.codexlPluginResponse, pluginRequestId);
+        })
+        .catch((error) => {
+          deliverCodexLPluginBridgeResponse({
+            id: pluginRequestId,
+            ok: false,
+            error: error?.message || String(error),
+          });
+        });
+      return true;
+    };
+    try {
+      Object.defineProperty(bridge, "__codexlRemoteWebBridge", {
+        configurable: true,
+        value: true,
+      });
+      Object.defineProperty(window, "__codexlPluginBridge", {
+        configurable: true,
+        value: bridge,
+        writable: true,
+      });
+    } catch {
+      bridge.__codexlRemoteWebBridge = true;
+      window.__codexlPluginBridge = bridge;
+    }
+  }
+
+  function codexLCurrentBridgeScriptUrl() {
+    const current = document.currentScript;
+    if (current?.src) {
+      return current.src;
+    }
+    const scripts = Array.from(document.scripts || []).reverse();
+    const bridgeScript = scripts.find((script) =>
+      /(?:^|\/)_(?:codexl_)?bridge\.js(?:[?#]|$)/.test(script.src || "")
+    );
+    return bridgeScript?.src || "";
+  }
+
+  function codexLPluginRuntimeScriptUrl() {
+    const configuredUrl =
+      pageParams.get("codexlPluginRuntimeUrl") || pageParams.get("codexlRuntimeUrl");
+    if (configuredUrl) {
+      try {
+        return new URL(configuredUrl, window.location.href).toString();
+      } catch {}
+    }
+    const bridgeScriptUrl = codexLCurrentBridgeScriptUrl();
+    if (bridgeScriptUrl) {
+      try {
+        const url = new URL(bridgeScriptUrl, window.location.href);
+        url.search = "";
+        url.hash = "";
+        if (url.pathname.endsWith("/_codexl_bridge.js")) {
+          url.pathname = url.pathname.replace(/_codexl_bridge\.js$/, "_codexl_plugin.js");
+          return url.toString();
+        }
+        if (url.pathname.endsWith("/_bridge.js")) {
+          url.pathname = url.pathname.replace(/_bridge\.js$/, "_codexl_plugin.js");
+          return url.toString();
+        }
+        return new URL("_codexl_plugin.js", url).toString();
+      } catch {}
+    }
+    try {
+      return new URL("./_codexl_plugin.js", window.location.href).toString();
+    } catch {
+      return "";
+    }
+  }
+
+  function codexLScriptUrlKey(src) {
+    try {
+      const url = new URL(src, window.location.href);
+      url.search = "";
+      url.hash = "";
+      return url.toString();
+    } catch {
+      return String(src || "").split('#')[0].split('?')[0];
+    }
+  }
+
+  function hasCodexLPluginRuntimeScript(src) {
+    if (window.__codexlPluginRuntime && !window.__codexlPluginRuntime.closed) {
+      return true;
+    }
+    const targetKey = codexLScriptUrlKey(src);
+    return Array.from(document.scripts || []).some((script) => {
+      const scriptSrc = script.src || script.getAttribute("src") || "";
+      if (!scriptSrc) {
+        return false;
+      }
+      if (script.dataset?.codexlRuntime === "plugin") {
+        return true;
+      }
+      if (codexLScriptUrlKey(scriptSrc) === targetKey) {
+        return true;
+      }
+      return /(?:^|\/)_codexl_plugin\.js(?:[?#]|$)/.test(scriptSrc);
+    });
+  }
+
+  function escapeCodexLHtmlAttribute(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;");
+  }
+
+  function installCodexLPluginRuntimeEntry() {
+    if (window.__codexlPluginRuntimeEntryInstalled) {
+      return;
+    }
+    const src = codexLPluginRuntimeScriptUrl();
+    if (!src || hasCodexLPluginRuntimeScript(src)) {
+      return;
+    }
+    window.__codexlPluginRuntimeEntryInstalled = true;
+    if (document.readyState === "loading" && document.currentScript) {
+      document.write(
+        `<script src="${escapeCodexLHtmlAttribute(src)}" data-codexl-runtime="plugin"><\/script>`
+      );
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = false;
+    script.dataset.codexlRuntime = "plugin";
+    (document.head || document.documentElement).appendChild(script);
+  }
+
   const LUCIDE_ICON_PATHS = {
     alertCircle: [
       ["circle", { cx: "12", cy: "12", r: "10" }],
@@ -2452,6 +2630,8 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
     void forwardToCodexHost(event.detail);
   });
 
+  installCodexLPluginBridge();
+  installCodexLPluginRuntimeEntry();
   bridgeConnectionStarted = true;
   void warmBridgeConnection();
 })();

@@ -33,10 +33,13 @@ pub(crate) use bridge::{
     is_web_bridge_socket_heartbeat, parse_web_bridge_socket_message, web_bridge_socket_response,
 };
 pub(crate) use file_picker::{dispatch_web_file_picker_message, is_web_file_picker_message};
+pub(crate) use plugin_runtime::{
+    dispatch_plugin_bridge_message, is_plugin_bridge_message, renderer_core_plugin_bool_setting,
+    SHOW_ALL_SESSIONS_KEY,
+};
 pub use plugin_runtime::{
     handle_plugin_bridge_websocket, plugin_bridge_token_valid, spawn_codex_plugin_injector,
 };
-pub(crate) use plugin_runtime::{renderer_core_plugin_bool_setting, SHOW_ALL_SESSIONS_KEY};
 pub use resource::{
     dispatch_web_resource_socket_payload, get_web_resource, handle_web_resource_websocket,
 };
@@ -64,6 +67,7 @@ use resource::{
 const CDP_COMMAND_TIMEOUT_MS: u64 = 15000;
 const DEBUG_RESOURCE_SAMPLE_LIMIT: usize = 12;
 const WEB_BRIDGE_SCRIPT_PATH: &str = "_bridge.js";
+const WEB_PLUGIN_RUNTIME_SCRIPT_PATH: &str = "_codexl_plugin.js";
 const WEB_FILE_PICKER_LIST_MESSAGE: &str = "web-file-picker-list";
 const WEB_FILE_PICKER_ENTRY_LIMIT: usize = 500;
 const WEB_RESOURCE_SOCKET_PATH: &str = "_resource";

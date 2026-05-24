@@ -55,11 +55,23 @@ dist/codex-app-web/
   26.513.31313/assets/...
 ```
 
-`index.html` is prepared for static hosting: the existing CodexL web bridge is
-injected before the Codex module bundle, CSP placeholders are removed, and root
-asset URLs are made relative to the version directory. `latest/index.html`
+`index.html` is prepared for static hosting: the CodexL web bridge is injected
+before the Codex module bundle, CSP placeholders are removed, and root asset
+URLs are made relative to the version directory. The bridge then loads the
+CodexL plugin runtime from the same stable runtime base. `latest/index.html`
 redirects to the newest extracted version while preserving the remote bridge
 query string.
+
+The injected CodexL runtime is intentionally outside the versioned Codex App
+bundle. By default, versioned pages load `../codexl-runtime/_codexl_bridge.js`,
+which in turn loads `../codexl-runtime/_codexl_plugin.js`, so bridge or plugin
+fixes can be published by replacing only the small `codexl-runtime/` files. To
+host the runtime from a separate project or domain, pass `--runtime-base-url`
+during extraction or publishing:
+
+```sh
+pnpm run publish:codex-web -- --runtime-base-url https://codexl-runtime.example.com
+```
 
 Publish the registry to Cloudflare Pages:
 

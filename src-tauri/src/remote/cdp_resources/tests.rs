@@ -119,6 +119,7 @@ fn injects_web_bridge_before_module_script() {
     let bridge_index = injected.find(WEB_BRIDGE_SCRIPT_PATH).unwrap();
     let module_index = injected.find("type=\"module\"").unwrap();
     assert!(bridge_index < module_index);
+    assert!(!injected.contains(WEB_PLUGIN_RUNTIME_SCRIPT_PATH));
 }
 
 #[test]
@@ -127,6 +128,7 @@ fn injects_web_bridge_only_once() {
     let injected = inject_web_bridge_script(html, None);
 
     assert_eq!(injected.matches(WEB_BRIDGE_SCRIPT_PATH).count(), 1);
+    assert!(!injected.contains(WEB_PLUGIN_RUNTIME_SCRIPT_PATH));
 }
 
 #[test]
@@ -142,6 +144,7 @@ fn injects_web_bridge_with_auth_query() {
     assert!(injected.contains(
         r#"<script src="/web/_bridge.js?hostId=local&token=secret&cloudUser=user-1&jwt=jwt-1"></script>"#
     ));
+    assert!(!injected.contains(WEB_PLUGIN_RUNTIME_SCRIPT_PATH));
     assert!(!injected.contains("codexBridgeUrl"));
     assert!(!injected.contains("transport=auto"));
 }
@@ -158,6 +161,19 @@ fn web_bridge_script_polyfills_random_uuid_before_app_bundle_runs() {
     assert!(polyfill_index < installed_guard_index);
     assert!(WEB_BRIDGE_SCRIPT.contains("Object.defineProperty(target, \"randomUUID\""));
     assert!(WEB_BRIDGE_SCRIPT.contains("cryptoObject.getRandomValues(bytes)"));
+}
+
+#[test]
+fn web_bridge_script_installs_codexl_plugin_bridge_shim() {
+    assert!(WEB_BRIDGE_SCRIPT.contains("installCodexLPluginBridge();"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("installCodexLPluginRuntimeEntry();"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("window.__codexlPluginBridge"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codexl-plugin-bridge"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codexlPluginResponse"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("_codexl_plugin.js"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codexlPluginRuntimeUrl"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codexlRuntimeUrl"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("document.write"));
 }
 
 #[test]
@@ -664,6 +680,9 @@ fn web_cache_manifest_extracts_html_assets() {
 
     assert!(paths.contains(&"/web/index.html?hostId=local".to_string()));
     assert!(paths.contains(&"/web/_bridge.js".to_string()));
+    assert!(paths
+        .iter()
+        .any(|path| path.starts_with("/web/_codexl_plugin.js?v=")));
     assert!(paths.contains(&"/web/assets/index.js".to_string()));
     assert!(paths.contains(&"/web/assets/app.css".to_string()));
 }
