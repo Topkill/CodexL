@@ -1852,7 +1852,8 @@ function App() {
         return;
       }
 
-      const startRemote = options.startRemote ?? profile.start_remote_on_launch;
+      const usesCliMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode) === "cli";
+      const startRemote = usesCliMode ? true : options.startRemote ?? profile.start_remote_on_launch;
       const startCloud = startRemote
         ? options.startCloud ?? profile.start_remote_cloud_on_launch
         : false;
@@ -2499,6 +2500,7 @@ function ProfileCard({
         <LaunchMenuButton
           isRunning={isRunning}
           options={remoteLaunchOptions}
+          remoteRequired={remoteFrontendMode === "cli"}
           onToggleProfile={() => onToggleProfile(profile, remoteLaunchOptions)}
           onOptionsChange={(options) => {
             onRemoteLaunchOptionsChange(profile.name, options).catch(onError);
@@ -2536,6 +2538,7 @@ function ProfileCard({
 type LaunchMenuButtonProps = {
   isRunning: boolean;
   options: RemoteLaunchOptions;
+  remoteRequired: boolean;
   onToggleProfile: () => Promise<void>;
   onOptionsChange: (options: Partial<RemoteLaunchOptions>) => void;
   onError: (error: unknown) => void;
@@ -2544,6 +2547,7 @@ type LaunchMenuButtonProps = {
 function LaunchMenuButton({
   isRunning,
   options,
+  remoteRequired,
   onToggleProfile,
   onOptionsChange,
   onError,
@@ -2607,8 +2611,12 @@ function LaunchMenuButton({
             </div>
             <Switch
               checked={startRemote}
+              disabled={remoteRequired}
               aria-label={strings.startRemoteWithInstance}
-              onCheckedChange={(checked) => onOptionsChange({ startRemote: checked === true })}
+              onCheckedChange={(checked) => {
+                if (remoteRequired) return;
+                onOptionsChange({ startRemote: checked === true });
+              }}
             />
           </div>
           {startRemote ? (

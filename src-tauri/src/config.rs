@@ -870,8 +870,12 @@ impl AppConfig {
             return Err(format!("Provider profile not found: {}", profile_name));
         };
 
-        profile.start_remote_on_launch = enabled;
-        if !enabled {
+        let uses_cli_mode = normalized_remote_frontend_mode(&profile.remote_frontend_mode)
+            == REMOTE_FRONTEND_MODE_CLI;
+        let next_enabled = enabled || uses_cli_mode;
+
+        profile.start_remote_on_launch = next_enabled;
+        if !next_enabled {
             profile.start_remote_cloud_on_launch = false;
             profile.start_remote_e2ee_on_launch = false;
         }
@@ -894,7 +898,9 @@ impl AppConfig {
             return Err(format!("Provider profile not found: {}", profile_name));
         };
 
-        let next_start_remote = start_remote;
+        let uses_cli_mode = normalized_remote_frontend_mode(&profile.remote_frontend_mode)
+            == REMOTE_FRONTEND_MODE_CLI;
+        let next_start_remote = start_remote || uses_cli_mode;
         let next_start_cloud = next_start_remote && start_cloud;
         let next_start_e2ee = next_start_remote && next_start_cloud;
         let next_password = if next_start_e2ee {
@@ -2294,6 +2300,11 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
             profile.start_remote_e2ee_on_launch = start_remote_e2ee_on_launch;
             profile.remote_e2ee_password = remote_e2ee_password;
         }
+        if normalized_remote_frontend_mode(&profile.remote_frontend_mode)
+            == REMOTE_FRONTEND_MODE_CLI
+        {
+            profile.start_remote_on_launch = true;
+        }
         if !profile.start_remote_on_launch {
             profile.start_remote_cloud_on_launch = false;
         }
@@ -3475,6 +3486,82 @@ model_provider = "old-provider"
             std::env::remove_var("CODEXL_CONFIG_PATH");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_remote_launch_options_keep_remote_enabled() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("cli-remote-keeps-enabled");
+        let old_home = std::env::var("HOME").ok();
+        let old_config_path = std::env::var("CODEXL_CONFIG_PATH").ok();
+
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEXL_CONFIG_PATH", root.join("config.json"));
+
+        let mut config = AppConfig {
+            provider_profiles: vec![ProviderProfile {
+                name: "workspace".to_string(),
+                codex_profile_name: "workspace".to_string(),
+                provider_name: "provider".to_string(),
+                model: "model".to_string(),
+                remote_frontend_mode: REMOTE_FRONTEND_MODE_CLI.to_string(),
+                start_remote_on_launch: true,
+                ..ProviderProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config
+            .set_remote_launch_options("workspace", false, false, None)
+            .expect("CLI mode remote cannot be disabled");
+        let profile = config
+            .provider_profile("workspace")
+            .expect("workspace profile");
+        assert!(profile.start_remote_on_launch);
+        assert!(!profile.start_remote_cloud_on_launch);
+        assert!(!profile.start_remote_e2ee_on_launch);
+
+        config
+            .set_start_remote_on_launch("workspace", false)
+            .expect("CLI mode remote stays enabled");
+        let profile = config
+            .provider_profile("workspace")
+            .expect("workspace profile");
+        assert!(profile.start_remote_on_launch);
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_config_path {
+            std::env::set_var("CODEXL_CONFIG_PATH", value);
+        } else {
+            std::env::remove_var("CODEXL_CONFIG_PATH");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalize_for_cli_mode_forces_remote_enabled() {
+        let mut config = AppConfig {
+            provider_profiles: vec![ProviderProfile {
+                name: "workspace".to_string(),
+                codex_profile_name: "workspace".to_string(),
+                provider_name: "provider".to_string(),
+                model: "model".to_string(),
+                remote_frontend_mode: REMOTE_FRONTEND_MODE_CLI.to_string(),
+                start_remote_on_launch: false,
+                ..ProviderProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        config.normalize();
+        let profile = config
+            .provider_profile("workspace")
+            .expect("workspace profile");
+        assert!(profile.start_remote_on_launch);
     }
 
     #[test]
