@@ -173,6 +173,7 @@ fn web_bridge_script_installs_codexl_plugin_bridge_shim() {
     assert!(WEB_BRIDGE_SCRIPT.contains("_codexl_plugin.js"));
     assert!(WEB_BRIDGE_SCRIPT.contains("codexlPluginRuntimeUrl"));
     assert!(WEB_BRIDGE_SCRIPT.contains("codexlRuntimeUrl"));
+    assert!(WEB_BRIDGE_SCRIPT.contains("codexlRuntimeBaseUrl"));
     assert!(WEB_BRIDGE_SCRIPT.contains("document.write"));
 }
 

@@ -90,7 +90,9 @@ CODEXL_REMOTE_WEB_ASSET_VERSION=latest
 Remote connection URLs include `webAssetBaseUrl` and `webAssetVersion`. QR
 codes keep only the short token URL; after connecting, the control page reads
 the registry metadata from `/api/remote-info`, loads that hosted bundle by
-default, and shows a bundle selector when the registry exposes `versions.json`.
+default, resolves the selected bundle manifest to pass the current CodexL
+runtime URL into the iframe, and shows a bundle selector when the registry
+exposes `versions.json`.
 
 Camera scanning requires a browser secure context, such as HTTPS or localhost.
 The PWA uses the browser's native QR detector when available and falls back to

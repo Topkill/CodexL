@@ -1431,6 +1431,16 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
         return new URL(configuredUrl, window.location.href).toString();
       } catch {}
     }
+    const configuredBaseUrl = pageParams.get("codexlRuntimeBaseUrl");
+    if (configuredBaseUrl) {
+      try {
+        const baseUrl = new URL(
+          configuredBaseUrl.endsWith("/") ? configuredBaseUrl : `${configuredBaseUrl}/`,
+          window.location.href
+        );
+        return new URL("_codexl_plugin.js", baseUrl).toString();
+      } catch {}
+    }
     const bridgeScriptUrl = codexLCurrentBridgeScriptUrl();
     if (bridgeScriptUrl) {
       try {
