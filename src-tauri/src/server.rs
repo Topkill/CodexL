@@ -74,6 +74,7 @@ pub struct LaunchInfo {
     pub proxy_url: String,
     pub profile_name: String,
     pub cli_stdio_path: Option<String>,
+    pub core_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +90,7 @@ pub struct InstanceStatus {
     pub proxy_url: String,
     pub profile_name: String,
     pub cli_stdio_path: Option<String>,
+    pub core_mode: String,
     pub remote_control: Option<remote::RemoteControlInfo>,
 }
 
@@ -193,6 +195,9 @@ pub async fn launch_codex_instance(
     let active_cli_model_provider = requested_config.active_cli_model_provider();
     let active_provider_profile =
         requested_config.provider_profile(&requested_config.active_provider);
+    let active_core_mode = active_provider_profile
+        .as_ref()
+        .map(|profile| profile.remote_frontend_mode.as_str());
     if requested_config.extensions.enabled
         && requested_config.extensions.next_ai_gateway_enabled
         && active_provider_profile
@@ -225,6 +230,7 @@ pub async fn launch_codex_instance(
         Some(&requested_config.active_provider),
         active_cli_profile.as_deref(),
         active_cli_model_provider.as_deref(),
+        active_core_mode,
         active_provider_profile
             .as_ref()
             .map(|profile| profile.proxy_url.as_str()),
@@ -297,11 +303,16 @@ fn requires_new_process(current: &LaunchInfo, requested: &AppConfig) -> bool {
         .provider_profile(&requested.active_provider)
         .map(|profile| profile.proxy_url)
         .unwrap_or_default();
+    let requested_core_mode = requested
+        .provider_profile(&requested.active_provider)
+        .map(|profile| config::normalized_remote_frontend_mode(&profile.remote_frontend_mode))
+        .unwrap_or_else(|| config::REMOTE_FRONTEND_MODE_APP.to_string());
 
     current.profile_name != requested.active_provider
         || current.codex_home != requested.codex_home
         || current.codex_path != requested.codex_path
         || current.proxy_url.trim() != requested_proxy_url.trim()
+        || current.core_mode != requested_core_mode
 }
 
 pub async fn stop_codex_instance(
@@ -376,6 +387,7 @@ pub async fn instance_statuses(state: &AppState) -> Result<Vec<InstanceStatus>, 
                 codex_home: info.codex_home,
                 proxy_url: info.proxy_url,
                 cli_stdio_path: info.cli_stdio_path,
+                core_mode: info.core_mode,
                 remote_control,
                 profile_name: info.profile_name,
             }
@@ -407,6 +419,12 @@ pub async fn instance_statuses(state: &AppState) -> Result<Vec<InstanceStatus>, 
             codex_home,
             proxy_url,
             cli_stdio_path: None,
+            core_mode: profile
+                .as_ref()
+                .map(|profile| {
+                    config::normalized_remote_frontend_mode(&profile.remote_frontend_mode)
+                })
+                .unwrap_or_else(|| config::REMOTE_FRONTEND_MODE_APP.to_string()),
             remote_control: Some(remote_control),
             profile_name,
         });
@@ -1097,6 +1115,7 @@ fn launch_info_from_instance(info: &LaunchInfo, pid: Option<u32>) -> LaunchInfo 
         proxy_url: info.proxy_url.clone(),
         profile_name: info.profile_name.clone(),
         cli_stdio_path: info.cli_stdio_path.clone(),
+        core_mode: info.core_mode.clone(),
     }
 }
 
@@ -1116,6 +1135,10 @@ fn launch_info(config: &AppConfig, pid: Option<u32>, cli_stdio_path: Option<Stri
             .unwrap_or_default(),
         profile_name: config.active_provider.clone(),
         cli_stdio_path,
+        core_mode: config
+            .provider_profile(&config.active_provider)
+            .map(|profile| config::normalized_remote_frontend_mode(&profile.remote_frontend_mode))
+            .unwrap_or_else(|| config::REMOTE_FRONTEND_MODE_APP.to_string()),
     }
 }
 

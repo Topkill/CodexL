@@ -475,6 +475,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "rand",
  "reqwest 0.12.28",
  "ring",

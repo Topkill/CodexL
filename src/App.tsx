@@ -262,7 +262,7 @@ const DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL = "https://codexl-codex-app-web.pages
 const DEFAULT_CODEX_WEB_ASSET_VERSION = "latest";
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 
-type RemoteFrontendMode = "app" | "cli";
+type RemoteFrontendMode = "app" | "cli" | "claude-code";
 
 type ProviderProfile = {
   id: string;
@@ -448,6 +448,7 @@ type LaunchInfo = {
   proxy_url: string;
   profile_name: string;
   cli_stdio_path: string | null;
+  core_mode: RemoteFrontendMode | string;
 };
 
 type RemoteControlInfo = {
@@ -802,6 +803,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     remoteFrontendMode: t("instanceDialog.remoteFrontendMode"),
     remoteFrontendApp: t("instanceDialog.remoteFrontendApp"),
     remoteFrontendCli: t("instanceDialog.remoteFrontendCli"),
+    remoteFrontendClaudeCode: t("instanceDialog.remoteFrontendClaudeCode"),
     codexAppDetected: (path: string) => t("instanceDialog.codexAppDetected", { path }),
     codexAppNotFound: t("instanceDialog.codexAppNotFound"),
     registryUrl: t("instanceDialog.registryUrl"),
@@ -1568,7 +1570,7 @@ function App() {
       let savedBot: BotProfileConfig | null = null;
       const extensionsEnabled = botExtensionsEnabled(config.extensions);
 
-      if (providerMode === "none") {
+      if (providerMode === "none" || form.remoteFrontendMode === "claude-code") {
         const provider = readWorkspaceProviderForm(
           form,
           workspaceNameInputRef,
@@ -1748,7 +1750,7 @@ function App() {
 
   const launchProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
-      const usesCliMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode) === "cli";
+      const usesCliMode = remoteFrontendModeUsesCli(profile.remote_frontend_mode);
       const startRemote = options.startRemote === true || usesCliMode;
       const startCloud = startRemote && options.startCloud === true;
       const requireE2ee = startCloud;
@@ -2087,7 +2089,7 @@ function App() {
           <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             {filteredProfiles.map((profile) => {
               const status = instanceStatuses.get(profile.name) || null;
-              const usesCliMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode) === "cli";
+              const usesCliMode = remoteFrontendModeUsesCli(profile.remote_frontend_mode);
               return (
                 <ProfileCard
                   key={profile.name}
@@ -2456,15 +2458,19 @@ function ProfileCard({
           </div>
         ) : null}
         <div className="flex items-center gap-3 text-sm text-muted-foreground">
-          {remoteFrontendMode === "cli" ? (
+          {remoteFrontendMode === "claude-code" ? (
+            <Cpu className="w-4 h-4 shrink-0" />
+          ) : remoteFrontendModeUsesCli(remoteFrontendMode) ? (
             <Terminal className="w-4 h-4 shrink-0" />
           ) : (
             <Monitor className="w-4 h-4 shrink-0" />
           )}
           <span className="truncate text-foreground">
-            {remoteFrontendMode === "cli"
-              ? `${strings.remoteFrontendCli} / ${profile.remote_web_asset_version || DEFAULT_CODEX_WEB_ASSET_VERSION}`
-              : strings.remoteFrontendApp}
+            {remoteFrontendMode === "claude-code"
+              ? strings.remoteFrontendClaudeCode
+              : remoteFrontendMode === "cli"
+                ? `${strings.remoteFrontendCli} / ${profile.remote_web_asset_version || DEFAULT_CODEX_WEB_ASSET_VERSION}`
+                : strings.remoteFrontendApp}
           </span>
         </div>
         {profile.codex_home ? (
@@ -4156,9 +4162,11 @@ function SettingsDialog({
   const selectedBotConfigId = availableBotConfigs.some((item) => item.id === form.botConfigId)
     ? form.botConfigId
     : BOT_CONFIG_CUSTOM_VALUE;
-  const newProviderActive = providerMode === "new" || providerMode === "gateway";
+  const claudeCodeMode = form.remoteFrontendMode === "claude-code";
+  const newProviderActive = !claudeCodeMode && (providerMode === "new" || providerMode === "gateway");
   const isEditingDefaultWorkspace = dialogMode === "edit" && editingProfileName === "Default";
   const canChangeProviderMode = dialogMode === "add" || dialogMode === "edit";
+  const showProviderModeSelector = canChangeProviderMode && !claudeCodeMode;
   const [wifiScan, setWifiScan] = useState<BotHandoffScanState>(emptyHandoffScanState);
   const [bluetoothScan, setBluetoothScan] = useState<BotHandoffScanState>(emptyHandoffScanState);
   const autoHandoffScanRef = useRef(false);
@@ -4212,7 +4220,7 @@ function SettingsDialog({
   }, [form.botEnabled, form.botHandoffEnabled, scanHandoffTargets]);
 
   useEffect(() => {
-    if (form.remoteFrontendMode !== "cli") {
+    if (!remoteFrontendModeUsesCli(form.remoteFrontendMode)) {
       return;
     }
     const registryUrl = normalizeRegistryUrl(form.remoteWebAssetRegistryUrl);
@@ -4289,7 +4297,7 @@ function SettingsDialog({
             {settingsError}
           </p>
         ) : null}
-        {canChangeProviderMode ? (
+        {showProviderModeSelector ? (
           <div className="bg-background border border-border rounded-md grid grid-cols-3 p-0.5">
             <Button
               variant={providerMode === "none" ? "secondary" : "ghost"}
@@ -4363,7 +4371,7 @@ function SettingsDialog({
         <div className="flex flex-col gap-3.5">
           <div className="flex flex-col gap-1.5">
             <Label>{strings.remoteFrontendMode}</Label>
-            <div className="bg-background border border-border rounded-md grid grid-cols-2 p-0.5">
+            <div className="bg-background border border-border rounded-md grid grid-cols-3 p-0.5">
               <Button
                 type="button"
                 variant={form.remoteFrontendMode === "app" ? "secondary" : "ghost"}
@@ -4395,6 +4403,22 @@ function SettingsDialog({
                 <Terminal className="h-3.5 w-3.5" />
                 {strings.remoteFrontendCli}
               </Button>
+              <Button
+                type="button"
+                variant={form.remoteFrontendMode === "claude-code" ? "secondary" : "ghost"}
+                size="sm"
+                className={cn(
+                  "shadow-none",
+                  form.remoteFrontendMode !== "claude-code" && "text-muted-foreground hover:bg-transparent",
+                )}
+                onClick={() => {
+                  onSetForm((current) => ({ ...current, remoteFrontendMode: "claude-code" }));
+                  onSelectProviderMode("none");
+                }}
+              >
+                <Cpu className="h-3.5 w-3.5" />
+                {strings.remoteFrontendClaudeCode}
+              </Button>
             </div>
             {form.remoteFrontendMode === "app" ? (
               <p
@@ -4406,7 +4430,7 @@ function SettingsDialog({
             ) : null}
           </div>
 
-          {form.remoteFrontendMode === "cli" ? (
+          {remoteFrontendModeUsesCli(form.remoteFrontendMode) ? (
             <div className="grid gap-3.5 sm:grid-cols-[minmax(0,1fr)_180px]">
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="remoteWebAssetRegistryUrlInput">{strings.registryUrl}</Label>
@@ -4462,7 +4486,7 @@ function SettingsDialog({
           ) : null}
         </div>
 
-        {providerMode === "existing" ? (
+        {!claudeCodeMode && providerMode === "existing" ? (
           <div className="flex flex-col gap-3.5">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="existingProviderSelect">{strings.provider}</Label>
@@ -5720,7 +5744,23 @@ async function copyText(text: string) {
 }
 
 function normalizeRemoteFrontendMode(value: unknown): RemoteFrontendMode {
-  return typeof value === "string" && value.trim().toLowerCase() === "cli" ? "cli" : "app";
+  if (typeof value !== "string") {
+    return "app";
+  }
+  switch (value.trim().toLowerCase()) {
+    case "cli":
+      return "cli";
+    case "claude-code":
+    case "claude_code":
+    case "claude code":
+      return "claude-code";
+    default:
+      return "app";
+  }
+}
+
+function remoteFrontendModeUsesCli(mode: RemoteFrontendMode | string) {
+  return normalizeRemoteFrontendMode(mode) === "cli";
 }
 
 function compactRemoteQrUrl(value: string) {
@@ -5781,9 +5821,9 @@ function readRemoteFrontendConfig(
   remote_web_asset_version: string;
 } | null {
   const mode = normalizeRemoteFrontendMode(form.remoteFrontendMode);
-  if (mode === "app") {
+  if (mode === "app" || mode === "claude-code") {
     return {
-      remote_frontend_mode: "app",
+      remote_frontend_mode: mode,
       remote_web_asset_registry_url: normalizeRegistryUrl(form.remoteWebAssetRegistryUrl),
       remote_web_asset_version: form.remoteWebAssetVersion.trim() || DEFAULT_CODEX_WEB_ASSET_VERSION,
     };
@@ -5825,7 +5865,7 @@ function readRemoteFrontendConfig(
   }
 
   return {
-    remote_frontend_mode: "cli",
+    remote_frontend_mode: mode,
     remote_web_asset_registry_url: registryUrl,
     remote_web_asset_version: version,
   };

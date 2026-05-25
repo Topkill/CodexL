@@ -65,6 +65,7 @@ pub fn launch_codex(
     stdio_name: Option<&str>,
     codex_profile: Option<&str>,
     codex_model_provider: Option<&str>,
+    core_mode: Option<&str>,
     proxy_url: Option<&str>,
     bot_config: Option<&BotProfileConfig>,
     language: Option<&str>,
@@ -90,6 +91,7 @@ pub fn launch_codex(
             stdio_name,
             codex_profile,
             codex_model_provider,
+            core_mode,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         cli_stdio_path = Some(middleware.stdio_path.to_string_lossy().to_string());
@@ -105,6 +107,9 @@ pub fn launch_codex(
         }
         if let Some(model_provider) = middleware.model_provider {
             command.env(cli_middleware::CODEX_MODEL_PROVIDER_ENV, model_provider);
+        }
+        if let Some(core_mode) = middleware.core_mode {
+            command.env(cli_middleware::CODEX_CORE_MODE_ENV, core_mode);
         }
     }
 
@@ -461,9 +466,10 @@ fn collect_descendant_pids(entries: &[ProcessEntry], root_pid: u32, pids: &mut B
 
 #[cfg(unix)]
 fn is_codex_app_server_for_profile(command: &str, profile_name: &str) -> bool {
-    command.contains(" app-server")
+    (command.contains(" app-server")
         && command_matches_profile(command, profile_name)
-        && command.contains(".app/Contents/Resources/codex")
+        && command.contains(".app/Contents/Resources/codex"))
+        || is_claude_code_app_server_for_profile(command, profile_name)
 }
 
 #[cfg(unix)]
@@ -477,7 +483,14 @@ fn command_matches_profile(command: &str, profile_name: &str) -> bool {
 
 #[cfg(unix)]
 fn is_codexl_middleware_command(command: &str) -> bool {
-    command.contains("--codexl-cli-middleware") && command.contains("app-server")
+    (command.contains("--codexl-cli-middleware") && command.contains("app-server"))
+        || command.contains("--codexl-claude-code-app-server")
+}
+
+#[cfg(unix)]
+fn is_claude_code_app_server_for_profile(command: &str, profile_name: &str) -> bool {
+    command.contains("--codexl-claude-code-app-server")
+        && command.contains(&format!("--workspace-name {}", profile_name))
 }
 
 #[cfg(unix)]

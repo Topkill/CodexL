@@ -9,6 +9,7 @@ use crate::extensions::builtins::gateway::config as gateway_config;
 pub const DEFAULT_PROVIDER_PROFILE_NAME: &str = "Default";
 pub const REMOTE_FRONTEND_MODE_APP: &str = "app";
 pub const REMOTE_FRONTEND_MODE_CLI: &str = "cli";
+pub const REMOTE_FRONTEND_MODE_CLAUDE_CODE: &str = "claude-code";
 pub const BOT_PLATFORM_NONE: &str = "none";
 pub const BOT_PLATFORM_SLACK: &str = "slack";
 pub const BOT_PLATFORM_DISCORD: &str = "discord";
@@ -2495,8 +2496,13 @@ fn workspace_name_or_default(workspace_name: &str, fallback: &str) -> Result<Str
 pub fn normalized_remote_frontend_mode(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         REMOTE_FRONTEND_MODE_CLI => REMOTE_FRONTEND_MODE_CLI.to_string(),
+        REMOTE_FRONTEND_MODE_CLAUDE_CODE => REMOTE_FRONTEND_MODE_CLAUDE_CODE.to_string(),
         _ => REMOTE_FRONTEND_MODE_APP.to_string(),
     }
+}
+
+pub fn remote_frontend_mode_uses_cli(value: &str) -> bool {
+    normalized_remote_frontend_mode(value) == REMOTE_FRONTEND_MODE_CLI
 }
 
 pub fn normalized_remote_web_asset_registry_url(value: &str) -> String {

@@ -1,3 +1,4 @@
+mod claude_code_app_server;
 mod cli;
 mod cli_middleware;
 mod config;
@@ -12,7 +13,6 @@ use config::{
     AppConfig, BotProfileConfig, DefaultProviderProfile, ExistingProviderRequest,
     NewProviderRequest, NextAiGatewayProviderRequest, UpdateNextAiGatewayProviderRequest,
     UpdateProviderRequest, UpdateWorkspaceRequest, WorkspaceRequest, DEFAULT_PROVIDER_PROFILE_NAME,
-    REMOTE_FRONTEND_MODE_CLI,
 };
 use extensions::builtins::bot_bridge;
 use extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
@@ -129,12 +129,7 @@ async fn launch_codex(
         let config = state.config.lock().await;
         config
             .provider_profile(&requested_profile_name)
-            .map(|profile| {
-                profile
-                    .remote_frontend_mode
-                    .trim()
-                    .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLI)
-            })
+            .map(|profile| config::remote_frontend_mode_uses_cli(&profile.remote_frontend_mode))
             .unwrap_or(false)
     };
     if uses_cli_mode {
@@ -761,10 +756,9 @@ pub fn run() {
                             .provider_profile(&profile_name)
                             .map(|profile| {
                                 profile.start_remote_on_launch
-                                    || profile
-                                        .remote_frontend_mode
-                                        .trim()
-                                        .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLI)
+                                    || config::remote_frontend_mode_uses_cli(
+                                        &profile.remote_frontend_mode,
+                                    )
                             })
                             .unwrap_or(false);
                         (config.auto_launch, profile_name, start_remote)

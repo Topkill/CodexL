@@ -2,7 +2,7 @@ use crate::{
     cli_middleware,
     config::{
         self, generated_codex_home, AppConfig, ProviderProfile, RemoteCloudAuthConfig,
-        REMOTE_FRONTEND_MODE_CLI,
+        REMOTE_FRONTEND_MODE_CLAUDE_CODE,
     },
     launcher, ports, server, AppState,
 };
@@ -333,7 +333,10 @@ pub async fn start_remote_control(
         .await?;
         (RemoteBackend::App, launch.cdp_host, launch.cdp_port)
     };
-    let remote_frontend_mode = backend.mode().to_string();
+    let remote_frontend_mode = profile
+        .as_ref()
+        .map(|profile| config::normalized_remote_frontend_mode(&profile.remote_frontend_mode))
+        .unwrap_or_else(|| backend.mode().to_string());
 
     let token = make_token();
     let relay_connection_id = relay_url.as_ref().map(|_| make_relay_connection_id());
@@ -2271,12 +2274,7 @@ fn profile_web_asset_version(app_config: &AppConfig, profile: Option<&ProviderPr
 
 fn profile_uses_cli_remote_frontend(profile: Option<&ProviderProfile>) -> bool {
     profile
-        .map(|profile| {
-            profile
-                .remote_frontend_mode
-                .trim()
-                .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLI)
-        })
+        .map(|profile| config::remote_frontend_mode_uses_cli(&profile.remote_frontend_mode))
         .unwrap_or(false)
 }
 
@@ -2318,6 +2316,11 @@ async fn start_cli_app_server_bridge(
     let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
     let active_cli_profile = requested_config.active_cli_profile();
     let active_cli_model_provider = requested_config.active_cli_model_provider();
+    let app_server_backend = active_provider_profile
+        .as_ref()
+        .filter(|profile| profile_uses_claude_code_app_server(profile))
+        .map(|_| CliAppServerBackend::ClaudeCode)
+        .unwrap_or(CliAppServerBackend::CodexCli);
     let proxy_url = active_provider_profile
         .as_ref()
         .map(|profile| profile.proxy_url.clone())
@@ -2329,6 +2332,7 @@ async fn start_cli_app_server_bridge(
         requested_config.active_provider.clone(),
         active_cli_profile,
         active_cli_model_provider,
+        app_server_backend,
         proxy_url,
         transcribe_api,
     )
@@ -2338,6 +2342,35 @@ async fn start_cli_app_server_bridge(
     config.codex_home = requested_config.codex_home;
     config.active_provider = requested_config.active_provider;
     Ok(bridge)
+}
+
+fn profile_uses_claude_code_app_server(profile: &ProviderProfile) -> bool {
+    if profile
+        .remote_frontend_mode
+        .trim()
+        .eq_ignore_ascii_case(REMOTE_FRONTEND_MODE_CLAUDE_CODE)
+    {
+        return true;
+    }
+    [
+        &profile.provider_name,
+        &profile.codex_profile_name,
+        &profile.name,
+    ]
+    .into_iter()
+    .any(|value| is_claude_code_profile_label(value))
+}
+
+fn is_claude_code_profile_label(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized == crate::claude_code_app_server::PROVIDER_NAME
+        || matches!(normalized.as_str(), "claude_code" | "claude code")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliAppServerBackend {
+    CodexCli,
+    ClaudeCode,
 }
 
 struct CliAppBridge {
@@ -2363,21 +2396,36 @@ impl CliAppBridge {
         workspace_name: String,
         cli_profile: Option<String>,
         cli_model_provider: Option<String>,
+        backend: CliAppServerBackend,
         proxy_url: String,
         transcribe_api: TranscribeApiConfig,
     ) -> Result<Arc<Self>, String> {
-        let mut command = TokioCommand::new(&executable);
-        if let Some(profile) = cli_profile.as_deref() {
-            command.arg("-c").arg(cli_config_string("profile", profile));
-        }
-        if let Some(model_provider) = cli_model_provider.as_deref() {
-            command
-                .arg("-c")
-                .arg(cli_config_string("model_provider", model_provider));
-        }
+        let mut command = match backend {
+            CliAppServerBackend::CodexCli => {
+                let mut command = TokioCommand::new(&executable);
+                if let Some(profile) = cli_profile.as_deref() {
+                    command.arg("-c").arg(cli_config_string("profile", profile));
+                }
+                if let Some(model_provider) = cli_model_provider.as_deref() {
+                    command
+                        .arg("-c")
+                        .arg(cli_config_string("model_provider", model_provider));
+                }
+                command.arg("app-server").arg("--analytics-default-enabled");
+                command
+            }
+            CliAppServerBackend::ClaudeCode => {
+                let host_executable = std::env::current_exe()
+                    .map_err(|err| format!("Failed to locate CodexL executable: {}", err))?;
+                let mut command = TokioCommand::new(host_executable);
+                command
+                    .arg(cli_middleware::CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG)
+                    .arg("--workspace-name")
+                    .arg(&workspace_name);
+                command
+            }
+        };
         command
-            .arg("app-server")
-            .arg("--analytics-default-enabled")
             .env("CODEX_HOME", &codex_home)
             .env(cli_middleware::CODEX_WORKSPACE_NAME_ENV, &workspace_name)
             .env("CODEXL_WORKSPACE_NAME", &workspace_name)
@@ -2714,7 +2762,7 @@ impl CliAppBridge {
             .cloned()
             .ok_or_else(|| "missing MCP request".to_string())?;
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        if method == "notifications/initialized" {
+        if method == "notifications/initialized" || method == "initialized" {
             return Ok(json!({ "messages": [] }));
         }
         if method == "initialize" {
@@ -2895,7 +2943,7 @@ impl CliAppBridge {
             "[codex-web][cli] ipc-request method={} requestId={} appRequestId={}",
             method, request_id, app_request_id
         );
-        if method == "notifications/initialized" {
+        if method == "notifications/initialized" || method == "initialized" {
             return Ok(json!({
                 "messages": [fetch_response_success(
                     &request_id,
@@ -3206,7 +3254,17 @@ impl CliAppBridge {
                 .unwrap_or("")
         );
 
-        let turns_page = self.read_cli_thread_turns_tail(&conversation_id).await?;
+        let turns_page = match self.read_cli_thread_turns_tail(&conversation_id).await {
+            Ok(turns_page) => turns_page,
+            Err(err) if thread_metadata.is_none() && cli_thread_missing_error(&err) => {
+                eprintln!(
+                    "[codex-web][cli] maybe-resume skipped conversationId={} reason={}",
+                    conversation_id, err
+                );
+                return Ok((Value::Null, Vec::new()));
+            }
+            Err(err) => return Err(err),
+        };
         eprintln!(
             "[codex-web][cli] maybe-resume turns conversationId={} count={} nextCursor={}",
             conversation_id,
@@ -3669,6 +3727,10 @@ fn default_cli_initialize_result() -> Value {
             "name": "codex-cli-app-server",
             "version": env!("CARGO_PKG_VERSION"),
         },
+        "userAgent": format!("codexl-cli-app-server/{}", env!("CARGO_PKG_VERSION")),
+        "codexHome": crate::config::default_codex_home(),
+        "platformFamily": std::env::consts::FAMILY,
+        "platformOs": std::env::consts::OS,
     })
 }
 
@@ -5228,6 +5290,14 @@ fn response_error_is_method_not_found(response: &Value) -> bool {
     json_error_message(error)
         .to_ascii_lowercase()
         .contains("method not found")
+}
+
+fn cli_thread_missing_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("thread not found")
+        || error.contains("thread not loaded")
+        || error.contains("thread/turns/list is unavailable before first user message")
+        || error.contains("includeturns is unavailable before first user message")
 }
 
 fn create_cli_projectless_thread_cwd(
@@ -7563,7 +7633,7 @@ mod tests {
             ..AppConfig::default()
         };
         let profile = ProviderProfile {
-            remote_frontend_mode: REMOTE_FRONTEND_MODE_CLI.to_string(),
+            remote_frontend_mode: config::REMOTE_FRONTEND_MODE_CLI.to_string(),
             remote_web_asset_registry_url: "https://profile.example.com/".to_string(),
             remote_web_asset_version: "26.513.31313".to_string(),
             ..ProviderProfile::default()
@@ -7577,6 +7647,31 @@ mod tests {
             profile_web_asset_version(&app_config, Some(&profile)),
             "26.513.31313"
         );
+    }
+
+    #[test]
+    fn claude_code_profile_uses_app_frontend_and_claude_backend() {
+        let app_config = AppConfig {
+            remote_web_asset_registry_url: "https://global.example.com".to_string(),
+            remote_web_asset_version: "global".to_string(),
+            ..AppConfig::default()
+        };
+        let profile = ProviderProfile {
+            remote_frontend_mode: config::REMOTE_FRONTEND_MODE_CLAUDE_CODE.to_string(),
+            remote_web_asset_registry_url: "https://profile.example.com/".to_string(),
+            remote_web_asset_version: "26.513.31313".to_string(),
+            ..ProviderProfile::default()
+        };
+
+        assert_eq!(
+            profile_web_asset_base_url(&app_config, Some(&profile)).as_deref(),
+            None
+        );
+        assert_eq!(
+            profile_web_asset_version(&app_config, Some(&profile)),
+            "latest"
+        );
+        assert!(profile_uses_claude_code_app_server(&profile));
     }
 
     #[test]

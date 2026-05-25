@@ -1,7 +1,7 @@
 use crate::{
     config::{
         self, AppConfig, ProviderProfile, WorkspaceRequest, REMOTE_FRONTEND_MODE_APP,
-        REMOTE_FRONTEND_MODE_CLI,
+        REMOTE_FRONTEND_MODE_CLAUDE_CODE, REMOTE_FRONTEND_MODE_CLI,
     },
     launcher, remote, server, AppState,
 };
@@ -148,9 +148,7 @@ fn workspace_show(args: &[String]) -> Result<i32, String> {
         println!("model: {}", empty_dash(&profile.model));
         println!("codex_home: {}", empty_dash(&profile.codex_home));
         println!("remote_frontend: {}", remote_frontend_label(&profile));
-        if normalized_remote_frontend_mode(&profile.remote_frontend_mode)
-            == REMOTE_FRONTEND_MODE_CLI
-        {
+        if config::remote_frontend_mode_uses_cli(&profile.remote_frontend_mode) {
             println!(
                 "registry_url: {}",
                 empty_dash(&profile.remote_web_asset_registry_url)
@@ -220,9 +218,11 @@ fn workspace_create(args: &[String]) -> Result<i32, String> {
     }
 
     if name.trim().is_empty() {
-        return Err("usage: codexl workspace create <name> [--mode app|cli]".to_string());
+        return Err(
+            "usage: codexl workspace create <name> [--mode app|cli|claude-code]".to_string(),
+        );
     }
-    if mode == REMOTE_FRONTEND_MODE_CLI && registry_url.is_empty() {
+    if config::remote_frontend_mode_uses_cli(&mode) && registry_url.is_empty() {
         registry_url = default_registry_url();
     }
 
@@ -301,7 +301,8 @@ fn workspace_set_remote_frontend(args: &[String]) -> Result<i32, String> {
 
     if name.trim().is_empty() || mode.is_empty() {
         return Err(
-            "usage: codexl workspace set-remote-frontend <name> --mode app|cli".to_string(),
+            "usage: codexl workspace set-remote-frontend <name> --mode app|cli|claude-code"
+                .to_string(),
         );
     }
 
@@ -316,7 +317,7 @@ fn workspace_set_remote_frontend(args: &[String]) -> Result<i32, String> {
     if let Some(version) = version {
         profile.remote_web_asset_version = version;
     }
-    if normalized_remote_frontend_mode(&profile.remote_frontend_mode) == REMOTE_FRONTEND_MODE_CLI {
+    if config::remote_frontend_mode_uses_cli(&profile.remote_frontend_mode) {
         if profile.remote_web_asset_registry_url.trim().is_empty() {
             profile.remote_web_asset_registry_url = default_registry_url();
         }
@@ -589,6 +590,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 fn normalized_remote_frontend_mode(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         REMOTE_FRONTEND_MODE_CLI => REMOTE_FRONTEND_MODE_CLI.to_string(),
+        REMOTE_FRONTEND_MODE_CLAUDE_CODE => REMOTE_FRONTEND_MODE_CLAUDE_CODE.to_string(),
         REMOTE_FRONTEND_MODE_APP => REMOTE_FRONTEND_MODE_APP.to_string(),
         _ => REMOTE_FRONTEND_MODE_APP.to_string(),
     }
@@ -616,13 +618,20 @@ fn workspace_kind(profile: &ProviderProfile) -> &'static str {
 }
 
 fn remote_frontend_label(profile: &ProviderProfile) -> String {
-    if normalized_remote_frontend_mode(&profile.remote_frontend_mode) == REMOTE_FRONTEND_MODE_CLI {
-        format!(
-            "cli@{}",
-            normalized_version(&profile.remote_web_asset_version)
-        )
-    } else {
-        "app".to_string()
+    match normalized_remote_frontend_mode(&profile.remote_frontend_mode).as_str() {
+        REMOTE_FRONTEND_MODE_CLI => {
+            format!(
+                "cli@{}",
+                normalized_version(&profile.remote_web_asset_version)
+            )
+        }
+        REMOTE_FRONTEND_MODE_CLAUDE_CODE => {
+            format!(
+                "claude-code@{}",
+                normalized_version(&profile.remote_web_asset_version)
+            )
+        }
+        _ => "app".to_string(),
     }
 }
 
@@ -663,8 +672,8 @@ Usage:
   codexl workspace list [--json]
   codexl workspace show <name> [--json]
   codexl workspace use <name>
-  codexl workspace create <name> [--mode app|cli] [--registry-url URL] [--version VERSION]
-  codexl workspace set-remote-frontend <name> --mode app|cli [--registry-url URL] [--version VERSION]
+  codexl workspace create <name> [--mode app|cli|claude-code] [--registry-url URL] [--version VERSION]
+  codexl workspace set-remote-frontend <name> --mode app|cli|claude-code [--registry-url URL] [--version VERSION]
   codexl codex [--profile NAME] [--codex-path PATH] -- [ARGS...]
   codexl codex-app find
   codexl codex-web versions [--registry-url URL] [--json]
@@ -688,8 +697,8 @@ fn print_workspace_help() {
   codexl workspace list [--json]
   codexl workspace show <name> [--json]
   codexl workspace use <name>
-  codexl workspace create <name> [--mode app|cli] [--registry-url URL] [--version VERSION]
-  codexl workspace set-remote-frontend <name> --mode app|cli [--registry-url URL] [--version VERSION]"#
+  codexl workspace create <name> [--mode app|cli|claude-code] [--registry-url URL] [--version VERSION]
+  codexl workspace set-remote-frontend <name> --mode app|cli|claude-code [--registry-url URL] [--version VERSION]"#
     );
 }
 

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::claude_code_app_server;
 use crate::extensions::builtins::bot_bridge;
 use crate::{config::AppConfig, remote};
 use serde_json::{json, Map, Value};
@@ -18,12 +19,14 @@ const MIDDLEWARE_LOG_ENV: &str = "CODEXL_CLI_MIDDLEWARE_LOG";
 pub const CODEX_PROFILE_ENV: &str = "CODEXL_CODEX_PROFILE";
 pub const CODEX_MODEL_PROVIDER_ENV: &str = "CODEXL_CODEX_MODEL_PROVIDER";
 pub const CODEX_WORKSPACE_NAME_ENV: &str = "CODEXL_CODEX_WORKSPACE_NAME";
+pub const CODEX_CORE_MODE_ENV: &str = "CODEXL_CODEX_CORE_MODE";
 const LEGACY_CODEX_INSTANCE_NAME_ENV: &str = "CODEXL_CODEX_INSTANCE_NAME";
 const CODEX_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const RUN_MODE_ARG: &str = "--codexl-cli-middleware";
 const STDIO_RUN_MODE_ARG: &str = "--codexl-cli-stdio";
 const BOT_MEDIA_MCP_RUN_MODE_ARG: &str = "--codexl-bot-media-mcp";
+pub const CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG: &str = "--codexl-claude-code-app-server";
 const CODEXL_WORKSPACE_CWD_FILTER_KEY: &str = "codexlWorkspaceCwd";
 
 type RequestMap = Arc<Mutex<std::collections::HashMap<String, RequestInfo>>>;
@@ -50,6 +53,7 @@ pub struct MiddlewareEnv {
     pub workspace_name: Option<String>,
     pub profile: Option<String>,
     pub model_provider: Option<String>,
+    pub core_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +101,7 @@ pub fn prepare(
     stdio_name: Option<&str>,
     codex_profile: Option<&str>,
     codex_model_provider: Option<&str>,
+    core_mode: Option<&str>,
 ) -> Result<MiddlewareEnv, String> {
     let executable_path = middleware_path();
     let export_stdio_path = stdio_path(stdio_name);
@@ -109,6 +114,7 @@ pub fn prepare(
     let profile = normalize_profile(codex_profile);
     let workspace_name = normalize_profile(stdio_name).or_else(|| profile.clone());
     let model_provider = normalize_profile(codex_model_provider);
+    let core_mode = normalize_profile(core_mode);
     write_stdio_export(
         &export_stdio_path,
         &host_executable,
@@ -119,6 +125,7 @@ pub fn prepare(
         workspace_name.as_deref(),
         profile.as_deref(),
         model_provider.as_deref(),
+        core_mode.as_deref(),
     )?;
     if default_stdio_path != export_stdio_path {
         write_stdio_export(
@@ -131,6 +138,7 @@ pub fn prepare(
             workspace_name.as_deref(),
             profile.as_deref(),
             model_provider.as_deref(),
+            core_mode.as_deref(),
         )?;
     }
     Ok(MiddlewareEnv {
@@ -141,6 +149,7 @@ pub fn prepare(
         workspace_name,
         profile,
         model_provider,
+        core_mode,
     })
 }
 
@@ -159,6 +168,9 @@ pub fn run_if_requested() -> bool {
         }
         value if value == OsStr::new(BOT_MEDIA_MCP_RUN_MODE_ARG) => {
             bot_bridge::run_bot_media_mcp_stdio()
+        }
+        value if value == OsStr::new(CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG) => {
+            claude_code_app_server::run_stdio_app_server(forwarded_args)
         }
         _ => return false,
     };
@@ -342,6 +354,7 @@ fn write_stdio_export(
     workspace_name: Option<&str>,
     profile: Option<&str>,
     model_provider: Option<&str>,
+    core_mode: Option<&str>,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -356,6 +369,7 @@ fn write_stdio_export(
         workspace_name,
         profile,
         model_provider,
+        core_mode,
     );
     let should_write = std::fs::read_to_string(path)
         .map(|existing| existing != content)
@@ -401,6 +415,14 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
+    if should_run_claude_code_app_server(&args) {
+        return claude_code_app_server::run_stdio_app_server_with_io(
+            claude_code_app_server_args(),
+            input,
+            output,
+        );
+    }
+
     let real_cli = std::env::var(REAL_CLI_ENV)
         .ok()
         .map(|value| value.trim().to_string())
@@ -483,6 +505,36 @@ where
         .map_err(|e| e.to_string())?;
 
     Ok(status.code().unwrap_or(1))
+}
+
+fn should_run_claude_code_app_server(args: &[OsString]) -> bool {
+    let core_mode = std::env::var(CODEX_CORE_MODE_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(
+        core_mode.as_str(),
+        crate::config::REMOTE_FRONTEND_MODE_CLAUDE_CODE | "claude_code" | "claude code"
+    ) {
+        return false;
+    }
+    args.first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| arg == "app-server")
+}
+
+fn claude_code_app_server_args() -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Some(workspace_name) = std::env::var(CODEX_WORKSPACE_NAME_ENV)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_CODEX_INSTANCE_NAME_ENV).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        args.push(OsString::from("--workspace-name"));
+        args.push(OsString::from(workspace_name));
+    }
+    args
 }
 
 fn real_cli_args(
@@ -2172,6 +2224,7 @@ fn stdio_export_script(
     workspace_name: Option<&str>,
     profile: Option<&str>,
     model_provider: Option<&str>,
+    core_mode: Option<&str>,
 ) -> String {
     let mut script = String::from("@echo off\r\n");
     push_cmd_env(
@@ -2192,6 +2245,9 @@ fn stdio_export_script(
     }
     if let Some(model_provider) = model_provider {
         push_cmd_env(&mut script, CODEX_MODEL_PROVIDER_ENV, model_provider);
+    }
+    if let Some(core_mode) = core_mode {
+        push_cmd_env(&mut script, CODEX_CORE_MODE_ENV, core_mode);
     }
     script.push_str(&format!(
         "\"{}\" {} %*\r\nexit /b %ERRORLEVEL%\r\n",
@@ -2382,6 +2438,7 @@ printf ':stdin=%s\n' "$first_line"
             Some("custom-instance"),
             Some("custom-profile"),
             Some("custom-provider"),
+            Some("claude-code"),
         );
 
         assert!(script.contains("export CODEX_CLI_PATH='/tmp/codexl-codex-cli-middleware'\n"));
@@ -2393,7 +2450,55 @@ printf ':stdin=%s\n' "$first_line"
         assert!(script.contains("export CODEXL_CODEX_WORKSPACE_NAME='custom-instance'\n"));
         assert!(script.contains("export CODEXL_CODEX_PROFILE='custom-profile'\n"));
         assert!(script.contains("export CODEXL_CODEX_MODEL_PROVIDER='custom-provider'\n"));
+        assert!(script.contains("export CODEXL_CODEX_CORE_MODE='claude-code'\n"));
         assert!(script.contains("exec '/tmp/CodexL Host' --codexl-cli-stdio \"$@\"\n"));
+    }
+
+    #[test]
+    #[ignore = "requires real ccr code service and Claude Code auth"]
+    fn real_claude_code_core_mode_routes_middleware_to_ccr() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("middleware-real-ccr");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let output_path = root.join("out.jsonl");
+        let thread_id = "33333333-3333-4333-8333-333333333333";
+        let token = "CODEXL_MIDDLEWARE_CLAUDE_OK";
+        let input = format!(
+            "{{\"id\":\"1\",\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\"}}}}\n{{\"method\":\"initialized\",\"params\":{{}}}}\n{{\"id\":\"2\",\"method\":\"thread/resume\",\"params\":{{\"threadId\":\"{}\",\"cwd\":\"{}\",\"model\":\"sonnet\"}}}}\n{{\"id\":\"3\",\"method\":\"turn/start\",\"params\":{{\"threadId\":\"{}\",\"input\":[{{\"type\":\"text\",\"text\":\"Reply exactly with this token and nothing else: {}\"}}]}}}}\n",
+            thread_id,
+            root.to_string_lossy(),
+            thread_id,
+            token
+        );
+
+        std::env::set_var(
+            CODEX_CORE_MODE_ENV,
+            crate::config::REMOTE_FRONTEND_MODE_CLAUDE_CODE,
+        );
+        std::env::set_var(CODEX_WORKSPACE_NAME_ENV, "middleware-real-ccr");
+        std::env::remove_var(REAL_CLI_ENV);
+
+        run_stdio_middleware_with_io(
+            vec![
+                OsString::from("app-server"),
+                OsString::from("--analytics-default-enabled"),
+            ],
+            std::io::Cursor::new(input.into_bytes()),
+            std::fs::File::create(&output_path).expect("create output"),
+        )
+        .expect("run middleware");
+
+        std::env::remove_var(CODEX_CORE_MODE_ENV);
+        std::env::remove_var(CODEX_WORKSPACE_NAME_ENV);
+
+        let output = std::fs::read_to_string(&output_path).expect("read output");
+        assert!(output.contains(r#""method":"item/started""#));
+        assert!(output.contains(r#""method":"item/commandExecution/outputDelta""#));
+        assert!(output.contains(r#""method":"item/agentMessage/delta""#));
+        assert!(output.contains(token), "output was:\n{}", output);
+        assert!(output.contains(r#""method":"turn/completed""#));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2695,8 +2800,16 @@ printf ':stdin=%s\n' "$first_line"
         let root = test_dir("all-sessions-fairness");
         let busy_home = root.join("busy-provider");
         let quiet_home = root.join("quiet-provider");
-        let busy_dir = busy_home.join("sessions").join("2026").join("05").join("23");
-        let quiet_dir = quiet_home.join("sessions").join("2026").join("05").join("23");
+        let busy_dir = busy_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("23");
+        let quiet_dir = quiet_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("23");
         std::fs::create_dir_all(&busy_dir).expect("create busy session dir");
         std::fs::create_dir_all(&quiet_dir).expect("create quiet session dir");
 
@@ -2894,6 +3007,7 @@ fn stdio_export_script(
     workspace_name: Option<&str>,
     profile: Option<&str>,
     model_provider: Option<&str>,
+    core_mode: Option<&str>,
 ) -> String {
     let mut script = String::from("#!/bin/sh\n");
     push_shell_export(
@@ -2914,6 +3028,9 @@ fn stdio_export_script(
     }
     if let Some(model_provider) = model_provider {
         push_shell_export(&mut script, CODEX_MODEL_PROVIDER_ENV, model_provider);
+    }
+    if let Some(core_mode) = core_mode {
+        push_shell_export(&mut script, CODEX_CORE_MODE_ENV, core_mode);
     }
     script.push_str(&format!(
         "exec {} {} \"$@\"\n",
