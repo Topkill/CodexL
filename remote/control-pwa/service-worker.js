@@ -1,5 +1,5 @@
-const CACHE_NAME = "codexl-remote-v43-voice-permissions";
-const WEB_CACHE_NAME = "codexl-remote-web-v11-local-bridge-plain";
+const CACHE_NAME = "codexl-remote-v44-codexl-runtime-bridge";
+const WEB_CACHE_NAME = "codexl-remote-web-v12-codexl-runtime-bridge";
 const WEB_CACHE_CONFIG_KEY = new URL("__codex-web-cache-config.json", self.registration.scope).toString();
 const WEB_VERSION_CACHE_KEY = new URL("__codex-web-version.json", self.registration.scope).toString();
 const WEB_PATH_PREFIX = new URL("web/", self.registration.scope).pathname;
@@ -16,6 +16,9 @@ const WEB_CACHE_IGNORED_PARAMS = [
   "transport",
   "codexBridgeUrl",
   "codexBridgeTransportUrl",
+  "codexlPluginRuntimeUrl",
+  "codexlRuntimeBaseUrl",
+  "codexlRuntimeUrl",
   "cloudUser",
   "jwt",
   "requirePassword",
@@ -34,13 +37,13 @@ const ASSETS = [
   "./",
   "index.html",
   "control.html",
-  "app.js?v=20260518-voice-permissions-v1",
-  "qrDecoder.js?v=20260518-voice-permissions-v1",
-  "realtimeTransport.js?v=20260518-voice-permissions-v1",
-  "react-app.css?v=20260518-voice-permissions-v1",
-  "react-app.js?v=20260518-voice-permissions-v1",
-  "vendor/jsQR.js?v=20260518-voice-permissions-v1",
-  "styles.css?v=20260518-voice-permissions-v1",
+  "app.js?v=20260524-codexl-runtime-bridge-v1",
+  "qrDecoder.js?v=20260524-codexl-runtime-bridge-v1",
+  "realtimeTransport.js?v=20260524-codexl-runtime-bridge-v1",
+  "react-app.css?v=20260524-codexl-runtime-bridge-v1",
+  "react-app.js?v=20260524-codexl-runtime-bridge-v1",
+  "vendor/jsQR.js?v=20260524-codexl-runtime-bridge-v1",
+  "styles.css?v=20260524-codexl-runtime-bridge-v1",
   "manifest.webmanifest",
   "icon.png",
 ].map((asset) => new URL(asset, self.registration.scope).toString());

@@ -1,5 +1,5 @@
-import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260518-voice-permissions-v1";
-import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260518-voice-permissions-v1";
+import { TRANSPORT_OPEN, openRealtimeSession } from "./realtimeTransport.js?v=20260524-codexl-runtime-bridge-v1";
+import { decodeCodexQrFromVideo } from "./qrDecoder.js?v=20260524-codexl-runtime-bridge-v1";
 
 const urlParams = new URLSearchParams(location.search);
 const initialConnection = connectionFromUrlParams(urlParams);
@@ -35,7 +35,7 @@ const SIDEBAR_SWIPE_RIGHT_OPEN_REGION_RATIO = 0.22;
 const SIDEBAR_SWIPE_MIN_DISTANCE_PX = 72;
 const SIDEBAR_SWIPE_MAX_VERTICAL_PX = 52;
 const SIDEBAR_SWIPE_DIRECTION_RATIO = 1.35;
-const PWA_BUILD = "20260518-voice-permissions-v1";
+const PWA_BUILD = "20260524-codexl-runtime-bridge-v1";
 const WEB_BRIDGE_URL_PARAM = "codexBridgeUrl";
 const PARENT_BRIDGE_OPEN_MESSAGE = "codex-web-parent-bridge-open";
 const PARENT_BRIDGE_OPENED_MESSAGE = "codex-web-parent-bridge-opened";
@@ -62,6 +62,8 @@ let remoteOrigin = location.origin;
 let remotePathPrefix = websocketBasePath(location.pathname);
 let webAssetBaseUrl = "";
 let webAssetVersion = "latest";
+let webAssetRuntimeConfig = null;
+let webAssetRuntimeConfigKey = "";
 let transportPreference = (urlParams.get("transport") || "auto").toLowerCase();
 let webTransportFallbackLogged = false;
 let pointerMoveTimer = null;
@@ -434,6 +436,8 @@ function setupControlEventHandlers() {
       return;
     }
     webAssetVersion = nextVersion;
+    webAssetRuntimeConfig = null;
+    webAssetRuntimeConfigKey = "";
     persistActiveWebAssetSelection();
     updateSecureWebButton();
     void connectWebBridgeMode();
@@ -834,6 +838,8 @@ async function startConnection(connection, { instanceId = connection.id || "" } 
   remoteRequiresPassword = requiresPassword;
   webAssetBaseUrl = connectionWebAssetBaseUrl(connection, connectionUrl, remoteInfo);
   webAssetVersion = connectionWebAssetVersion(connection, connectionUrl, remoteInfo);
+  webAssetRuntimeConfig = null;
+  webAssetRuntimeConfigKey = "";
   configureWebAssetVersionSelect();
   updateSecureWebButton();
   if (webAssetRegistryEnabled()) {
@@ -1000,6 +1006,17 @@ async function connectWebBridgeMode() {
 
   const attempt = ++state.webConnectAttempt;
   clearReconnectTimer();
+  const registryMode = webAssetRegistryEnabled();
+  if (registryMode) {
+    setStatus(`Loading app bundle metadata (${webAssetVersion})`);
+    if (activeInstanceId) {
+      updateInstanceStatus(activeInstanceId, `Loading app bundle metadata (${webAssetVersion})`);
+    }
+    await refreshWebAssetRuntimeConfig();
+    if (state.remoteMode !== REMOTE_MODE_WEB || state.webConnectAttempt !== attempt) {
+      return;
+    }
+  }
   const remoteFrameUrl = webBridgeUrl();
   if (!webFrame || !remoteFrameUrl) {
     setStatus("Web bridge unavailable");
@@ -1012,7 +1029,6 @@ async function connectWebBridgeMode() {
   state.connected = false;
   state.frameConnected = false;
   state.webFrameLoaded = false;
-  const registryMode = webAssetRegistryEnabled();
   setStatus(registryMode ? `Loading app bundle (${webAssetVersion})` : "Preparing web cache");
   if (activeInstanceId) {
     updateInstanceStatus(activeInstanceId, registryMode ? `Loading app bundle (${webAssetVersion})` : "Preparing web cache");
@@ -2421,6 +2437,18 @@ function applyWebAssetParams(params) {
   return params;
 }
 
+function applyCodexLRuntimeParams(params) {
+  const config = webAssetRuntimeConfig;
+  const pluginRuntimeScriptUrl = config?.pluginRuntimeScriptUrl || "";
+  if (pluginRuntimeScriptUrl) {
+    params.set("codexlPluginRuntimeUrl", pluginRuntimeScriptUrl);
+    params.set("codexlRuntimeUrl", pluginRuntimeScriptUrl);
+  } else if (config?.runtimeBaseUrl) {
+    params.set("codexlRuntimeBaseUrl", config.runtimeBaseUrl);
+  }
+  return params;
+}
+
 function webAssetFrameUrl() {
   const base = new URL(`${webAssetBaseUrl}/`);
   return new URL(`${encodeURIComponent(webAssetVersion)}/index.html`, base);
@@ -2480,6 +2508,151 @@ async function refreshWebAssetVersions() {
   }
 }
 
+function webAssetRuntimeCacheKey() {
+  return `${webAssetBaseUrl}|${webAssetVersion}`;
+}
+
+async function refreshWebAssetRuntimeConfig() {
+  if (!webAssetRegistryEnabled()) {
+    webAssetRuntimeConfig = null;
+    webAssetRuntimeConfigKey = "";
+    return null;
+  }
+  const key = webAssetRuntimeCacheKey();
+  if (webAssetRuntimeConfig && webAssetRuntimeConfigKey === key) {
+    return webAssetRuntimeConfig;
+  }
+  try {
+    const config = await loadWebAssetRuntimeConfig(webAssetBaseUrl, webAssetVersion);
+    if (key !== webAssetRuntimeCacheKey()) {
+      return webAssetRuntimeConfig;
+    }
+    webAssetRuntimeConfig = config;
+    webAssetRuntimeConfigKey = key;
+    return config;
+  } catch (error) {
+    console.warn("[web-assets] unable to load runtime manifest", error);
+    if (key === webAssetRuntimeCacheKey()) {
+      webAssetRuntimeConfig = null;
+      webAssetRuntimeConfigKey = key;
+    }
+    return null;
+  }
+}
+
+async function loadWebAssetRuntimeConfig(baseUrl, version) {
+  const manifestUrl = await webAssetManifestUrl(baseUrl, version);
+  if (!manifestUrl) {
+    return null;
+  }
+  const response = await fetch(manifestUrl, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const manifest = await response.json();
+  const runtimeBaseUrl = resolveWebAssetRuntimeBaseUrl(
+    manifest?.runtimeBaseUrl || manifest?.runtime_base_url || "",
+    manifestUrl,
+  );
+  const bridgeScriptUrl =
+    resolveWebAssetRuntimeScriptUrl(
+      manifest?.bridgeScriptUrl || manifest?.bridge_script_url || "",
+      manifestUrl,
+    ) ||
+    runtimeScriptUrlFromBase(runtimeBaseUrl, "_codexl_bridge.js") ||
+    resolveWebAssetRuntimeScriptUrl(
+      manifest?.bridgeScript || manifest?.bridge_script || "",
+      manifestUrl,
+    );
+  const pluginRuntimeScriptUrl =
+    resolveWebAssetRuntimeScriptUrl(
+      manifest?.pluginRuntimeScriptUrl || manifest?.plugin_runtime_script_url || "",
+      manifestUrl,
+    ) ||
+    runtimeScriptUrlFromBase(runtimeBaseUrl, "_codexl_plugin.js") ||
+    resolveWebAssetRuntimeScriptUrl(
+      manifest?.pluginRuntimeScript || manifest?.plugin_runtime_script || "",
+      manifestUrl,
+    );
+  return {
+    bridgeScriptUrl,
+    manifestUrl: manifestUrl.toString(),
+    pluginRuntimeScriptUrl,
+    runtimeBaseUrl,
+  };
+}
+
+async function webAssetManifestUrl(baseUrl, version) {
+  const base = new URL(`${baseUrl}/`);
+  const normalizedVersion = normalizeWebAssetVersion(version);
+  if (normalizedVersion === "latest") {
+    try {
+      const latestUrl = new URL("latest.json", base);
+      const response = await fetch(latestUrl, { cache: "no-store" });
+      if (response.ok) {
+        const latest = await response.json();
+        const manifestPath =
+          typeof latest?.manifest === "string"
+            ? latest.manifest
+            : typeof latest?.manifestPath === "string"
+              ? latest.manifestPath
+              : "";
+        if (manifestPath) {
+          return new URL(manifestPath, base);
+        }
+      }
+    } catch (error) {
+      console.warn("[web-assets] unable to resolve latest manifest", error);
+    }
+  }
+  return new URL(`${encodeURIComponent(normalizedVersion)}/manifest.json`, base);
+}
+
+function resolveWebAssetRuntimeBaseUrl(value, baseUrl) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    const url = new URL(raw.endsWith("/") ? raw : `${raw}/`, baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
+    url.hash = "";
+    url.search = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function resolveWebAssetRuntimeScriptUrl(value, baseUrl) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    const url = new URL(raw, baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function runtimeScriptUrlFromBase(baseUrl, fileName) {
+  if (!baseUrl) {
+    return "";
+  }
+  try {
+    return new URL(fileName, `${baseUrl}/`).toString();
+  } catch {
+    return "";
+  }
+}
+
 function defaultWebAssetRegistryUrl() {
   return normalizeWebAssetBaseUrl(
     urlParams.get("defaultWebAssetBaseUrl") ||
@@ -2522,7 +2695,7 @@ function openSecureRegistryWeb() {
     return;
   }
 
-  openRegistryStandalonePage();
+  void openRegistryStandalonePage();
 }
 
 function persistActiveWebAssetSelection() {
@@ -2569,6 +2742,7 @@ function webBridgeUrl() {
     url.searchParams.set("codexBridgeParent", "1");
     url.searchParams.set("codexBridgeParentOrigin", location.origin);
   }
+  applyCodexLRuntimeParams(url.searchParams);
   const bridgeTransportUrl = webBridgeWebTransportUrl();
   if (bridgeTransportUrl) {
     url.searchParams.set("codexBridgeTransportUrl", bridgeTransportUrl);
@@ -2583,6 +2757,7 @@ function registryStandaloneUrl() {
   url.searchParams.set("token", token);
   applyWebEndpointCryptoParams(url.searchParams);
   url.searchParams.set(WEB_BRIDGE_URL_PARAM, webBridgeSocketUrl());
+  applyCodexLRuntimeParams(url.searchParams);
   const bridgeTransportUrl = webBridgeWebTransportUrl();
   if (bridgeTransportUrl) {
     url.searchParams.set("codexBridgeTransportUrl", bridgeTransportUrl);
@@ -2597,6 +2772,7 @@ function localWebFrameUrl(scope, remoteFrameUrl) {
   url.search = remoteUrl.search;
   applyWebEndpointCryptoParams(url.searchParams);
   url.searchParams.set(WEB_BRIDGE_URL_PARAM, webBridgeSocketUrl());
+  applyCodexLRuntimeParams(url.searchParams);
   const bridgeTransportUrl = webBridgeWebTransportUrl();
   if (bridgeTransportUrl) {
     url.searchParams.set("codexBridgeTransportUrl", bridgeTransportUrl);
@@ -2675,7 +2851,7 @@ function openRemoteControlPageDirectly() {
   location.href = url.toString();
 }
 
-function openRegistryStandalonePage() {
+async function openRegistryStandalonePage() {
   setStatus(`Opening HTTPS app bundle (${webAssetVersion})`);
   if (activeInstanceId) {
     updateInstanceStatus(activeInstanceId, `Opening HTTPS app bundle (${webAssetVersion})`, {
@@ -2683,6 +2859,7 @@ function openRegistryStandalonePage() {
       webAssetVersion,
     });
   }
+  await refreshWebAssetRuntimeConfig();
   location.href = registryStandaloneUrl();
 }
 

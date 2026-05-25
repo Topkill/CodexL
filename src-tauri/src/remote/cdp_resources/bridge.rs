@@ -353,6 +353,10 @@ pub async fn dispatch_web_bridge_message(
         cdp_host, cdp_port, message_type, request_id, url, mcp_method, mcp_id
     );
 
+    if super::plugin_runtime::is_plugin_bridge_message(&message) {
+        return super::plugin_runtime::dispatch_plugin_bridge_message(message).await;
+    }
+
     if message.get("type").and_then(Value::as_str) == Some(WEB_BRIDGE_SNAPSHOT_REQUEST_TYPE) {
         let reason = message
             .get("reason")

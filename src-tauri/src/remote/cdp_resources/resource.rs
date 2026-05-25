@@ -1,6 +1,9 @@
 use super::bridge::web_bridge_id_to_string;
 use super::bridge_script::{web_bridge_script_response, WEB_BRIDGE_SCRIPT};
 use super::cdp::{cdp_send, connect_target, list_targets, select_target};
+use super::plugin_runtime::{
+    web_plugin_runtime_script, web_plugin_runtime_script_response, web_plugin_runtime_version,
+};
 use super::*;
 use crate::remote::crypto::RemoteCrypto;
 use std::sync::Arc;
@@ -9,7 +12,7 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 const WEB_RESOURCE_TREE_CACHE_TTL_MS: u64 = 30_000;
-const WEB_RESOURCE_REWRITE_VERSION: &str = "bridge-script-auth-query-v1";
+const WEB_RESOURCE_REWRITE_VERSION: &str = "bridge-script-plugin-entry-v3";
 
 static WEB_RESOURCE_TREE_CACHE: OnceLock<StdMutex<Option<CachedWebResourceTree>>> = OnceLock::new();
 static WEB_RESOURCE_TREE_LOAD_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
@@ -39,6 +42,9 @@ pub async fn get_web_resource(
 
     if lookup.path == WEB_BRIDGE_SCRIPT_PATH {
         return Ok(web_bridge_script_response());
+    }
+    if lookup.path == WEB_PLUGIN_RUNTIME_SCRIPT_PATH {
+        return Ok(web_plugin_runtime_script_response());
     }
 
     let (snapshot, mut socket, mut next_id) = prepare_web_resource_cdp(cdp_host, cdp_port).await?;
@@ -362,6 +368,7 @@ pub(super) fn web_resource_version(
         hash = fnv1a64_with_seed(content, hash);
     }
     hash = fnv1a64_with_seed(WEB_BRIDGE_SCRIPT.as_bytes(), hash);
+    hash = fnv1a64_with_seed(web_plugin_runtime_script().as_bytes(), hash);
     hash = fnv1a64_with_seed(WEB_RESOURCE_REWRITE_VERSION.as_bytes(), hash);
     format!("{:016x}", hash)
 }
@@ -379,7 +386,11 @@ pub(super) fn web_cache_resource_paths(
     );
     push_web_cache_path(
         &mut paths,
-        &format!("{}/{}", WEB_PATH_PREFIX, WEB_BRIDGE_SCRIPT_PATH),
+        &web_path_with_query(WEB_BRIDGE_SCRIPT_PATH, None),
+    );
+    push_web_cache_path(
+        &mut paths,
+        &web_plugin_runtime_script_src(),
     );
 
     for resource in resources {
@@ -1599,13 +1610,19 @@ fn is_html_csp_meta_tag(tag: &str) -> bool {
 }
 
 pub(super) fn inject_web_bridge_script(input: &str, request_query: Option<&str>) -> String {
-    if input.contains(WEB_BRIDGE_SCRIPT_PATH) {
+    let tags = [(!input.contains(WEB_BRIDGE_SCRIPT_PATH)).then(|| {
+        format!(
+            r#"<script src="{}"></script>"#,
+            web_bridge_script_src(request_query)
+        )
+    })]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if tags.is_empty() {
         return input.to_string();
     }
-    let tag = format!(
-        r#"<script src="{}"></script>"#,
-        web_bridge_script_src(request_query)
-    );
+    let tag = tags.join("\n");
     for marker in [
         "<script type=\"module\"",
         "<script type='module'",
@@ -1629,6 +1646,15 @@ fn web_bridge_script_src(request_query: Option<&str>) -> String {
         Some(query) => format!("{}?{}", base, query),
         None => base,
     }
+}
+
+fn web_plugin_runtime_script_src() -> String {
+    format!(
+        "{}/{}?v={}",
+        WEB_PATH_PREFIX,
+        WEB_PLUGIN_RUNTIME_SCRIPT_PATH,
+        web_plugin_runtime_version()
+    )
 }
 
 fn web_bridge_script_auth_query(request_query: Option<&str>) -> Option<String> {

@@ -18,6 +18,9 @@ if (!args.skipExtract) {
   if (args.app) extractArgs.push("--app", args.app);
   if (args.asar) extractArgs.push("--asar", args.asar);
   if (args.bridgeScript) extractArgs.push("--bridge-script", args.bridgeScript);
+  if (args.pluginRuntimeScript) extractArgs.push("--plugin-runtime-script", args.pluginRuntimeScript);
+  if (args.runtimeBaseUrl) extractArgs.push("--runtime-base-url", args.runtimeBaseUrl);
+  if (args.runtimeDir) extractArgs.push("--runtime-dir", args.runtimeDir);
   if (args.version) extractArgs.push("--version", args.version);
   if (args.clean) extractArgs.push("--clean");
   if (args.noClean) extractArgs.push("--no-clean");
@@ -53,7 +56,10 @@ function parseArgs(argv) {
     noClean: false,
     noLatest: false,
     outDir: defaultOutDir,
+    pluginRuntimeScript: "",
     projectName: process.env.CODEXL_CODEX_WEB_ASSET_PAGES_PROJECT || "codexl-codex-app-web",
+    runtimeBaseUrl: "",
+    runtimeDir: "",
     skipExtract: false,
     version: "",
   };
@@ -74,6 +80,15 @@ function parseArgs(argv) {
         break;
       case "--bridge-script":
         parsed.bridgeScript = readValue(argv, ++index, arg);
+        break;
+      case "--plugin-runtime-script":
+        parsed.pluginRuntimeScript = readValue(argv, ++index, arg);
+        break;
+      case "--runtime-base-url":
+        parsed.runtimeBaseUrl = readValue(argv, ++index, arg);
+        break;
+      case "--runtime-dir":
+        parsed.runtimeDir = readValue(argv, ++index, arg);
         break;
       case "--out-dir":
         parsed.outDir = readValue(argv, ++index, arg);
@@ -133,6 +148,9 @@ Extraction options are forwarded:
   --out-dir <path>       Default: ${defaultOutDir}
   --version <version>
   --bridge-script <path>
+  --plugin-runtime-script <path>
+  --runtime-base-url <url>
+  --runtime-dir <path>
   --clean
   --no-clean
   --no-latest

@@ -4,6 +4,7 @@ use crate::config::AppConfig;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use std::path::Component;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Instant;
@@ -12,9 +13,12 @@ const CODEXL_PLUGIN_BRIDGE_PATH: &str = "/plugin/_bridge";
 const CODEXL_PLUGIN_CDP_BINDING_NAME: &str = "__codexlPluginBridge";
 const CODEXL_PLUGIN_INJECT_TIMEOUT_MS: u64 = 20_000;
 const CODEXL_PLUGIN_INJECT_RETRY_MS: u64 = 150;
-const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.8";
+const CODEXL_PLUGIN_RUNTIME_VERSION: &str = "0.1.18";
 const CODEXL_RENDERER_PLUGIN_ENTRY_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const CODEXL_CORE_PLUGIN_ID: &str = "codexl.core";
+const CODEXL_PLUGIN_REMOTE_WEB_BRIDGE_URL: &str =
+    "ws://127.0.0.1:0/plugin/_bridge?token=remote-web-bridge";
+const CODEXL_PLUGIN_WEB_BRIDGE_MESSAGE_TYPE: &str = "codexl-plugin-bridge";
 pub(crate) const SHOW_ALL_SESSIONS_KEY: &str = "showAllSessions";
 
 static CODEXL_PLUGIN_BRIDGE_TOKENS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
@@ -122,6 +126,41 @@ where
     }
     eprintln!("[codex-plugin] bridge websocket closed");
     Ok(())
+}
+
+pub(super) fn web_plugin_runtime_script_response() -> WebResourceResponse {
+    WebResourceResponse {
+        status: StatusCode::OK,
+        content_type: "application/javascript; charset=utf-8".to_string(),
+        body: Bytes::from(web_plugin_runtime_script()),
+    }
+}
+
+pub(super) fn web_plugin_runtime_version() -> &'static str {
+    CODEXL_PLUGIN_RUNTIME_VERSION
+}
+
+pub(super) fn web_plugin_runtime_script() -> String {
+    codex_plugin_bootstrap_script(CODEXL_PLUGIN_REMOTE_WEB_BRIDGE_URL)
+}
+
+pub(crate) fn is_plugin_bridge_message(message: &Value) -> bool {
+    message.get("type").and_then(Value::as_str) == Some(CODEXL_PLUGIN_WEB_BRIDGE_MESSAGE_TYPE)
+}
+
+pub(crate) async fn dispatch_plugin_bridge_message(message: Value) -> Result<Value, String> {
+    let plugin_request = message
+        .get("pluginRequest")
+        .or_else(|| message.get("request"))
+        .or_else(|| message.get("payload"))
+        .cloned()
+        .ok_or_else(|| "missing CodexL plugin bridge request".to_string())?;
+    let raw = serde_json::to_string(&plugin_request).map_err(|err| err.to_string())?;
+    let response = plugin_bridge_socket_response(&raw).await;
+    Ok(json!({
+        "messages": [],
+        "codexlPluginResponse": response,
+    }))
 }
 
 async fn inject_codex_plugin_runtime(
@@ -355,6 +394,8 @@ async fn plugin_bridge_socket_response(raw: &str) -> Value {
                 "plugins": plugins,
             })
         }),
+        "session:context-usage" => renderer_session_context_usage(&request),
+        "session:delete" => renderer_session_delete(&request),
         "transcribe:fetch" => plugin_transcribe_fetch_response(&request).await,
         "storage:get" => renderer_plugin_storage_get(&request),
         "storage:set" => renderer_plugin_storage_set(&request),
@@ -591,6 +632,307 @@ pub(crate) fn renderer_core_plugin_bool_setting(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn renderer_session_delete(request: &Value) -> Result<Value, String> {
+    let thread_id = request
+        .get("threadId")
+        .or_else(|| request.get("conversationId"))
+        .or_else(|| request.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let requested_path = request
+        .get("path")
+        .or_else(|| request.get("rolloutPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if thread_id.is_none() && requested_path.is_none() {
+        return Err("session delete requires threadId or path".to_string());
+    }
+
+    let roots = session_delete_roots();
+    if roots.is_empty() {
+        return Err("no Codex session roots were found".to_string());
+    }
+
+    let path = if let Some(path) = requested_path.as_deref() {
+        validate_requested_session_delete_path(path, &roots)?
+    } else {
+        find_session_file_for_delete(&roots, thread_id.as_deref().unwrap_or(""))
+            .ok_or_else(|| "session file was not found".to_string())?
+    };
+
+    let deleted_thread_id = thread_id
+        .or_else(|| session_file_thread_id(&path))
+        .unwrap_or_default();
+    std::fs::remove_file(&path)
+        .map_err(|err| format!("failed to delete session {}: {}", path.display(), err))?;
+    Ok(json!({
+        "type": "session-deleted",
+        "threadId": deleted_thread_id,
+        "path": path.to_string_lossy().to_string(),
+    }))
+}
+
+fn renderer_session_context_usage(request: &Value) -> Result<Value, String> {
+    let thread_id = request
+        .get("threadId")
+        .or_else(|| request.get("conversationId"))
+        .or_else(|| request.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let requested_path = request
+        .get("path")
+        .or_else(|| request.get("rolloutPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if thread_id.is_none() && requested_path.is_none() {
+        return Err("session context usage requires threadId or path".to_string());
+    }
+
+    let roots = session_delete_roots();
+    if roots.is_empty() {
+        return Err("no Codex session roots were found".to_string());
+    }
+
+    let path = if let Some(path) = requested_path.as_deref() {
+        validate_requested_session_read_path(path, &roots)?
+    } else {
+        find_session_file_for_delete(&roots, thread_id.as_deref().unwrap_or(""))
+            .ok_or_else(|| "session file was not found".to_string())?
+    };
+
+    let resolved_thread_id = thread_id
+        .or_else(|| session_file_thread_id(&path))
+        .unwrap_or_default();
+    Ok(json!({
+        "type": "session-context-usage",
+        "threadId": resolved_thread_id,
+        "path": path.to_string_lossy().to_string(),
+        "tokenUsage": latest_session_context_usage(&path).unwrap_or(Value::Null),
+    }))
+}
+
+fn session_delete_roots() -> Vec<PathBuf> {
+    let config = AppConfig::load();
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    push_session_delete_root(&mut roots, &mut seen, config.codex_home.clone());
+    push_session_delete_root(&mut roots, &mut seen, crate::config::default_codex_home());
+    if let Ok(value) = std::env::var("CODEX_HOME") {
+        push_session_delete_root(&mut roots, &mut seen, value);
+    }
+    if let Ok(value) = std::env::var("CODEXL_CODEX_HOME") {
+        push_session_delete_root(&mut roots, &mut seen, value);
+    }
+
+    for profile in &config.codex_home_profiles {
+        push_session_delete_root(&mut roots, &mut seen, profile.path.clone());
+    }
+    for profile in &config.provider_profiles {
+        push_session_delete_root(&mut roots, &mut seen, profile.codex_home.clone());
+        push_session_delete_root(
+            &mut roots,
+            &mut seen,
+            crate::config::generated_codex_home(profile)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    for root in discovered_session_delete_roots() {
+        push_session_delete_root(&mut roots, &mut seen, root.to_string_lossy().to_string());
+    }
+
+    roots
+}
+
+fn push_session_delete_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<String>, value: String) {
+    let normalized = crate::config::normalize_home_path(&value);
+    if normalized.trim().is_empty() {
+        return;
+    }
+    let path = PathBuf::from(normalized);
+    if !path.join("sessions").is_dir() {
+        return;
+    }
+    let key = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .to_string();
+    if seen.insert(key) {
+        roots.push(path);
+    }
+}
+
+fn discovered_session_delete_roots() -> Vec<PathBuf> {
+    let root = crate::extensions::builtins::codexl_home_dir().join("codex-homes");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("sessions").is_dir())
+        .collect()
+}
+
+fn validate_requested_session_delete_path(
+    value: &str,
+    roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    validate_requested_session_path(value, roots, "delete")
+}
+
+fn validate_requested_session_read_path(value: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    validate_requested_session_path(value, roots, "read")
+}
+
+fn validate_requested_session_path(
+    value: &str,
+    roots: &[PathBuf],
+    action: &str,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(crate::config::normalize_home_path(value));
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|err| format!("failed to inspect session {}: {}", path.display(), err))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("refusing to {} a symlinked session file", action));
+    }
+    if !metadata.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return Err(format!("session {} target must be a .jsonl file", action));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| format!("failed to resolve session {}: {}", path.display(), err))?;
+    if roots
+        .iter()
+        .any(|root| path_is_under(&canonical, &root.join("sessions")))
+    {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "session {} target is outside known Codex session directories",
+            action
+        ))
+    }
+}
+
+fn find_session_file_for_delete(roots: &[PathBuf], thread_id: &str) -> Option<PathBuf> {
+    if thread_id.trim().is_empty() {
+        return None;
+    }
+    for root in roots {
+        let mut files = Vec::new();
+        collect_session_jsonl_files(&root.join("sessions"), &mut files);
+        for path in files {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            if session_file_thread_id(&path)
+                .as_deref()
+                .is_some_and(|session_thread_id| {
+                    session_thread_id_matches(session_thread_id, thread_id)
+                })
+            {
+                return path.canonicalize().ok().or(Some(path));
+            }
+        }
+    }
+    None
+}
+
+fn session_thread_id_matches(session_thread_id: &str, requested_thread_id: &str) -> bool {
+    let session_thread_id = session_thread_id.trim();
+    let requested_thread_id = requested_thread_id.trim();
+    if session_thread_id.is_empty() || requested_thread_id.is_empty() {
+        return false;
+    }
+    session_thread_id == requested_thread_id
+        || requested_thread_id
+            .strip_prefix("local:")
+            .is_some_and(|id| id == session_thread_id)
+        || session_thread_id
+            .strip_prefix("local:")
+            .is_some_and(|id| id == requested_thread_id)
+}
+
+fn collect_session_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_jsonl_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn session_file_thread_id(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let meta: Value = serde_json::from_str(line.trim_end()).ok()?;
+    if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    meta.get("payload")
+        .and_then(|payload| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn latest_session_context_usage(path: &Path) -> Option<Value> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut latest = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(event) = serde_json::from_str::<Value>(line.trim_end()) else {
+            continue;
+        };
+        if let Some(info) = session_event_token_count_info(&event) {
+            latest = Some(info.clone());
+        }
+    }
+    latest
+}
+
+fn session_event_token_count_info(event: &Value) -> Option<&Value> {
+    if event.get("type").and_then(Value::as_str) == Some("token_count") {
+        return event.get("info").filter(|info| info.is_object());
+    }
+    let payload = event.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+        payload.get("info").filter(|info| info.is_object())
+    } else {
+        None
+    }
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    path.strip_prefix(root).is_ok()
+}
+
 fn renderer_plugin_storage_set(request: &Value) -> Result<Value, String> {
     let plugin_id = request_plugin_id(request)?;
     let key = request_storage_key(request)?;
@@ -703,15 +1045,18 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "in-app-transcribe-2";
+  const RUNTIME_BUILD = "session-delete-9";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
+  const ENABLE_DELETE_SESSION_KEY = "enableDeleteSession";
   const SHOW_CONTEXT_INDICATORS_KEY = "showContextIndicators";
   const SHOW_ALL_SESSIONS_KEY = "showAllSessions";
   const SETTINGS_STYLE_ID = "codexl-plugin-global-style";
   const SETTINGS_NAV_ATTR = "data-codexl-settings-nav";
   const SETTINGS_PANEL_ATTR = "data-codexl-settings-panel";
+  const SESSION_DELETE_BUTTON_ATTR = "data-codexl-session-delete-button";
+  const SESSION_DELETE_HOST_ATTR = "data-codexl-session-delete-host";
   const CONTEXT_INDICATOR_ID = "codexl-context-indicator";
   const CONTEXT_TOOLTIP_ID = "codexl-context-indicator-tooltip";
   const existing = window.__codexlPluginRuntime;
@@ -736,10 +1081,13 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     build: RUNTIME_BUILD,
     cleanup: [],
     codexlSettings: {
+      enableDeleteSession: false,
       showAllSessions: false,
       showContextIndicators: false,
     },
     contextUsageByThread: new Map(),
+    contextUsageSessionRefreshByThread: new Map(),
+    deletedSessionIds: new Set(),
     latestContextUsage: null,
     lastContextLocationKey: "",
     loadedPlugins: new Map(),
@@ -1358,6 +1706,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       removeContextIndicator();
     } catch {}
     try {
+      removeSessionDeleteControls();
+    } catch {}
+    try {
       removeCodexLSettingsInjection();
     } catch {}
     try {
@@ -1492,6 +1843,39 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       [${SETTINGS_NAV_ATTR}="1"] {
         cursor: pointer;
       }
+      [${SESSION_DELETE_BUTTON_ATTR}="1"] {
+        align-items: center;
+        box-sizing: border-box;
+        color: color-mix(in srgb, currentColor 76%, transparent);
+        cursor: pointer;
+        display: inline-flex;
+        flex: 0 0 auto;
+        justify-content: center;
+        margin: 0;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 120ms ease-out, color 120ms ease-out, background-color 120ms ease-out;
+      }
+      [${SESSION_DELETE_BUTTON_ATTR}="1"]:hover,
+      [${SESSION_DELETE_BUTTON_ATTR}="1"]:focus-visible {
+        color: rgb(239, 68, 68);
+        opacity: 1;
+      }
+      [${SESSION_DELETE_BUTTON_ATTR}="1"][data-state="deleting"] {
+        cursor: wait;
+        opacity: 1;
+      }
+      [${SESSION_DELETE_HOST_ATTR}="1"]:hover [${SESSION_DELETE_BUTTON_ATTR}="1"],
+      [${SESSION_DELETE_HOST_ATTR}="1"]:focus-within [${SESSION_DELETE_BUTTON_ATTR}="1"] {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      [${SESSION_DELETE_BUTTON_ATTR}="1"] svg {
+        display: block;
+        height: 14px;
+        pointer-events: none;
+        width: 14px;
+      }
       .codexl-settings-panel {
         background: var(--color-main-surface-primary, Canvas);
         box-sizing: border-box;
@@ -1560,7 +1944,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     runtime.coreSettingsLoaded = true;
     try {
-      const [showContextResponse, showAllSessionsResponse] = await Promise.all([
+      const [showContextResponse, showAllSessionsResponse, enableDeleteResponse] = await Promise.all([
         request("storage:get", {
           key: SHOW_CONTEXT_INDICATORS_KEY,
           pluginId: CORE_PLUGIN_ID,
@@ -1569,15 +1953,21 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           key: SHOW_ALL_SESSIONS_KEY,
           pluginId: CORE_PLUGIN_ID,
         }),
+        request("storage:get", {
+          key: ENABLE_DELETE_SESSION_KEY,
+          pluginId: CORE_PLUGIN_ID,
+        }),
       ]);
       runtime.codexlSettings.showContextIndicators = showContextResponse?.value === true;
       runtime.codexlSettings.showAllSessions = showAllSessionsResponse?.value === true;
+      runtime.codexlSettings.enableDeleteSession = enableDeleteResponse?.value === true;
     } catch (error) {
       runtime.coreSettingsLoaded = false;
       throw error;
     } finally {
       updateSettingsUi();
       updateContextIndicator();
+      updateSessionDeleteControls();
     }
   }
 
@@ -1601,6 +1991,19 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       key: SHOW_ALL_SESSIONS_KEY,
       pluginId: CORE_PLUGIN_ID,
       value: runtime.codexlSettings.showAllSessions,
+    }).catch((error) =>
+      log("error", "CodexL settings save failed", String(error))
+    );
+  }
+
+  function setEnableDeleteSession(enabled) {
+    runtime.codexlSettings.enableDeleteSession = !!enabled;
+    updateSettingsUi();
+    updateSessionDeleteControls();
+    request("storage:set", {
+      key: ENABLE_DELETE_SESSION_KEY,
+      pluginId: CORE_PLUGIN_ID,
+      value: runtime.codexlSettings.enableDeleteSession,
     }).catch((error) =>
       log("error", "CodexL settings save failed", String(error))
     );
@@ -2341,6 +2744,20 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
                   </button>
                 </div>
               </div>
+              <div class="flex items-center justify-between gap-4 p-3">
+                <div class="flex min-w-0 items-center gap-3">
+                  <div class="flex min-w-0 flex-col gap-1">
+                    <div class="min-w-0 text-sm text-token-text-primary">Enable Delete Session</div>
+                  </div>
+                </div>
+                <div class="flex shrink-0 items-center gap-2">
+                  <button class="codexl-settings-switch inline-flex items-center text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-token-focus-border focus-visible:rounded-full cursor-interaction" type="button" role="switch" aria-label="Enable Delete Session" aria-checked="false" data-state="unchecked" data-codexl-setting="enableDeleteSession">
+                    <span class="codexl-settings-switch-track relative inline-flex shrink-0 items-center rounded-full transition-colors duration-200 ease-out bg-token-foreground/10 h-5 w-8" data-state="unchecked">
+                      <span class="codexl-settings-switch-thumb rounded-full border border-[color:var(--gray-0)] bg-[color:var(--gray-0)] shadow-sm transition-transform duration-200 ease-out data-[state=unchecked]:translate-x-[2px] data-[state=checked]:translate-x-[14px] h-4 w-4" data-state="unchecked"></span>
+                    </span>
+                  </button>
+                </div>
+              </div>
             </div>
           </section>
         </div>
@@ -2355,6 +2772,11 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       .querySelector('[data-codexl-setting="showAllSessions"]')
       ?.addEventListener("click", () => {
         setShowAllSessions(!runtime.codexlSettings.showAllSessions);
+      });
+    panel
+      .querySelector('[data-codexl-setting="enableDeleteSession"]')
+      ?.addEventListener("click", () => {
+        setEnableDeleteSession(!runtime.codexlSettings.enableDeleteSession);
       });
     updateSettingsUi();
   }
@@ -2411,10 +2833,12 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       .querySelectorAll(".codexl-settings-switch")
       .forEach((toggle) => {
         const setting = toggle.getAttribute("data-codexl-setting") || "showContextIndicators";
-        const enabled =
-          setting === "showAllSessions"
-            ? runtime.codexlSettings.showAllSessions
-            : runtime.codexlSettings.showContextIndicators;
+        const enabledBySetting = {
+          [ENABLE_DELETE_SESSION_KEY]: runtime.codexlSettings.enableDeleteSession,
+          [SHOW_ALL_SESSIONS_KEY]: runtime.codexlSettings.showAllSessions,
+          [SHOW_CONTEXT_INDICATORS_KEY]: runtime.codexlSettings.showContextIndicators,
+        };
+        const enabled = enabledBySetting[setting] === true;
         const state = enabled ? "checked" : "unchecked";
         toggle.setAttribute("aria-checked", state === "checked" ? "true" : "false");
         toggle.setAttribute("data-state", state);
@@ -2554,6 +2978,1099 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     refreshCodexLSettingsNav();
   }
 
+  function threadIdFromUrlLike(value) {
+    if (typeof value !== "string" || !value.trim() || value.trim().startsWith('#')) {
+      return null;
+    }
+    try {
+      const url = new URL(value, window.location.href);
+      if (url.origin !== window.location.origin) {
+        return null;
+      }
+      const queryThreadId =
+        url.searchParams.get("threadId") ||
+        url.searchParams.get("conversationId") ||
+        url.searchParams.get("sessionId") ||
+        url.searchParams.get("id");
+      if (queryThreadId) {
+        return normalizeThreadId(queryThreadId);
+      }
+      const routeNames = new Set([
+        "c",
+        "chat",
+        "conversation",
+        "conversations",
+        "local",
+        "no-project",
+        "no_project",
+        "projectless",
+        "projectless-session",
+        "projectless-sessions",
+        "remote",
+        "session",
+        "sessions",
+        "thread",
+        "threads",
+      ]);
+      const parts = url.pathname.split("/").filter(Boolean);
+      for (let index = 0; index < parts.length - 1; index += 1) {
+        if (!routeNames.has(parts[index])) {
+          continue;
+        }
+        const decoded = decodeURIComponent(parts[index + 1]);
+        const threadId = normalizeThreadId(decoded);
+        if (threadId) {
+          return threadId;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function sessionThreadIdFromElement(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+    let current = element;
+    let depth = 0;
+    while (current && current !== document.body && depth < 5) {
+      const hrefs = [
+        current instanceof HTMLAnchorElement
+          ? current.getAttribute("href") || current.href || ""
+          : "",
+        current.getAttribute("href") || "",
+        current.getAttribute("data-href") || "",
+        current.getAttribute("data-url") || "",
+      ];
+      for (const href of hrefs) {
+        const threadId = threadIdFromUrlLike(href);
+        if (threadId) {
+          return threadId;
+        }
+      }
+      for (const attr of [
+        "data-thread-id",
+        "data-threadid",
+        "data-conversation-id",
+        "data-conversationid",
+        "data-session-id",
+        "data-sessionid",
+      ]) {
+        const threadId = normalizeThreadId(current.getAttribute(attr));
+        if (threadId) {
+          return threadId;
+        }
+      }
+      const dataId = normalizeThreadId(current.getAttribute("data-id"));
+      if (
+        dataId &&
+        canUseDataIdAsSessionThreadId(current)
+      ) {
+        return dataId;
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    return null;
+  }
+
+  function sessionContainerSummary(element) {
+    let current = element;
+    const parts = [];
+    let depth = 0;
+    while (current && current !== document.body && depth < 6) {
+      if (current instanceof Element) {
+        parts.push(
+          [
+            current.tagName,
+            current.getAttribute("role") || "",
+            current.getAttribute("aria-label") || "",
+            current.getAttribute("data-testid") || "",
+            String(current.className || ""),
+          ].join(" ")
+        );
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    return parts.join(" ").toLowerCase();
+  }
+
+  function hasSessionIdAttribute(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    return [
+      "data-thread-id",
+      "data-threadid",
+      "data-conversation-id",
+      "data-conversationid",
+      "data-session-id",
+      "data-sessionid",
+    ].some((attr) => !!normalizeThreadId(element.getAttribute(attr)));
+  }
+
+  function sessionElementTestId(element) {
+    return element instanceof Element
+      ? (element.getAttribute("data-testid") || "").toLowerCase()
+      : "";
+  }
+
+  function hasSessionLikeTestId(element) {
+    return /thread|conversation|session/.test(sessionElementTestId(element));
+  }
+
+  function hasSessionDataIdAttribute(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const dataId = normalizeThreadId(element.getAttribute("data-id"));
+    if (!dataId || isSessionActionOnlyElement(element)) {
+      return false;
+    }
+    return /history|conversation|thread|session|projectless|remote|control/.test(
+      sessionContainerSummary(element)
+    );
+  }
+
+  function isSessionActionOnlyElement(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    if (!element.matches('button, [role="button"], [aria-haspopup], [aria-expanded]')) {
+      return false;
+    }
+    const label = [
+      element.getAttribute("aria-label") || "",
+      element.getAttribute("title") || "",
+      normalizedText(element),
+    ]
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    return /new chat|new conversation|add|create|search|filter|settings|menu|more|collapse|expand/.test(
+      label
+    );
+  }
+
+  function elementLooksLikeSessionRow(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    if (
+      hasSessionIdAttribute(element) ||
+      hasSessionDataIdAttribute(element) ||
+      hasSessionLikeTestId(element)
+    ) {
+      return true;
+    }
+    if (element.matches('a[href], [role="link"], [role="listitem"], li')) {
+      return true;
+    }
+    if (element.matches('button, [role="button"]') && !isSessionActionOnlyElement(element)) {
+      return true;
+    }
+    return false;
+  }
+
+  function isSessionSectionHeaderElement(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const tag = element.tagName.toLowerCase();
+    const role = (element.getAttribute("role") || "").toLowerCase();
+    if (/^h[1-6]$/.test(tag) || role === "heading" || role === "banner") {
+      return true;
+    }
+    const text = normalizedText(element).toLowerCase();
+    if (!text) {
+      return false;
+    }
+    const summary = sessionContainerSummary(element);
+    const isTitleLike =
+      /header|heading|title|toolbar/.test(summary) || /projectless|sidebar|history/.test(summary);
+    return (
+      !elementLooksLikeSessionRow(element) &&
+      isTitleLike &&
+      /^(chats|chats new chat|chat history|conversations|sessions)$/.test(text)
+    );
+  }
+
+  function canUseDataIdAsSessionThreadId(element) {
+    if (!(element instanceof Element) || isSessionSectionHeaderElement(element)) {
+      return false;
+    }
+    return (
+      /history|conversation|thread|session|projectless|remote|control/.test(
+        sessionContainerSummary(element)
+      ) &&
+      !isSessionActionOnlyElement(element)
+    );
+  }
+
+  function canUseLooseSessionFiber(element) {
+    if (!(element instanceof Element) || isSessionSectionHeaderElement(element)) {
+      return false;
+    }
+    return elementLooksLikeSessionRow(element);
+  }
+
+  function hasThreadLikeShape(value) {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+    const explicitThreadId = hasExplicitThreadIdField(value);
+    const remoteTaskId = nonEmptyString(value.id);
+    return (
+      typeof value.path === "string" ||
+      typeof value.rolloutPath === "string" ||
+      typeof value.sessionPath === "string" ||
+      typeof value.conversationRoute === "string" ||
+      typeof value.displayCwd === "string" ||
+      typeof value.modelProvider === "string" ||
+      typeof value.threadSource === "string" ||
+      typeof value.source === "string" ||
+      Array.isArray(value.turns) ||
+      Array.isArray(value.messages) ||
+      value.createdAt != null ||
+      value.created_at != null ||
+      value.updatedAt != null ||
+      value.updated_at != null ||
+      hasProjectlessThreadShape(value) ||
+      (explicitThreadId &&
+        (hasSessionishThreadShape(value) ||
+          typeof value.preview === "string" ||
+          typeof value.name === "string" ||
+          typeof value.title === "string" ||
+          typeof value.threadTitle === "string" ||
+          typeof value.titleOverride === "string" ||
+          value.threadTitle != null ||
+          value.titleOverride != null)) ||
+      (remoteTaskId &&
+        (typeof value.title === "string" ||
+          typeof value.task_title === "string" ||
+          value.task_status_display != null ||
+          value.has_unread_turn != null ||
+          value.latest_turn_status_display != null) &&
+        (value.created_at != null ||
+          value.updated_at != null ||
+          value.task_status_display != null ||
+          value.has_unread_turn != null)) ||
+      (typeof value.cwd === "string" &&
+        (typeof value.preview === "string" ||
+          typeof value.name === "string" ||
+          typeof value.title === "string")) ||
+      (typeof value.displayCwd === "string" &&
+        (typeof value.preview === "string" ||
+          typeof value.threadTitle === "string" ||
+          typeof value.title === "string" ||
+          value.titleOverride != null)) ||
+      (typeof value.preview === "string" &&
+        (value.status || typeof value.name === "string" || typeof value.title === "string"))
+    );
+  }
+
+  function nonEmptyString(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  }
+
+  function lowerString(value) {
+    return nonEmptyString(value)?.toLowerCase() || "";
+  }
+
+  function hasExplicitThreadIdField(value) {
+    return !!(
+      nonEmptyString(value?.threadId) ||
+      nonEmptyString(value?.thread_id) ||
+      nonEmptyString(value?.conversationId) ||
+      nonEmptyString(value?.conversation_id) ||
+      nonEmptyString(value?.sessionId) ||
+      nonEmptyString(value?.session_id)
+    );
+  }
+
+  function hasProjectlessThreadShape(value) {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+    return (
+      lowerString(value.workspaceKind || value.workspace_kind) === "projectless" ||
+      value.projectless === true ||
+      value.isProjectless === true ||
+      typeof value.projectlessOutputDirectory === "string" ||
+      typeof value.projectless_output_directory === "string" ||
+      [value.source, value.threadSource, value.sourceKind]
+        .map(lowerString)
+        .some((value) => value.includes("projectless")) ||
+      (value.projectId === null &&
+        (value.cwd == null ||
+          typeof value.preview === "string" ||
+          typeof value.name === "string" ||
+          typeof value.title === "string")) ||
+      (value.project === null &&
+        (typeof value.preview === "string" ||
+          typeof value.name === "string" ||
+          typeof value.title === "string"))
+    );
+  }
+
+  function hasSessionishThreadShape(value) {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+    return (
+      value.forkedFromId != null ||
+      value.forked_from_id != null ||
+      value.created_at != null ||
+      value.updated_at != null ||
+      value.lastMessageAt != null ||
+      value.last_message_at != null ||
+      value.lastActivityAt != null ||
+      value.last_activity_at != null ||
+      value.turnCount != null ||
+      value.turn_count != null ||
+      value.messageCount != null ||
+      value.message_count != null ||
+      value.workspaceKind != null ||
+      value.workspace_kind != null ||
+      value.workspaceRoot != null ||
+      value.workspace_root != null ||
+      value.projectId === null ||
+      value.project === null ||
+      value.workspace === null ||
+      typeof value.sourceKind === "string" ||
+      Array.isArray(value.sourceKinds) ||
+      Array.isArray(value.source_kinds) ||
+      value.task_status_display != null ||
+      value.latest_turn_status_display != null ||
+      value.has_unread_turn != null ||
+      value.conversationRoute != null ||
+      value.displayCwd != null ||
+      value.threadTitle != null ||
+      value.titleOverride != null ||
+      typeof value.archived === "boolean" ||
+      typeof value.ephemeral === "boolean" ||
+      typeof value.pinned === "boolean" ||
+      typeof value.favorite === "boolean" ||
+      (value.status && typeof value.status === "object" && typeof value.status.type === "string")
+    );
+  }
+
+  function threadIdFromThreadLikeObject(value) {
+    return normalizeThreadId(
+      value?.threadId ??
+        value?.thread_id ??
+        value?.conversationId ??
+        value?.conversation_id ??
+        value?.sessionId ??
+        value?.session_id ??
+        value?.id
+    );
+  }
+
+  function threadTitleFromThreadLikeObject(value) {
+    return nonEmptyString(
+      value?.threadTitle ??
+        value?.thread_title ??
+        value?.titleOverride ??
+        value?.title_override ??
+        value?.title ??
+        value?.task_title ??
+        value?.name ??
+        value?.preview
+    );
+  }
+
+  function findAnyThreadLikeObject(value, depth = 0, seen = new WeakSet()) {
+    if (!value || typeof value !== "object" || depth > 5) {
+      return null;
+    }
+    if (seen.has(value)) {
+      return null;
+    }
+    seen.add(value);
+    if (threadIdFromThreadLikeObject(value) && hasThreadLikeShape(value)) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 40)) {
+        const found = findAnyThreadLikeObject(item, depth + 1, seen);
+        if (found) {
+          return found;
+        }
+      }
+      return null;
+    }
+    const priorityKeys = [
+      "thread",
+      "conversation",
+      "localConversation",
+      "remoteTask",
+      "task",
+      "session",
+      "item",
+      "data",
+      "props",
+      "memoizedProps",
+      "pendingProps",
+    ];
+    for (const key of priorityKeys) {
+      const found = findAnyThreadLikeObject(value[key], depth + 1, seen);
+      if (found) {
+        return found;
+      }
+    }
+    for (const key of Object.keys(value).slice(0, 40)) {
+      if (priorityKeys.includes(key)) {
+        continue;
+      }
+      const found = findAnyThreadLikeObject(value[key], depth + 1, seen);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  function isLikelySessionCandidateElement(element, candidate) {
+    if (!candidate?.threadId || !isElementVisible(element)) {
+      return false;
+    }
+    if (isSessionSectionHeaderElement(element)) {
+      return false;
+    }
+    if (
+      element.closest(
+        `[${SETTINGS_PANEL_ATTR}="1"], #${ROOT_ID}, [${SESSION_DELETE_BUTTON_ATTR}="1"]`
+      )
+    ) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    if (rect.height > 130 || rect.width < 48) {
+      return false;
+    }
+    const text = normalizedText(element);
+    if (text.length > 280) {
+      return false;
+    }
+    if (!candidate.fromDom && !canUseLooseSessionFiber(element)) {
+      return false;
+    }
+    const summary = sessionContainerSummary(element);
+    if (
+      /sidebar|side-bar|history|conversation|thread|session|projectless|remote|control|navigation|nav\b/.test(
+        summary
+      )
+    ) {
+      return elementLooksLikeSessionRow(element);
+    }
+    return (
+      rect.left <= Math.max(460, window.innerWidth * 0.44) &&
+      rect.width <= 680 &&
+      (candidate.path ||
+        element.matches(
+          'a[href], button, [role="button"], [role="link"], [role="listitem"], li, [data-testid], [data-thread-id], [data-threadid], [data-conversation-id], [data-conversationid], [data-session-id], [data-sessionid]'
+        ))
+    );
+  }
+
+  function findSessionDeleteHost(element) {
+    const elementRect = element.getBoundingClientRect();
+    let fallback = null;
+    let current = element;
+    let depth = 0;
+    while (current && current !== document.body && depth < 7) {
+      if (current instanceof HTMLElement) {
+        const rect = current.getBoundingClientRect();
+        const usable =
+          rect.width <= 720 &&
+          rect.height <= 140 &&
+          rect.height >= elementRect.height - 2 &&
+          rect.width >= Math.max(80, elementRect.width * 0.8);
+        if (usable && !isSessionSectionHeaderElement(current)) {
+          if (
+            elementLooksLikeSessionRow(current) &&
+            !isSessionActionOnlyElement(current)
+          ) {
+            return current;
+          }
+          fallback ||= current;
+        }
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    return fallback || element;
+  }
+
+  function hasLayoutBox(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+
+  function sessionActionButtons(host) {
+    if (!(host instanceof Element)) {
+      return [];
+    }
+    const hostRect = host.getBoundingClientRect();
+    const minRight = hostRect.left + hostRect.width * 0.48;
+    const buttons = Array.from(
+      host.querySelectorAll('button, [role="button"], a[href], [tabindex]')
+    ).filter((button) => {
+      if (!(button instanceof HTMLElement)) {
+        return false;
+      }
+      if (button.hasAttribute(SESSION_DELETE_BUTTON_ATTR)) {
+        return false;
+      }
+      return true;
+    });
+    const positioned = buttons.filter((button) => {
+      if (!hasLayoutBox(button)) {
+        return false;
+      }
+      const rect = button.getBoundingClientRect();
+      const compact =
+        rect.width <= Math.max(72, hostRect.height * 1.8) &&
+        rect.height <= Math.max(48, hostRect.height + 10);
+      return compact && rect.right >= minRight;
+    });
+    if (positioned.length > 0) {
+      return positioned;
+    }
+    return buttons
+      .filter((button) => {
+        const label = [
+          button.getAttribute("aria-label") || "",
+          button.getAttribute("title") || "",
+          normalizedText(button),
+        ].join(" ");
+        return label.trim().length <= 100;
+      })
+      .slice(-3);
+  }
+
+  function findSessionActionSlot(host) {
+    const buttons = sessionActionButtons(host).sort((first, second) => {
+      const firstRect = first.getBoundingClientRect();
+      const secondRect = second.getBoundingClientRect();
+      return secondRect.right - firstRect.right;
+    });
+    const template = buttons[0] || null;
+    if (template?.parentElement) {
+      const siblings = buttons.filter((button) => button.parentElement === template.parentElement);
+      siblings.sort((first, second) => first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+      return {
+        container: template.parentElement,
+        reference: siblings[siblings.length - 1] || template,
+        template,
+      };
+    }
+
+    const hostRect = host.getBoundingClientRect();
+    const rightSideChildren = Array.from(host.children)
+      .filter((child) => child instanceof HTMLElement && hasLayoutBox(child))
+      .map((child) => ({ child, rect: child.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.right >= hostRect.left + hostRect.width * 0.62);
+    rightSideChildren.sort((first, second) => second.rect.right - first.rect.right);
+    if (rightSideChildren[0]?.child) {
+      return {
+        container: host,
+        reference: rightSideChildren[0].child,
+        template: null,
+      };
+    }
+
+    return {
+      container: host,
+      reference: null,
+      template: null,
+    };
+  }
+
+  function findThreadLikeObject(value, threadId, depth = 0, seen = new WeakSet()) {
+    if (!value || typeof value !== "object" || depth > 5) {
+      return null;
+    }
+    if (seen.has(value)) {
+      return null;
+    }
+    seen.add(value);
+    const valueThreadId = threadIdFromThreadLikeObject(value);
+    if (
+      valueThreadId === threadId &&
+      hasThreadLikeShape(value)
+    ) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 40)) {
+        const found = findThreadLikeObject(item, threadId, depth + 1, seen);
+        if (found) {
+          return found;
+        }
+      }
+      return null;
+    }
+    const priorityKeys = [
+      "thread",
+      "conversation",
+      "localConversation",
+      "remoteTask",
+      "task",
+      "item",
+      "data",
+      "props",
+      "memoizedProps",
+      "pendingProps",
+    ];
+    for (const key of priorityKeys) {
+      const found = findThreadLikeObject(value[key], threadId, depth + 1, seen);
+      if (found) {
+        return found;
+      }
+    }
+    for (const key of Object.keys(value).slice(0, 40)) {
+      if (priorityKeys.includes(key)) {
+        continue;
+      }
+      const found = findThreadLikeObject(value[key], threadId, depth + 1, seen);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  function sessionDataFromElement(element, threadId = null) {
+    try {
+      let fiber = getFiber(element);
+      let depth = 0;
+      while (fiber && depth < 8) {
+        const found = threadId
+          ? findThreadLikeObject(fiber.memoizedProps, threadId) ||
+            findThreadLikeObject(fiber.pendingProps, threadId)
+          : findAnyThreadLikeObject(fiber.memoizedProps) ||
+            findAnyThreadLikeObject(fiber.pendingProps);
+        if (found) {
+          return found;
+        }
+        fiber = fiber.return || null;
+        depth += 1;
+      }
+    } catch {}
+    return null;
+  }
+
+  function sessionPathFromData(data) {
+    const path = data?.path || data?.rolloutPath || data?.sessionPath || data?.filePath;
+    return typeof path === "string" && path.trim() ? path.trim() : null;
+  }
+
+  function sessionCandidateFromData(data, element = null, fromDom = false) {
+    const threadId = threadIdFromThreadLikeObject(data);
+    if (!threadId) {
+      return null;
+    }
+    return {
+      element,
+      fromDom,
+      path: sessionPathFromData(data),
+      threadId,
+      title: threadTitleFromThreadLikeObject(data),
+    };
+  }
+
+  function sessionPathFromElement(element, threadId) {
+    return sessionPathFromData(sessionDataFromElement(element, threadId));
+  }
+
+  function sessionCandidateFromElement(element) {
+    const hrefThreadId = sessionThreadIdFromElement(element);
+    if (!hrefThreadId && !canUseLooseSessionFiber(element)) {
+      return null;
+    }
+    const data = sessionDataFromElement(element, hrefThreadId);
+    const dataThreadId = threadIdFromThreadLikeObject(data);
+    const threadId = hrefThreadId || dataThreadId;
+    if (!threadId) {
+      return null;
+    }
+    return {
+      element,
+      fromDom: !!hrefThreadId,
+      path: sessionPathFromData(data),
+      threadId,
+      title: threadTitleFromThreadLikeObject(data),
+    };
+  }
+
+  function sessionCandidateFromFiber(fiber) {
+    if (!fiber || typeof fiber !== "object") {
+      return null;
+    }
+    const data =
+      findAnyThreadLikeObject(fiber.memoizedProps) ||
+      findAnyThreadLikeObject(fiber.pendingProps);
+    return sessionCandidateFromData(data);
+  }
+
+  function sessionFiberHostScore(element, candidate) {
+    if (!(element instanceof HTMLElement) || !isElementVisible(element)) {
+      return -1;
+    }
+    if (
+      element.closest(
+        `[${SETTINGS_PANEL_ATTR}="1"], #${ROOT_ID}, [${SESSION_DELETE_BUTTON_ATTR}="1"]`
+      )
+    ) {
+      return -1;
+    }
+    const rect = element.getBoundingClientRect();
+    if (rect.height < 18 || rect.height > 140 || rect.width < 80 || rect.width > 760) {
+      return -1;
+    }
+    const text = normalizedText(element);
+    if (!text || text.length > 280) {
+      return -1;
+    }
+    const summary = sessionContainerSummary(element);
+    const rowClassHint = /h-token-nav-row|token-nav-row|list-hover|group\/inline|sidebar|recent|task|thread|conversation|session/.test(summary);
+    const rowDomHint =
+      element.matches('[role="button"], button, a[href], li, [role="listitem"]') &&
+      (rowClassHint || !!element.querySelector("[data-thread-title]"));
+    if (!rowDomHint) {
+      return -1;
+    }
+    let score = 1;
+    if (element.matches('[role="button"], button, a[href], li, [role="listitem"]')) {
+      score += 3;
+    }
+    if (element.querySelector("[data-thread-title]")) {
+      score += 5;
+    }
+    if (rowClassHint) {
+      score += 3;
+    }
+    if (candidate?.title && text.toLowerCase().includes(candidate.title.toLowerCase())) {
+      score += 4;
+    }
+    return score;
+  }
+
+  function sessionHostElementFromFiber(fiber, candidate) {
+    let best = null;
+    let bestScore = -1;
+    const seen = new Set();
+    const visit = (node, depth) => {
+      if (!node || seen.has(node) || depth > 12) {
+        return;
+      }
+      seen.add(node);
+      if (node.stateNode instanceof HTMLElement) {
+        const score = sessionFiberHostScore(node.stateNode, candidate);
+        if (score > bestScore) {
+          best = node.stateNode;
+          bestScore = score;
+        }
+      }
+      let child = node.child || null;
+      while (child) {
+        visit(child, depth + 1);
+        child = child.sibling || null;
+      }
+    };
+    visit(fiber, 0);
+    return best;
+  }
+
+  function removeDeletedSessionHost(host, threadId) {
+    if (threadId) {
+      runtime.deletedSessionIds.add(threadId);
+    }
+    try {
+      host?.remove();
+    } catch {}
+    if (threadId && threadIdFromLocation() === threadId) {
+      const base = window.location.pathname.startsWith("/remote") ? "/remote" : "/local";
+      try {
+        window.history.pushState(window.history.state, "", base);
+        window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
+      } catch {
+        window.location.assign(base);
+      }
+    }
+  }
+
+  function sessionDeleteButtonSvg() {
+    return `
+      <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 6h18"></path>
+        <path d="M8 6V4h8v2"></path>
+        <path d="M19 6l-1 14H6L5 6"></path>
+        <path d="M10 11v5"></path>
+        <path d="M14 11v5"></path>
+      </svg>
+    `;
+  }
+
+  function createSessionDeleteButton(template) {
+    const button =
+      template instanceof HTMLElement
+        ? template.cloneNode(true)
+        : document.createElement("button");
+    if (button instanceof HTMLAnchorElement) {
+      button.removeAttribute("href");
+    }
+    if (button instanceof HTMLButtonElement) {
+      button.type = "button";
+      button.disabled = false;
+    }
+    button.removeAttribute("id");
+    button.removeAttribute("data-testid");
+    button.removeAttribute("aria-controls");
+    button.removeAttribute("aria-expanded");
+    button.removeAttribute("aria-haspopup");
+    button.removeAttribute("data-state");
+    button.title = "Delete session";
+    button.setAttribute("aria-label", "Delete session");
+    button.setAttribute(SESSION_DELETE_BUTTON_ATTR, "1");
+    button.innerHTML = sessionDeleteButtonSvg();
+    button.style.position = "";
+    button.style.inset = "";
+    button.style.left = "";
+    button.style.right = "";
+    button.style.top = "";
+    button.style.bottom = "";
+    button.style.transform = "";
+    return button;
+  }
+
+  function ensureSessionDeleteButton(element, candidate = sessionCandidateFromElement(element)) {
+    if (!candidate?.threadId) {
+      return;
+    }
+    const { path, threadId } = candidate;
+    const host = findSessionDeleteHost(element);
+    if (!host || !(host instanceof HTMLElement)) {
+      return;
+    }
+    if (runtime.deletedSessionIds.has(threadId)) {
+      removeDeletedSessionHost(host, threadId);
+      return;
+    }
+    host.setAttribute(SESSION_DELETE_HOST_ATTR, "1");
+    host.dataset.codexlSessionThreadId = threadId;
+    if (path) {
+      host.dataset.codexlSessionPath = path;
+    }
+    const slot = findSessionActionSlot(host);
+    let button = host.querySelector(`[${SESSION_DELETE_BUTTON_ATTR}="1"]`);
+    if (!button) {
+      button = createSessionDeleteButton(slot.template);
+      if (slot.reference?.parentElement === slot.container) {
+        slot.reference.after(button);
+      } else {
+        slot.container.appendChild(button);
+      }
+    }
+    button.onclick = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      if (button.dataset.state === "deleting") {
+        return;
+      }
+      button.dataset.state = "deleting";
+      button.disabled = true;
+      const path =
+        host.dataset.codexlSessionPath ||
+        sessionPathFromElement(host, threadId) ||
+        sessionPathFromElement(element, threadId);
+      try {
+        await request("session:delete", { path, threadId });
+        removeDeletedSessionHost(host, threadId);
+      } catch (error) {
+        button.disabled = false;
+        button.dataset.state = "error";
+        log("error", "Delete session failed", String(error));
+        window.setTimeout(() => {
+          if (button.dataset.state === "error") {
+            delete button.dataset.state;
+          }
+        }, 1600);
+      }
+    };
+  }
+
+  function removeSessionDeleteControls() {
+    document
+      .querySelectorAll(`[${SESSION_DELETE_BUTTON_ATTR}="1"]`)
+      .forEach((button) => button.remove());
+    document
+      .querySelectorAll(`[${SESSION_DELETE_HOST_ATTR}="1"]`)
+      .forEach((host) => {
+        host.removeAttribute(SESSION_DELETE_HOST_ATTR);
+        delete host.dataset.codexlSessionThreadId;
+        delete host.dataset.codexlSessionPath;
+      });
+  }
+
+  function updateSessionDeleteControls() {
+    if (!document.body) {
+      return;
+    }
+    if (!runtime.codexlSettings.enableDeleteSession) {
+      removeSessionDeleteControls();
+      return;
+    }
+    const selector = [
+      'a[href]',
+      'button',
+      'li',
+      '[role="button"]',
+      '[role="link"]',
+      '[data-testid]',
+      '[data-testid*="thread"]',
+      '[data-testid*="conversation"]',
+      '[data-testid*="session"]',
+      '[data-thread-id]',
+      '[data-threadid]',
+      '[data-conversation-id]',
+      '[data-conversationid]',
+      '[data-session-id]',
+      '[data-sessionid]',
+      '[data-id]',
+    ].join(",");
+    const seenHosts = new Set();
+    Array.from(document.querySelectorAll(selector))
+      .slice(0, 600)
+      .forEach((element) => {
+        const candidate = sessionCandidateFromElement(element);
+        if (!isLikelySessionCandidateElement(element, candidate)) {
+          return;
+        }
+        const host = findSessionDeleteHost(element);
+        if (seenHosts.has(host)) {
+          return;
+        }
+        seenHosts.add(host);
+        ensureSessionDeleteButton(element, candidate);
+      });
+    updateSessionDeleteControlsFromFibers(seenHosts);
+  }
+
+  function updateSessionDeleteControlsFromFibers(seenHosts = new Set()) {
+    const root = runtime.lastFiberRoot?.current || runtime.lastFiberRoot;
+    if (!root) {
+      return;
+    }
+    const seenFibers = new Set();
+    let visited = 0;
+    const visit = (fiber) => {
+      if (!fiber || seenFibers.has(fiber) || visited > 6000) {
+        return;
+      }
+      seenFibers.add(fiber);
+      visited += 1;
+      const candidate = sessionCandidateFromFiber(fiber);
+      if (candidate?.threadId) {
+        const host = sessionHostElementFromFiber(fiber, candidate);
+        if (
+          host &&
+          !seenHosts.has(host) &&
+          isLikelySessionCandidateElement(host, candidate)
+        ) {
+          seenHosts.add(host);
+          ensureSessionDeleteButton(host, candidate);
+        }
+      }
+      visit(fiber.child || null);
+      visit(fiber.sibling || null);
+    };
+    visit(root);
+  }
+
+  function sessionDeleteDiagnostics() {
+    const selector =
+      'a[href], button, li, [role="button"], [role="link"], [data-testid], [data-thread-id], [data-threadid], [data-conversation-id], [data-conversationid], [data-session-id], [data-sessionid], [data-id]';
+    const samples = [];
+    for (const element of Array.from(document.querySelectorAll(selector)).slice(0, 120)) {
+      const candidate = sessionCandidateFromElement(element);
+      if (candidate?.threadId) {
+        samples.push({
+          candidate,
+          summary: elementDebugSummary(element),
+        });
+        if (samples.length >= 20) {
+          break;
+        }
+      }
+    }
+    const fiberSamples = [];
+    const root = runtime.lastFiberRoot?.current || runtime.lastFiberRoot;
+    const seenFibers = new Set();
+    let visited = 0;
+    const visit = (fiber) => {
+      if (!fiber || seenFibers.has(fiber) || visited > 1200 || fiberSamples.length >= 20) {
+        return;
+      }
+      seenFibers.add(fiber);
+      visited += 1;
+      const candidate = sessionCandidateFromFiber(fiber);
+      if (candidate?.threadId) {
+        const host = sessionHostElementFromFiber(fiber, candidate);
+        fiberSamples.push({
+          candidate,
+          host: elementDebugSummary(host),
+          hostScore: sessionFiberHostScore(host, candidate),
+        });
+      }
+      visit(fiber.child || null);
+      visit(fiber.sibling || null);
+    };
+    visit(root);
+    return {
+      enabled: runtime.codexlSettings.enableDeleteSession,
+      fiberSamples,
+      href: window.location.href,
+      samples,
+    };
+  }
+
+  function scheduleSessionDeleteRefresh() {
+    if (runtime.sessionDeleteScheduled) {
+      return;
+    }
+    runtime.sessionDeleteScheduled = true;
+    window.requestAnimationFrame(() => {
+      runtime.sessionDeleteScheduled = false;
+      updateSessionDeleteControls();
+    });
+  }
+
+  function installSessionDeleteInjector() {
+    if (runtime.sessionDeleteInjectorInstalled || !document.body) {
+      return;
+    }
+    runtime.sessionDeleteInjectorInstalled = true;
+    const observer = new MutationObserver(scheduleSessionDeleteRefresh);
+    observer.observe(document.body, { childList: true, subtree: true });
+    const interval = window.setInterval(updateSessionDeleteControls, 1500);
+    runtime.cleanup.push(() => observer.disconnect());
+    runtime.cleanup.push(() => window.clearInterval(interval));
+    updateSessionDeleteControls();
+  }
+
   function toFiniteNumber(value) {
     if (typeof value === "number" && Number.isFinite(value)) {
       return value;
@@ -2567,6 +4084,25 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     const parsed = Number(normalized);
     return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function firstFiniteNumber(...values) {
+    for (const value of values) {
+      const number = toFiniteNumber(value);
+      if (number != null) {
+        return number;
+      }
+    }
+    return null;
+  }
+
+  function firstObject(...values) {
+    for (const value of values) {
+      if (value && typeof value === "object") {
+        return value;
+      }
+    }
+    return null;
   }
 
   function clampPercent(value) {
@@ -2642,13 +4178,111 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return threadId;
   }
 
-  function contextUsageFromTokenUsage(tokenUsage, source) {
-    if (!tokenUsage || typeof tokenUsage !== "object") {
+  function tokenUsageTotalTokens(usage) {
+    if (!usage || typeof usage !== "object") {
       return null;
     }
-    const last = tokenUsage.last && typeof tokenUsage.last === "object" ? tokenUsage.last : null;
-    const contextWindow = toFiniteNumber(tokenUsage.modelContextWindow);
-    const totalTokens = toFiniteNumber(last?.totalTokens);
+    const direct = firstFiniteNumber(usage.totalTokens, usage.total_tokens, usage.total);
+    if (direct != null) {
+      return direct;
+    }
+    const input = firstFiniteNumber(
+      usage.inputTokens,
+      usage.input_tokens,
+      usage.promptTokens,
+      usage.prompt_tokens
+    );
+    const output = firstFiniteNumber(
+      usage.outputTokens,
+      usage.output_tokens,
+      usage.completionTokens,
+      usage.completion_tokens
+    );
+    if (input != null || output != null) {
+      return (input || 0) + (output || 0);
+    }
+    return null;
+  }
+
+  function hasTokenUsageShape(value) {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+    return (
+      firstFiniteNumber(
+        value.modelContextWindow,
+        value.model_context_window,
+        value.contextWindow,
+        value.context_window,
+        value.maxContextWindow,
+        value.max_context_window
+      ) != null ||
+      firstObject(
+        value.last,
+        value.lastTokenUsage,
+        value.last_token_usage,
+        value.totalTokenUsage,
+        value.total_token_usage
+      ) != null ||
+      tokenUsageTotalTokens(value) != null
+    );
+  }
+
+  function tokenUsageFromValue(value) {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    if (value.type === "token_count" && value.info && typeof value.info === "object") {
+      return value.info;
+    }
+    if (
+      value.payload?.type === "token_count" &&
+      value.payload.info &&
+      typeof value.payload.info === "object"
+    ) {
+      return value.payload.info;
+    }
+    const nested = firstObject(
+      value.latestTokenUsageInfo,
+      value.latest_token_usage_info,
+      value.tokenUsageInfo,
+      value.token_usage_info,
+      value.tokenUsage,
+      value.token_usage,
+      value.usageInfo,
+      value.usage_info,
+      value.usage
+    );
+    if (nested) {
+      return nested;
+    }
+    return hasTokenUsageShape(value) ? value : null;
+  }
+
+  function contextUsageFromTokenUsage(tokenUsage, source) {
+    const normalizedTokenUsage = tokenUsageFromValue(tokenUsage);
+    if (!normalizedTokenUsage || typeof normalizedTokenUsage !== "object") {
+      return null;
+    }
+    const last =
+      firstObject(
+        normalizedTokenUsage.last,
+        normalizedTokenUsage.lastTokenUsage,
+        normalizedTokenUsage.last_token_usage
+      ) ||
+      firstObject(
+        normalizedTokenUsage.totalTokenUsage,
+        normalizedTokenUsage.total_token_usage
+      ) || normalizedTokenUsage;
+    const contextWindow = firstFiniteNumber(
+      normalizedTokenUsage.modelContextWindow,
+      normalizedTokenUsage.model_context_window,
+      normalizedTokenUsage.contextWindow,
+      normalizedTokenUsage.context_window,
+      normalizedTokenUsage.maxContextWindow,
+      normalizedTokenUsage.max_context_window
+    );
+    const totalTokens = tokenUsageTotalTokens(last);
     if (contextWindow == null || contextWindow <= 0 || totalTokens == null || totalTokens < 0) {
       return null;
     }
@@ -2683,7 +4317,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     if (!conversationState || typeof conversationState !== "object") {
       return null;
     }
-    return conversationState.latestTokenUsageInfo ?? null;
+    return tokenUsageFromValue(conversationState);
   }
 
   function threadStreamStateParams(message) {
@@ -2714,6 +4348,10 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     seen.add(value);
     let found = false;
     const currentThreadId = normalizeThreadId(value.threadId ?? value.conversationId ?? value.id) || threadId;
+    const ownTokenUsage = tokenUsageFromValue(value);
+    if (ownTokenUsage) {
+      found = rememberContextUsageForThread(currentThreadId, ownTokenUsage, source) || found;
+    }
     if (Array.isArray(value)) {
       for (const item of value.slice(0, 50)) {
         found = scanAppServerTokenUsage(item, currentThreadId, source, depth + 1, seen) || found;
@@ -2727,7 +4365,15 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       } catch {
         continue;
       }
-      if (key === "latestTokenUsageInfo") {
+      if (
+        key === "latestTokenUsageInfo" ||
+        key === "latest_token_usage_info" ||
+        key === "tokenUsageInfo" ||
+        key === "token_usage_info" ||
+        key === "tokenUsage" ||
+        key === "token_usage" ||
+        key === "usage"
+      ) {
         found = rememberContextUsageForThread(currentThreadId, child, source) || found;
         continue;
       }
@@ -2774,7 +4420,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     if (method === "thread/tokenUsage/updated") {
       rememberContextUsageForThread(
         params.threadId ?? params.conversationId,
-        params.tokenUsage,
+        tokenUsageFromValue(params),
         "app-server:thread/tokenUsage/updated"
       );
       return true;
@@ -2814,6 +4460,15 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       return;
     }
     if (handleMcpNotification(message)) {
+      return;
+    }
+    if (
+      scanAppServerTokenUsage(
+        message,
+        normalizeThreadId(message.threadId ?? message.conversationId ?? message.id),
+        "app-server:message"
+      )
+    ) {
       return;
     }
     handleMcpRequestOrResponse(message);
@@ -2859,15 +4514,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   }
 
   function threadIdFromLocation() {
-    const match = window.location.pathname.match(/^\/(?:local|remote)\/([^/]+)/);
-    if (!match) {
-      return null;
-    }
-    try {
-      return normalizeThreadId(decodeURIComponent(match[1]));
-    } catch {
-      return normalizeThreadId(match[1]);
-    }
+    return threadIdFromUrlLike(window.location.href);
   }
 
   function isNewThreadLocation() {
@@ -2891,11 +4538,51 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
   }
 
+  function refreshContextUsageFromSession(threadId) {
+    const normalizedThreadId = normalizeThreadId(threadId);
+    if (!normalizedThreadId) {
+      return;
+    }
+    const now = Date.now();
+    const state = runtime.contextUsageSessionRefreshByThread.get(normalizedThreadId) || {};
+    if (state.pending || now - (state.lastAttempt || 0) < 5000) {
+      return;
+    }
+    runtime.contextUsageSessionRefreshByThread.set(normalizedThreadId, {
+      ...state,
+      lastAttempt: now,
+      pending: true,
+    });
+    request("session:context-usage", { threadId: normalizedThreadId })
+      .then((response) => {
+        const tokenUsage = tokenUsageFromValue(response);
+        if (tokenUsage) {
+          rememberContextUsageForThread(
+            response?.threadId ?? normalizedThreadId,
+            tokenUsage,
+            "session:context-usage"
+          );
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        const latest = runtime.contextUsageSessionRefreshByThread.get(normalizedThreadId) || {};
+        runtime.contextUsageSessionRefreshByThread.set(normalizedThreadId, {
+          ...latest,
+          pending: false,
+        });
+      });
+  }
+
   function currentContextUsage() {
     syncActiveThreadFromLocation();
     const threadId = normalizeThreadId(runtime.activeThreadId);
     if (threadId) {
-      return runtime.contextUsageByThread.get(threadId) || null;
+      const usage = runtime.contextUsageByThread.get(threadId) || null;
+      if (!usage) {
+        refreshContextUsageFromSession(threadId);
+      }
+      return usage;
     }
     return null;
   }
@@ -3223,6 +4910,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     installGlobalStyle();
     installCodexAppServerContextBridge();
     installCodexLSettingsInjector();
+    installSessionDeleteInjector();
     installContextIndicator();
     if (document.getElementById(ROOT_ID)) {
       updateUi();
@@ -3425,6 +5113,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           settingsDebugLog("manual settings diagnostics", diagnostics);
           return diagnostics;
         },
+        debugSessionDelete: sessionDeleteDiagnostics,
+        refreshSessionDelete: updateSessionDeleteControls,
+        setEnableDeleteSession,
         setShowContextIndicators,
         values: runtime.codexlSettings,
       },
@@ -3473,6 +5164,20 @@ mod tests {
         let script = codex_plugin_bootstrap_script("ws://127.0.0.1:14588/plugin/_bridge?token=t");
 
         assert!(script.contains("CodexL"));
+        assert!(script.contains("Enable Delete Session"));
+        assert!(script.contains("enableDeleteSession"));
+        assert!(script.contains("session:delete"));
+        assert!(script.contains("codexl-session-delete-button"));
+        assert!(script.contains("isSessionSectionHeaderElement"));
+        assert!(script.contains("hasSessionDataIdAttribute"));
+        assert!(script.contains("canUseLooseSessionFiber"));
+        assert!(script.contains("updateSessionDeleteControlsFromFibers"));
+        assert!(script.contains("sessionHostElementFromFiber"));
+        assert!(script.contains("conversationRoute"));
+        assert!(script.contains("task_status_display"));
+        assert!(script.contains("hasProjectlessThreadShape"));
+        assert!(script.contains("projectlessOutputDirectory"));
+        assert!(script.contains("data-conversation-id"));
         assert!(script.contains("Show Context Indicators"));
         assert!(script.contains("Show All Sessions"));
         assert!(script.contains("showContextIndicators"));
@@ -3480,22 +5185,27 @@ mod tests {
         assert!(script.contains("codexl-context-indicator"));
         assert!(script.contains("findComposerSendButton"));
         assert!(script.contains("container.insertBefore(indicator, sendButton)"));
+        assert!(script.contains("session:context-usage"));
+        assert!(script.contains("refreshContextUsageFromSession"));
+        assert!(script.contains("token_count"));
         assert!(script.contains("thread/tokenUsage/updated"));
         assert!(script.contains("modelContextWindow"));
-        assert!(script.contains("last?.totalTokens"));
+        assert!(script.contains("model_context_window"));
+        assert!(script.contains("tokenUsageTotalTokens"));
+        assert!(script.contains("last_token_usage"));
         assert!(script.contains("latestTokenUsageInfo"));
+        assert!(script.contains("tokenUsageInfo"));
         assert!(script.contains("threadIdFromLocation"));
         assert!(script.contains("toLocaleString(\"en-US\")"));
         assert!(script.contains("data-codexl-context-title"));
         assert!(script.contains("codexl-context-indicator-tooltip"));
         assert!(script.contains("bindContextIndicatorTooltip"));
-        assert!(script.contains("return runtime.contextUsageByThread.get(threadId) || null"));
+        assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
         assert!(script.contains("background: transparent"));
         assert!(script.contains("border: 0"));
         assert!(!script.contains("right: 48px"));
         assert!(!script.contains("bottom: 12px"));
         assert!(!script.contains("contextWindow ??"));
-        assert!(!script.contains("tokenUsageInfo"));
         assert!(!script.contains("lastTotalTokens"));
         assert!(!script.contains("if (!runtime.activeThreadId)"));
         assert!(!script.contains("return runtime.latestContextUsage || null"));
@@ -3528,6 +5238,52 @@ mod tests {
     fn plugin_bridge_accepts_registered_token() {
         let token = register_plugin_bridge_token();
         assert!(plugin_bridge_token_valid(Some(&format!("token={}", token))));
+    }
+
+    #[test]
+    fn latest_session_context_usage_reads_token_count_events() {
+        let dir = std::env::temp_dir().join(format!("codexl-context-{}", random_token()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("session.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"thread-1"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":42},"model_context_window":1000}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":7},"model_context_window":2000}}}
+"#,
+        )
+        .expect("write session");
+
+        let usage = latest_session_context_usage(&path).expect("token usage");
+
+        assert_eq!(
+            usage
+                .pointer("/last_token_usage/input_tokens")
+                .and_then(Value::as_i64),
+            Some(50)
+        );
+        assert_eq!(
+            usage.get("model_context_window").and_then(Value::as_i64),
+            Some(2000)
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn session_delete_matches_local_prefixed_thread_ids() {
+        assert!(session_thread_id_matches(
+            "0123456789abcdef",
+            "local:0123456789abcdef"
+        ));
+        assert!(session_thread_id_matches(
+            "local:0123456789abcdef",
+            "0123456789abcdef"
+        ));
+        assert!(!session_thread_id_matches(
+            "0123456789abcdef",
+            "local:fedcba9876543210"
+        ));
     }
 
     #[test]

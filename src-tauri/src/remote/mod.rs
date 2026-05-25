@@ -1149,6 +1149,10 @@ impl RemoteRuntimeState {
     }
 
     async fn dispatch_web_bridge_message(&self, message: Value) -> Result<Value, String> {
+        if cdp_resources::is_plugin_bridge_message(&message) {
+            return cdp_resources::dispatch_plugin_bridge_message(message).await;
+        }
+
         match self.backend.cli_bridge() {
             Some(cli_bridge) => cli_bridge.dispatch_message(message).await,
             None => {
@@ -2679,6 +2683,9 @@ impl CliAppBridge {
     }
 
     async fn dispatch_message(&self, message: Value) -> Result<Value, String> {
+        if cdp_resources::is_plugin_bridge_message(&message) {
+            return cdp_resources::dispatch_plugin_bridge_message(message).await;
+        }
         if cdp_resources::is_web_file_picker_message(&message) {
             return cdp_resources::dispatch_web_file_picker_message(message);
         }

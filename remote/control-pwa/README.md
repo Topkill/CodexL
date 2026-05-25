@@ -55,11 +55,23 @@ dist/codex-app-web/
   26.513.31313/assets/...
 ```
 
-`index.html` is prepared for static hosting: the existing CodexL web bridge is
-injected before the Codex module bundle, CSP placeholders are removed, and root
-asset URLs are made relative to the version directory. `latest/index.html`
+`index.html` is prepared for static hosting: the CodexL web bridge is injected
+before the Codex module bundle, CSP placeholders are removed, and root asset
+URLs are made relative to the version directory. The bridge then loads the
+CodexL plugin runtime from the same stable runtime base. `latest/index.html`
 redirects to the newest extracted version while preserving the remote bridge
 query string.
+
+The injected CodexL runtime is intentionally outside the versioned Codex App
+bundle. By default, versioned pages load `../codexl-runtime/_codexl_bridge.js`,
+which in turn loads `../codexl-runtime/_codexl_plugin.js`, so bridge or plugin
+fixes can be published by replacing only the small `codexl-runtime/` files. To
+host the runtime from a separate project or domain, pass `--runtime-base-url`
+during extraction or publishing:
+
+```sh
+pnpm run publish:codex-web -- --runtime-base-url https://codexl-runtime.example.com
+```
 
 Publish the registry to Cloudflare Pages:
 
@@ -78,7 +90,9 @@ CODEXL_REMOTE_WEB_ASSET_VERSION=latest
 Remote connection URLs include `webAssetBaseUrl` and `webAssetVersion`. QR
 codes keep only the short token URL; after connecting, the control page reads
 the registry metadata from `/api/remote-info`, loads that hosted bundle by
-default, and shows a bundle selector when the registry exposes `versions.json`.
+default, resolves the selected bundle manifest to pass the current CodexL
+runtime URL into the iframe, and shows a bundle selector when the registry
+exposes `versions.json`.
 
 Camera scanning requires a browser secure context, such as HTTPS or localhost.
 The PWA uses the browser's native QR detector when available and falls back to
