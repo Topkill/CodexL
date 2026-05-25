@@ -975,6 +975,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [appSettingsOpen, setAppSettingsOpen] = useState(false);
   const [settingsError, setSettingsError] = useState("");
+  const [appToast, setAppToast] = useState<ToastState | null>(null);
   const [saveDisabled, setSaveDisabled] = useState(false);
   const [providerMode, setProviderMode] = useState<ProviderMode>("existing");
   const [dialogMode, setDialogMode] = useState<DialogMode>("add");
@@ -1033,8 +1034,17 @@ function App() {
   const showSettingsError = useCallback((error: unknown) => {
     const message = errorMessage(error).replace(/^Error:\s*/, "");
     setSettingsError(message);
+    const id = Date.now();
+    setAppToast({
+      id,
+      status: "error",
+      message: `${strings.failed}：${message}`,
+    });
+    window.setTimeout(() => {
+      setAppToast((current) => (current?.id === id ? null : current));
+    }, 3200);
     console.error(error);
-  }, []);
+  }, [strings.failed]);
 
   const checkForAppUpdate = useCallback(async () => {
     setAppUpdateState({
@@ -2223,6 +2233,8 @@ function App() {
           onClose={closeWeixinBotLogin}
         />
       ) : null}
+
+      {appToast ? <SettingsToast toast={appToast} /> : null}
     </div>
   );
 }
@@ -3236,26 +3248,26 @@ function AppSettingsDialog({
 function SettingsToast({ toast }: { toast: ToastState }) {
   const icon =
     toast.status === "loading" ? (
-      <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
+      <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-muted-foreground mt-0.5" />
     ) : toast.status === "success" ? (
-      <CheckCircle2 className="h-4 w-4 text-emerald" />
+      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald mt-0.5" />
     ) : (
-      <AlertCircle className="h-4 w-4 text-destructive" />
+      <AlertCircle className="h-4 w-4 shrink-0 text-destructive mt-0.5" />
     );
+  const className = "fixed left-1/2 top-6 z-[80] flex w-[calc(100vw-2rem)] max-w-sm -translate-x-1/2 items-start gap-2.5 rounded-md border border-border bg-background px-4 py-3 text-sm text-foreground shadow-lg";
 
   return createPortal(
     <div
       role="status"
       aria-live="polite"
-      className="fixed left-1/2 top-6 z-[80] flex w-[calc(100vw-2rem)] max-w-sm -translate-x-1/2 items-center gap-2 rounded-md border border-border bg-card px-3 py-2.5 text-sm text-card-foreground shadow-xl"
+      className={className}
     >
       {icon}
-      <span className="min-w-0 break-words">{toast.message}</span>
+      <span className="min-w-0 break-all leading-relaxed text-muted-foreground font-medium select-text">{toast.message}</span>
     </div>,
     document.body,
   );
 }
-
 function SettingsNavButton({
   active,
   icon,
