@@ -524,6 +524,7 @@ fn run_codex_command(args: &[String]) -> Result<i32, String> {
     config.normalize();
 
     let executable = resolve_codex_cli_executable(codex_path.as_deref(), &config)?;
+    eprintln!("[codexl] launching Codex CLI executable: {}", executable);
     let status = Command::new(&executable)
         .args(&forwarded)
         .env("CODEX_HOME", config.codex_home.clone())

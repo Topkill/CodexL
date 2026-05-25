@@ -69,6 +69,7 @@ pub fn launch_codex(
     bot_config: Option<&BotProfileConfig>,
     language: Option<&str>,
 ) -> std::io::Result<CodexLaunch> {
+    eprintln!("[codexl] launching Codex App executable: {}", executable);
     let mut command = Command::new(executable);
     command
         .args([
@@ -540,10 +541,27 @@ fn executable_from_app_bundle(app_path: &Path) -> Option<String> {
 
 fn bundled_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
     let executable = PathBuf::from(codex_app_executable);
-    let contents_dir = executable.parent()?.parent()?;
+    let app_dir = executable.parent()?;
     let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let candidate = contents_dir.join("Resources").join(file_name);
-    candidate.is_file().then_some(candidate)
+
+    #[cfg(windows)]
+    let candidates = [
+        app_dir.join("app").join("resources").join(file_name),
+        app_dir.join("resources").join(file_name),
+    ];
+
+    #[cfg(not(windows))]
+    let candidates = {
+        let contents_dir = app_dir.parent()?;
+        [contents_dir.join("Resources").join(file_name)]
+    };
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn read_bundle_executable(info_path: &Path) -> Option<String> {
@@ -563,6 +581,37 @@ fn read_bundle_executable(info_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_cli_from_windows_app_resources() {
+        let root = unique_test_dir("codex-cli-windows-resources");
+        let resources_dir = root.join("app").join("resources");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+        let app_executable = root.join("Codex.exe");
+        let cli_executable = resources_dir.join("codex.exe");
+        std::fs::write(&app_executable, "").expect("write app executable");
+        std::fs::write(&cli_executable, "").expect("write cli executable");
+
+        assert_eq!(
+            bundled_cli_path(&app_executable.to_string_lossy()),
+            Some(cli_executable)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos))
+    }
 }
 
 #[cfg(all(test, unix))]

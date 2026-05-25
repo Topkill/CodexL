@@ -2225,6 +2225,10 @@ impl CliAppBridge {
         proxy_url: String,
         transcribe_api: TranscribeApiConfig,
     ) -> Result<Arc<Self>, String> {
+        eprintln!(
+            "[codexl] launching Codex CLI app-server executable: {}",
+            executable
+        );
         let mut command = TokioCommand::new(&executable);
         if let Some(profile) = cli_profile.as_deref() {
             command.arg("-c").arg(cli_config_string("profile", profile));
@@ -4386,6 +4390,7 @@ fn cli_frontend_compat_endpoint_response(
             "buildFlavor": "cli-remote",
         })),
         "get-configuration" => Some(json!({ "value": Value::Null })),
+        "get-setting" => Some(json!({ "value": Value::Null })),
         "get-copilot-api-proxy-info" => Some(Value::Null),
         "home-directory" => Some(json!({
             "homeDirectory": config::sys_home_dir().unwrap_or_default(),
@@ -4406,6 +4411,9 @@ fn cli_frontend_compat_endpoint_response(
             "workspaceRoot": Value::Null,
         })),
         "set-configuration" => Some(json!({
+            "value": params.get("value").cloned().unwrap_or(Value::Null),
+        })),
+        "set-setting" => Some(json!({
             "value": params.get("value").cloned().unwrap_or(Value::Null),
         })),
         "set-remote-control-connections-enabled" => Some(Value::Null),
@@ -7570,6 +7578,24 @@ mod tests {
                 "Default",
             ),
             Some(json!({ "config": {} }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "get-setting",
+                &json!({ "params": { "key": "codex.some-setting" } }),
+                "/tmp/codex-home",
+                "Default",
+            ),
+            Some(json!({ "value": Value::Null }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "set-setting",
+                &json!({ "params": { "key": "codex.some-setting", "value": true } }),
+                "/tmp/codex-home",
+                "Default",
+            ),
+            Some(json!({ "value": true }))
         );
         assert_eq!(
             cli_frontend_compat_endpoint_response(

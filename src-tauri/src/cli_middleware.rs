@@ -223,10 +223,27 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 fn bundled_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
     let executable = PathBuf::from(codex_app_executable);
-    let contents_dir = executable.parent()?.parent()?;
+    let app_dir = executable.parent()?;
     let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let candidate = contents_dir.join("Resources").join(file_name);
-    candidate.is_file().then_some(candidate)
+
+    #[cfg(windows)]
+    let candidates = [
+        app_dir.join("app").join("resources").join(file_name),
+        app_dir.join("resources").join(file_name),
+    ];
+
+    #[cfg(not(windows))]
+    let candidates = {
+        let contents_dir = app_dir.parent()?;
+        [contents_dir.join("Resources").join(file_name)]
+    };
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn middleware_path() -> PathBuf {
@@ -406,6 +423,10 @@ where
         profile.as_deref(),
         model_provider.as_deref(),
         &real_args,
+    );
+    eprintln!(
+        "[codexl] launching real Codex CLI executable via middleware: {}",
+        real_cli.to_string_lossy()
     );
 
     let mut child = Command::new(&real_cli)
@@ -959,6 +980,7 @@ mod tests {
         std::env::temp_dir().join(format!("codexl-{}-{}-{}", name, std::process::id(), nanos))
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn resolves_bundled_cli_from_macos_app_executable() {
         let root = test_dir("bundle-path");
@@ -969,6 +991,26 @@ mod tests {
 
         let app_executable = macos_dir.join("Codex");
         let cli_executable = resources_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        std::fs::write(&app_executable, "").expect("write app executable");
+        std::fs::write(&cli_executable, "").expect("write CLI executable");
+
+        assert_eq!(
+            bundled_cli_path(&app_executable.to_string_lossy()),
+            Some(cli_executable)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_bundled_cli_from_windows_app_executable() {
+        let root = test_dir("bundle-path");
+        let resources_dir = root.join("app").join("resources");
+        std::fs::create_dir_all(&resources_dir).expect("create resources dir");
+
+        let app_executable = root.join("Codex.exe");
+        let cli_executable = resources_dir.join("codex.exe");
         std::fs::write(&app_executable, "").expect("write app executable");
         std::fs::write(&cli_executable, "").expect("write CLI executable");
 
