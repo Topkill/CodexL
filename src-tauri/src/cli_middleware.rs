@@ -37,7 +37,7 @@ type SharedCurrentCwd = Arc<Mutex<Option<String>>>;
 type SharedOutput<W> = Arc<Mutex<W>>;
 
 #[cfg(windows)]
-const MIDDLEWARE_FILE_NAME: &str = "codexl-codex-cli-middleware.cmd";
+const MIDDLEWARE_FILE_NAME: &str = "codexl-codex-cli-middleware.exe";
 #[cfg(windows)]
 const STDIO_FILE_NAME: &str = "codexl-codex-cli-stdio.cmd";
 
@@ -157,12 +157,43 @@ pub fn prepare(
 
 pub fn run_if_requested() -> bool {
     let mut args = std::env::args_os();
-    let _program = args.next();
+    let program = args.next();
+    #[cfg(not(windows))]
+    let _ = &program;
     let Some(mode) = args.next() else {
+        #[cfg(windows)]
+        {
+            if program_is_windows_middleware_shim(program.as_deref()) {
+                let exit_code = run_stdio_middleware(Vec::new());
+                let exit_code = match exit_code {
+                    Ok(code) => code,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        1
+                    }
+                };
+                std::process::exit(exit_code);
+            }
+        }
         return false;
     };
 
     let forwarded_args: Vec<OsString> = args.collect();
+    #[cfg(windows)]
+    if program_is_windows_middleware_shim(program.as_deref()) {
+        let mut all_args = Vec::with_capacity(forwarded_args.len() + 1);
+        all_args.push(mode);
+        all_args.extend(forwarded_args);
+        let exit_code = match run_stdio_middleware(all_args) {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("{}", err);
+                1
+            }
+        };
+        std::process::exit(exit_code);
+    }
+
     let exit_code = match mode.as_os_str() {
         value if value == OsStr::new(RUN_MODE_ARG) => run_stdio_middleware(forwarded_args),
         value if value == OsStr::new(STDIO_RUN_MODE_ARG) => {
@@ -188,6 +219,14 @@ pub fn run_if_requested() -> bool {
         }
     };
     std::process::exit(exit_code);
+}
+
+#[cfg(windows)]
+fn program_is_windows_middleware_shim(program: Option<&OsStr>) -> bool {
+    program
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case(MIDDLEWARE_FILE_NAME))
 }
 
 fn resolve_real_cli_path(
@@ -258,10 +297,22 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 fn bundled_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
     let executable = PathBuf::from(codex_app_executable);
-    let contents_dir = executable.parent()?.parent()?;
     let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let candidate = contents_dir.join("Resources").join(file_name);
-    candidate.is_file().then_some(candidate)
+    let mut candidates = Vec::new();
+
+    if cfg!(windows) {
+        if let Some(app_dir) = executable.parent() {
+            candidates.push(app_dir.join("resources").join(file_name));
+            candidates.push(app_dir.join("Resources").join(file_name));
+        }
+    }
+
+    if let Some(contents_dir) = executable.parent().and_then(|parent| parent.parent()) {
+        candidates.push(contents_dir.join("Resources").join(file_name));
+        candidates.push(contents_dir.join("resources").join(file_name));
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 fn middleware_path() -> PathBuf {
@@ -368,25 +419,56 @@ fn write_middleware(path: &Path, host_executable: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let content = middleware_script(host_executable);
-    let should_write = std::fs::read_to_string(path)
-        .map(|existing| existing != content)
-        .unwrap_or(true);
-    if should_write {
-        std::fs::write(path, content).map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .map_err(|e| e.to_string())?
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).map_err(|e| e.to_string())?;
+        if same_path(path, host_executable) {
+            return Ok(());
+        }
+        if should_copy_middleware_exe(path, host_executable) {
+            std::fs::copy(host_executable, path).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
     }
 
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let content = middleware_script(host_executable);
+        let should_write = std::fs::read_to_string(path)
+            .map(|existing| existing != content)
+            .unwrap_or(true);
+        if should_write {
+            std::fs::write(path, content).map_err(|e| e.to_string())?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn should_copy_middleware_exe(path: &Path, host_executable: &Path) -> bool {
+    let Ok(source) = std::fs::metadata(host_executable) else {
+        return false;
+    };
+    let Ok(target) = std::fs::metadata(path) else {
+        return true;
+    };
+    if source.len() != target.len() {
+        return true;
+    }
+    match (source.modified(), target.modified()) {
+        (Ok(source_modified), Ok(target_modified)) => source_modified > target_modified,
+        _ => false,
+    }
 }
 
 fn write_stdio_export(

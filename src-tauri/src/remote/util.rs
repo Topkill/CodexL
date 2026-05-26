@@ -1,4 +1,6 @@
 use serde_json::Value;
+use std::net::Ipv4Addr;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn number_field(value: &Value, field: &str, fallback: f64) -> f64 {
@@ -156,9 +158,141 @@ fn relay_url_with_path(relay_url: &str, pathname: &str) -> Result<reqwest::Url, 
 }
 
 fn lan_ip_address() -> Option<String> {
+    let mut candidates = interface_lan_ip_candidates();
+    if let Some(ip) = routed_lan_ip_candidate() {
+        candidates.push(("route".to_string(), ip));
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(name, ip)| lan_ip_candidate_score(&name, ip).map(|score| (score, ip)))
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, ip)| ip.to_string())
+}
+
+fn routed_lan_ip_candidate() -> Option<Ipv4Addr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+fn interface_lan_ip_candidates() -> Vec<(String, Ipv4Addr)> {
+    if cfg!(windows) {
+        windows_ipconfig_lan_ip_candidates()
+    } else {
+        unix_ifconfig_lan_ip_candidates()
+    }
+}
+
+fn windows_ipconfig_lan_ip_candidates() -> Vec<(String, Ipv4Addr)> {
+    let Ok(output) = Command::new("ipconfig").output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut adapter = String::new();
+    let mut candidates = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !line.starts_with(' ') && !line.starts_with('\t') && trimmed.ends_with(':') {
+            adapter = trimmed.trim_end_matches(':').to_string();
+            continue;
+        }
+        if !trimmed.contains("IPv4") {
+            continue;
+        }
+        let Some((_, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if let Some(ip) = parse_ipv4_token(value) {
+            candidates.push((adapter.clone(), ip));
+        }
+    }
+    candidates
+}
+
+fn unix_ifconfig_lan_ip_candidates() -> Vec<(String, Ipv4Addr)> {
+    let Ok(output) = Command::new("ifconfig").output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut iface = String::new();
+    let mut candidates = Vec::new();
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            iface = line.split(':').next().unwrap_or("").trim().to_string();
+        }
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("inet ") else {
+            continue;
+        };
+        if let Some(ip) = rest.split_whitespace().next().and_then(parse_ipv4_token) {
+            candidates.push((iface.clone(), ip));
+        }
+    }
+    candidates
+}
+
+fn parse_ipv4_token(value: &str) -> Option<Ipv4Addr> {
+    let token = value.split_whitespace().next().unwrap_or("").trim();
+    let end = token
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(token.len());
+    token.get(..end)?.parse().ok()
+}
+
+fn lan_ip_candidate_score(interface_name: &str, ip: Ipv4Addr) -> Option<i32> {
+    let octets = ip.octets();
+    if ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || octets[0] >= 224
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+    {
+        return None;
+    }
+
+    let mut score = if octets[0] == 192 && octets[1] == 168 {
+        130
+    } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        120
+    } else if octets[0] == 10 {
+        110
+    } else {
+        10
+    };
+
+    let name = interface_name.to_ascii_lowercase();
+    if name.contains("wi-fi")
+        || name.contains("wifi")
+        || name.contains("wireless")
+        || name.starts_with("en")
+        || name.starts_with("wl")
+        || name.starts_with("eth")
+    {
+        score += 20;
+    }
+    if name.contains("virtual")
+        || name.contains("vethernet")
+        || name.contains("vmware")
+        || name.contains("virtualbox")
+        || name.contains("hyper-v")
+        || name.contains("wsl")
+        || name.contains("docker")
+        || name.contains("bridge")
+        || name.contains("tailscale")
+        || name.contains("zerotier")
+        || name.contains("clash")
+        || name.contains("vpn")
+        || name.contains("tun")
+        || name.contains("tap")
+        || name.starts_with("utun")
+        || name.starts_with("lo")
+    {
+        score -= 80;
+    }
+    Some(score)
 }
 
 pub(super) fn make_token() -> String {
@@ -238,6 +372,26 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"Secret"));
         assert!(!constant_time_eq(b"secret", b"secret-extra"));
+    }
+
+    #[test]
+    fn lan_ip_candidate_score_prefers_physical_lan_over_tun_and_virtual() {
+        let tun = lan_ip_candidate_score("Clash TUN", Ipv4Addr::new(198, 18, 0, 1))
+            .expect("tun candidate");
+        let wifi = lan_ip_candidate_score("Wi-Fi", Ipv4Addr::new(192, 168, 0, 23))
+            .expect("wifi candidate");
+        let virtual_switch = lan_ip_candidate_score("vEthernet", Ipv4Addr::new(192, 168, 137, 1))
+            .expect("virtual candidate");
+        assert!(wifi > tun);
+        assert!(wifi > virtual_switch);
+    }
+
+    #[test]
+    fn parse_ipv4_token_ignores_windows_preferred_suffix() {
+        assert_eq!(
+            parse_ipv4_token("192.168.0.23(Preferred)"),
+            Some(Ipv4Addr::new(192, 168, 0, 23))
+        );
     }
 
     #[test]

@@ -43,6 +43,7 @@ import {
   Sun,
   Terminal,
   Trash2,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -269,6 +270,7 @@ type ProviderProfile = {
   name: string;
   codex_profile_name: string;
   provider_name: string;
+  provider_config_format: string;
   base_url: string;
   model: string;
   proxy_url: string;
@@ -503,6 +505,7 @@ type DefaultProviderProfile = {
   base_url: string;
   api_key: string;
   model: string;
+  config_format?: string;
 };
 
 type ExistingProvider = {
@@ -1036,6 +1039,24 @@ function App() {
     const message = errorMessage(error).replace(/^Error:\s*/, "");
     setSettingsError(message);
     console.error(error);
+  }, []);
+
+  useEffect(() => {
+    const showRuntimeError = (error: unknown) => {
+      setSettingsError(errorMessage(error).replace(/^Error:\s*/, ""));
+    };
+    const handleError = (event: ErrorEvent) => {
+      showRuntimeError(event.error || event.message);
+    };
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      showRuntimeError(event.reason || event);
+    };
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
   }, []);
 
   const checkForAppUpdate = useCallback(async () => {
@@ -2084,6 +2105,23 @@ function App() {
         </div>
       </header>
 
+      {settingsError && !settingsOpen ? (
+        <div className="fixed left-1/2 top-14 z-50 flex w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 items-start gap-2 rounded-md border border-destructive/50 bg-background px-3 py-2.5 text-sm shadow-lg">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <span className="min-w-0 flex-1 break-words text-foreground">{settingsError}</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="-mr-1 -mt-1 h-7 w-7 shrink-0"
+            onClick={() => setSettingsError("")}
+            aria-label="Dismiss"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+      ) : null}
+
       <main className="min-h-0 flex-1 overflow-auto p-6 md:p-8">
         {filteredProfiles.length > 0 ? (
           <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
@@ -2397,7 +2435,10 @@ function ProfileCard({
   const isRunning = Boolean(status?.running || remote?.running);
   const isRemoteRunning = Boolean(remote?.running);
   const showRemoteActions = isRunning && Boolean(remote?.url);
-  const codexProfileName = profile.codex_profile_name || profile.name;
+  const codexProfileName =
+    profile.provider_config_format === "top_level"
+      ? profile.provider_name || profile.name
+      : profile.codex_profile_name || profile.name;
   const remoteFrontendMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode);
   const providerLine =
     isProviderlessWorkspace(profile)
@@ -2469,7 +2510,7 @@ function ProfileCard({
             {remoteFrontendMode === "claude-code"
               ? strings.remoteFrontendClaudeCode
               : remoteFrontendMode === "cli"
-                ? `${strings.remoteFrontendCli} / ${profile.remote_web_asset_version || DEFAULT_CODEX_WEB_ASSET_VERSION}`
+                ? `${strings.remoteFrontendCli} / ${strings.registryVersion}: ${profile.remote_web_asset_version || DEFAULT_CODEX_WEB_ASSET_VERSION}`
                 : strings.remoteFrontendApp}
           </span>
         </div>
@@ -6747,6 +6788,10 @@ function dedupeProfiles(profiles: ProviderProfile[]) {
       name,
       codex_profile_name: (profile.codex_profile_name || "").trim(),
       provider_name: (profile.provider_name || "").trim(),
+      provider_config_format:
+        (profile.provider_config_format || "").trim() === "top_level"
+          ? "top_level"
+          : "profile",
       base_url: profile.base_url.trim(),
       model: profile.model.trim(),
       proxy_url: (profile.proxy_url || "").trim(),

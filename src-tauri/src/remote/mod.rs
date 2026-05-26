@@ -2425,7 +2425,8 @@ impl CliAppBridge {
                 command
                     .arg(cli_middleware::CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG)
                     .arg("--workspace-name")
-                    .arg(&workspace_name);
+                    .arg(&workspace_name)
+                    .env("CODEXL_BUNDLED_CODEX_CLI_PATH", &executable);
                 command
             }
         };
@@ -2479,11 +2480,16 @@ impl CliAppBridge {
 
     fn spawn_stdout_reader(self: Arc<Self>, stdout: tokio::process::ChildStdout) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => self.handle_stdout_line(line).await,
-                    Ok(None) => break,
+                line.clear();
+                match reader.read_until(b'\n', &mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&line).into_owned();
+                        self.handle_stdout_line(line).await;
+                    }
                     Err(err) => {
                         eprintln!("Codex CLI app-server stdout failed: {}", err);
                         break;
@@ -2491,6 +2497,8 @@ impl CliAppBridge {
                 }
             }
             self.connected.store(false, Ordering::Relaxed);
+            self.publish_messages(self.connection_event_messages(false))
+                .await;
             self.reject_pending("Codex CLI app-server stopped").await;
         });
     }
@@ -2721,9 +2729,15 @@ impl CliAppBridge {
                 self.dispatch_cli_update_workspace_root_options_message(message)
                     .await
             }
-            "codex-web-bridge-request-snapshot"
-            | "desktop-notification-hide"
-            | "thread-stream-state-changed" => Ok(json!({ "messages": [] })),
+            "codex-web-bridge-request-snapshot" => Ok(json!({
+                "messages": self.connection_event_messages(self.is_running().await),
+            })),
+            "codex-app-server-restart" => Ok(json!({
+                "messages": self.connection_event_messages(self.is_running().await),
+            })),
+            "desktop-notification-hide" | "thread-stream-state-changed" => {
+                Ok(json!({ "messages": [] }))
+            }
             _ => Ok(json!({ "messages": [] })),
         }
     }
@@ -3053,6 +3067,12 @@ impl CliAppBridge {
         params: Value,
     ) -> Result<(Value, Vec<Value>), String> {
         match endpoint {
+            "app-server-connection-state" => {
+                return Ok((
+                    cli_app_server_connection_state_response(self.is_running().await),
+                    Vec::new(),
+                ));
+            }
             "active-workspace-roots" => {
                 let store = self.global_state.lock().await;
                 return Ok((cli_active_workspace_roots_response(&store), Vec::new()));
@@ -3614,6 +3634,8 @@ impl CliAppBridge {
     async fn subscribe(&self) -> (usize, mpsc::UnboundedReceiver<Value>) {
         let id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
+        let initial_messages = self.connection_event_messages(self.is_running().await);
+        let _ = tx.send(json!({ "messages": initial_messages }));
         self.subscribers.lock().await.insert(id, tx);
         (id, rx)
     }
@@ -3644,16 +3666,7 @@ impl CliAppBridge {
     }
 
     async fn status(&self) -> Value {
-        let running = {
-            let mut child = self.child.lock().await;
-            match child.as_mut().and_then(|child| child.try_wait().ok()) {
-                Some(_status) => {
-                    self.connected.store(false, Ordering::Relaxed);
-                    false
-                }
-                None => self.connected.load(Ordering::Relaxed),
-            }
-        };
+        let running = self.is_running().await;
         json!({
             "backend": "cli",
             "cdpUrl": Value::Null,
@@ -3679,11 +3692,38 @@ impl CliAppBridge {
 
     async fn stop(&self) {
         self.connected.store(false, Ordering::Relaxed);
+        self.publish_messages(self.connection_event_messages(false))
+            .await;
         self.reject_pending("Codex CLI app-server stopped").await;
         if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+    }
+
+    async fn is_running(&self) -> bool {
+        let mut child = self.child.lock().await;
+        match child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(_status)) => {
+                    self.connected.store(false, Ordering::Relaxed);
+                    false
+                }
+                Ok(None) => self.connected.load(Ordering::Relaxed),
+                Err(_) => self.connected.load(Ordering::Relaxed),
+            },
+            None => {
+                self.connected.store(false, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    fn connection_event_messages(&self, connected: bool) -> Vec<Value> {
+        cli_app_server_connection_event_messages(connected)
+            .into_iter()
+            .map(|message| self.decorate_notification(message))
+            .collect()
     }
 }
 
@@ -3739,6 +3779,56 @@ fn default_cli_initialize_result() -> Value {
         "platformFamily": std::env::consts::FAMILY,
         "platformOs": std::env::consts::OS,
     })
+}
+
+fn cli_app_server_connection_state(connected: bool) -> &'static str {
+    if connected {
+        "connected"
+    } else {
+        "error"
+    }
+}
+
+fn cli_app_server_connection_error(connected: bool) -> Value {
+    if connected {
+        Value::Null
+    } else {
+        json!({
+            "code": "connection-failed",
+            "message": "Codex app-server is not available",
+        })
+    }
+}
+
+fn cli_app_server_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn cli_app_server_connection_state_response(connected: bool) -> Value {
+    json!({
+        "state": cli_app_server_connection_state(connected),
+        "error": cli_app_server_connection_error(connected),
+        "appServerVersion": cli_app_server_version(),
+        "installedCodexVersion": cli_app_server_version(),
+    })
+}
+
+fn cli_app_server_connection_event_messages(connected: bool) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "codex-app-server-initialized",
+            "hostId": "local",
+            "appServerVersion": cli_app_server_version(),
+            "installedCodexVersion": cli_app_server_version(),
+        }),
+        json!({
+            "type": "codex-app-server-connection-changed",
+            "hostId": "local",
+            "state": cli_app_server_connection_state(connected),
+            "error": cli_app_server_connection_error(connected),
+            "transport": "websocket",
+        }),
+    ]
 }
 
 fn cli_app_server_initialize_request() -> Value {
@@ -4728,6 +4818,7 @@ fn cli_frontend_compat_endpoint_response(
             "version": env!("CARGO_PKG_VERSION"),
             "buildFlavor": "cli-remote",
         })),
+        "get-setting" => Some(json!({ "value": Value::Null })),
         "get-configuration" => Some(json!({ "value": Value::Null })),
         "get-copilot-api-proxy-info" => Some(Value::Null),
         "home-directory" => Some(json!({
@@ -4751,6 +4842,9 @@ fn cli_frontend_compat_endpoint_response(
             "workspaceRoot": Value::Null,
         })),
         "set-configuration" => Some(json!({
+            "value": params.get("value").cloned().unwrap_or(Value::Null),
+        })),
+        "set-setting" => Some(json!({
             "value": params.get("value").cloned().unwrap_or(Value::Null),
         })),
         "set-remote-control-connections-enabled" => Some(Value::Null),
@@ -8071,6 +8165,67 @@ mod tests {
     }
 
     #[test]
+    fn cli_app_server_connection_state_reports_connected() {
+        let response = cli_app_server_connection_state_response(true);
+
+        assert_eq!(
+            response.get("state").and_then(Value::as_str),
+            Some("connected")
+        );
+        assert!(response.get("error").is_some_and(Value::is_null));
+        assert!(response
+            .get("appServerVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|version| !version.is_empty()));
+        assert!(response
+            .get("installedCodexVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|version| !version.is_empty()));
+    }
+
+    #[test]
+    fn cli_app_server_connection_events_cover_snapshot_state() {
+        let messages = cli_app_server_connection_event_messages(false);
+
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|message| message.get("type"))
+                .and_then(Value::as_str),
+            Some("codex-app-server-initialized")
+        );
+        assert_eq!(
+            messages
+                .get(1)
+                .and_then(|message| message.get("type"))
+                .and_then(Value::as_str),
+            Some("codex-app-server-connection-changed")
+        );
+        assert_eq!(
+            messages
+                .get(1)
+                .and_then(|message| message.get("transport"))
+                .and_then(Value::as_str),
+            Some("websocket")
+        );
+        assert_eq!(
+            messages
+                .get(1)
+                .and_then(|message| message.get("state"))
+                .and_then(Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            messages
+                .get(1)
+                .and_then(|message| message.get("error"))
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+            Some("connection-failed")
+        );
+    }
+
+    #[test]
     fn cli_frontend_compat_endpoints_return_expected_shapes() {
         assert_eq!(
             cli_frontend_compat_endpoint_response(
@@ -8089,6 +8244,15 @@ mod tests {
                 "Default",
             ),
             Some(json!({ "config": {} }))
+        );
+        assert_eq!(
+            cli_frontend_compat_endpoint_response(
+                "get-setting",
+                &json!({ "params": { "key": "theme" } }),
+                "/tmp/codex-home",
+                "Default",
+            ),
+            Some(json!({ "value": Value::Null }))
         );
         assert_eq!(
             cli_frontend_compat_endpoint_response(
