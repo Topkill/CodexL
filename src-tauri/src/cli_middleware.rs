@@ -27,6 +27,8 @@ const RUN_MODE_ARG: &str = "--codexl-cli-middleware";
 const STDIO_RUN_MODE_ARG: &str = "--codexl-cli-stdio";
 const BOT_MEDIA_MCP_RUN_MODE_ARG: &str = "--codexl-bot-media-mcp";
 pub const CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG: &str = "--codexl-claude-code-app-server";
+pub const CLAUDE_CODE_MCP_METADATA_RELAY_RUN_MODE_ARG: &str =
+    "--codexl-claude-code-mcp-metadata-relay";
 const CODEXL_WORKSPACE_CWD_FILTER_KEY: &str = "codexlWorkspaceCwd";
 
 type RequestMap = Arc<Mutex<std::collections::HashMap<String, RequestInfo>>>;
@@ -172,6 +174,9 @@ pub fn run_if_requested() -> bool {
         value if value == OsStr::new(CLAUDE_CODE_APP_SERVER_RUN_MODE_ARG) => {
             claude_code_app_server::run_stdio_app_server(forwarded_args)
         }
+        value if value == OsStr::new(CLAUDE_CODE_MCP_METADATA_RELAY_RUN_MODE_ARG) => {
+            claude_code_app_server::run_mcp_metadata_relay(forwarded_args)
+        }
         _ => return false,
     };
 
@@ -291,13 +296,16 @@ fn default_log_path() -> PathBuf {
 fn expand_home_path(path: &str) -> PathBuf {
     let trimmed = path.trim();
     if trimmed == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(trimmed));
+        return user_home_dir().unwrap_or_else(|| PathBuf::from(trimmed));
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = user_home_dir() {
+            return home.join(rest);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("~\\") {
+        if let Some(home) = user_home_dir() {
+            return home.join(rest);
         }
     }
     PathBuf::from(trimmed)
@@ -311,11 +319,48 @@ fn normalize_profile(profile: Option<&str>) -> Option<String> {
 }
 
 fn codexl_home_dir() -> PathBuf {
-    std::env::var("HOME")
+    std::env::var("CODEXL_HOME")
         .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_home_path(&value))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                if let Some(app_data) = env_path_without_home_expansion("APPDATA") {
+                    return app_data.join("CodexL");
+                }
+            }
+            user_home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codexl")
+        })
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_path_without_home_expansion("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var("HOMEDRIVE").ok()?;
+                let path = std::env::var("HOMEPATH").ok()?;
+                let combined = format!("{}{}", drive.trim(), path.trim());
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(combined))
+                }
+            })
+            .or_else(|| env_path_without_home_expansion("HOME"))
+    } else {
+        env_path_without_home_expansion("HOME")
+    }
+}
+
+fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codexl")
 }
 
 fn write_middleware(path: &Path, host_executable: &Path) -> Result<(), String> {
@@ -1352,10 +1397,7 @@ fn is_projectless_cwd(cwd: &str) -> bool {
 }
 
 fn projectless_workspace_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .map(|home| home.join("Documents").join("Codex"))
+    user_home_dir().map(|home| home.join("Documents").join("Codex"))
 }
 
 fn is_projectless_cwd_under_root(cwd: &Path, workspace_root: &Path) -> bool {

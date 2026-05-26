@@ -1,12 +1,17 @@
 use crate::config::{self, BotHandoffConfig, BotProfileConfig};
 use crate::extensions::{self, BuiltinNodeExtension};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(windows)]
+use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +134,57 @@ static DINGTALK_ACCESS_TOKEN_CACHE: OnceLock<Mutex<BTreeMap<String, DingtalkAcce
 unsafe extern "C" {
     fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
 }
+
+#[cfg(windows)]
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut c_void,
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn LockFileEx(
+        file: *mut c_void,
+        flags: u32,
+        reserved: u32,
+        bytes_to_lock_low: u32,
+        bytes_to_lock_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct LastInputInfo {
+    cb_size: u32,
+    last_input_tick: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "User32")]
+unsafe extern "system" {
+    fn GetLastInputInfo(last_input_info: *mut LastInputInfo) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn GetTickCount64() -> u64;
+}
+
+#[cfg(windows)]
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+#[cfg(windows)]
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
 
 #[derive(Debug, Clone)]
 struct BotBridgeConfig {
@@ -1969,7 +2025,45 @@ fn try_lock_file_exclusive(file: &File) -> Result<bool, String> {
 }
 
 #[cfg(not(unix))]
-fn try_lock_file_exclusive(_file: &File) -> Result<bool, String> {
+fn try_lock_file_exclusive(file: &File) -> Result<bool, String> {
+    try_lock_file_exclusive_windows(file)
+}
+
+#[cfg(windows)]
+fn try_lock_file_exclusive_windows(file: &File) -> Result<bool, String> {
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as *mut c_void,
+            LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if matches!(
+        err.raw_os_error(),
+        Some(ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION)
+    ) {
+        Ok(false)
+    } else {
+        Err(err.to_string())
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn try_lock_file_exclusive_windows(_file: &File) -> Result<bool, String> {
     Ok(true)
 }
 
@@ -5028,7 +5122,7 @@ impl AppServerBridge {
     }
 
     fn create_projectless_cwd(&self, prompt_seed: &str) -> Result<String, String> {
-        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+        let home = user_home_dir().ok_or_else(|| "home directory is not set".to_string())?;
         let seconds = unix_seconds();
         let (year, month, day) = utc_date_from_unix_seconds(seconds);
         let date = format!("{:04}-{:02}-{:02}", year, month, day);
@@ -5038,7 +5132,7 @@ impl AppServerBridge {
         } else {
             prompt_slug
         };
-        let dir = PathBuf::from(home)
+        let dir = home
             .join("Documents")
             .join("Codex")
             .join(date)
@@ -6044,6 +6138,7 @@ fn handoff_presence_from_signals(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn detect_screen_locked_with_detail() -> (Option<bool>, String) {
     let mut details = Vec::new();
     match command_stdout("/usr/sbin/ioreg", &["-r", "-k", "CGSSessionScreenIsLocked"]) {
@@ -6079,6 +6174,22 @@ fn detect_screen_locked_with_detail() -> (Option<bool>, String) {
     }
 }
 
+#[cfg(windows)]
+fn detect_screen_locked_with_detail() -> (Option<bool>, String) {
+    (
+        None,
+        "screen lock detection is not implemented on Windows".to_string(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn detect_screen_locked_with_detail() -> (Option<bool>, String) {
+    (
+        None,
+        "screen lock detection is not implemented on this platform".to_string(),
+    )
+}
+
 fn parse_screen_locked_from_ioreg_output(output: &str) -> Option<bool> {
     for line in output.lines() {
         if !line.contains("CGSSessionScreenIsLocked") && !line.contains("IOConsoleLocked") {
@@ -6095,6 +6206,7 @@ fn parse_screen_locked_from_ioreg_output(output: &str) -> Option<bool> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn detect_user_idle_seconds() -> Option<u64> {
     let output = command_stdout("/usr/sbin/ioreg", &["-c", "IOHIDSystem"])?;
     output.lines().find_map(|line| {
@@ -6106,6 +6218,31 @@ fn detect_user_idle_seconds() -> Option<u64> {
         let nanos = digits.parse::<u64>().ok()?;
         Some(nanos / 1_000_000_000)
     })
+}
+
+#[cfg(windows)]
+fn detect_user_idle_seconds() -> Option<u64> {
+    windows_user_idle_seconds()
+}
+
+#[cfg(windows)]
+fn windows_user_idle_seconds() -> Option<u64> {
+    let mut info = LastInputInfo {
+        cb_size: std::mem::size_of::<LastInputInfo>() as u32,
+        last_input_tick: 0,
+    };
+    let ok = unsafe { GetLastInputInfo(&mut info) };
+    if ok == 0 {
+        return None;
+    }
+    let now = unsafe { GetTickCount64() };
+    let last = u64::from(info.last_input_tick);
+    now.checked_sub(last).map(|millis| millis / 1000)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn detect_user_idle_seconds() -> Option<u64> {
+    None
 }
 
 fn detect_phone_wifi_targets_with_detail(targets: &[String]) -> (Option<bool>, String) {
@@ -6219,6 +6356,9 @@ fn parse_arp_scan_target(line: &str) -> Option<BotHandoffScanTarget> {
     if line.is_empty() || line.contains("(incomplete)") {
         return None;
     }
+    if let Some(target) = parse_windows_arp_scan_target(line) {
+        return Some(target);
+    }
     let open = line.find('(')?;
     let close = line[open + 1..].find(')')? + open + 1;
     let host = line[..open].trim().trim_end_matches('.');
@@ -6260,6 +6400,33 @@ fn parse_arp_scan_target(line: &str) -> Option<BotHandoffScanTarget> {
     })
 }
 
+fn parse_windows_arp_scan_target(line: &str) -> Option<BotHandoffScanTarget> {
+    let mut parts = line.split_whitespace();
+    let ip = parts.next()?.trim();
+    let mac = parts.next()?.trim();
+    if !looks_like_ipv4(ip) || format_mac_hex(mac).is_none() {
+        return None;
+    }
+    Some(BotHandoffScanTarget {
+        id: format!("wifi:{}", ip),
+        label: format!("{} ({})", ip, mac),
+        target: ip.to_string(),
+        detail: format!("MAC {}", mac),
+        source: "wifi".to_string(),
+    })
+}
+
+fn looks_like_ipv4(value: &str) -> bool {
+    let mut count = 0;
+    for part in value.split('.') {
+        count += 1;
+        if part.is_empty() || part.parse::<u8>().is_err() {
+            return false;
+        }
+    }
+    count == 4
+}
+
 fn parse_bluetooth_scan_targets(output: &str) -> Vec<BotHandoffScanTarget> {
     let mut targets = Vec::new();
     if let Ok(value) = serde_json::from_str::<Value>(output) {
@@ -6271,6 +6438,7 @@ fn parse_bluetooth_scan_targets(output: &str) -> Vec<BotHandoffScanTarget> {
     targets
 }
 
+#[cfg(target_os = "macos")]
 fn collect_bluetooth_scan_targets_from_commands(targets: &mut Vec<BotHandoffScanTarget>) {
     let blueutil_arg_sets: &[&[&str]] = &[
         &["--format", "json", "--inquiry", "6"],
@@ -6326,6 +6494,40 @@ fn collect_bluetooth_scan_targets_from_commands(targets: &mut Vec<BotHandoffScan
         push_scan_targets_with_source(targets, ioreg_targets, "ioreg IOBluetoothDevice");
     }
 }
+
+#[cfg(windows)]
+fn collect_bluetooth_scan_targets_from_commands(targets: &mut Vec<BotHandoffScanTarget>) {
+    let Some(output) = command_stdout(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-PnpDevice -Class Bluetooth | Where-Object { $_.FriendlyName } | ForEach-Object { $_.FriendlyName }",
+        ],
+    ) else {
+        return;
+    };
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        push_unique_scan_target(
+            targets,
+            BotHandoffScanTarget {
+                id: format!("bluetooth:{}", line.to_ascii_lowercase()),
+                label: line.to_string(),
+                target: line.to_string(),
+                detail: "Windows Bluetooth device".to_string(),
+                source: "bluetooth".to_string(),
+            },
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn collect_bluetooth_scan_targets_from_commands(_targets: &mut Vec<BotHandoffScanTarget>) {}
 
 fn push_scan_targets_with_source(
     targets: &mut Vec<BotHandoffScanTarget>,
@@ -6729,8 +6931,13 @@ fn push_unique_scan_target(targets: &mut Vec<BotHandoffScanTarget>, target: BotH
 }
 
 fn ping_target(target: &str) -> bool {
-    Command::new("ping")
-        .args(["-c", "1", "-W", "1", target])
+    let mut command = Command::new("ping");
+    if cfg!(windows) {
+        command.args(["-n", "1", "-w", "1000", target]);
+    } else {
+        command.args(["-c", "1", "-W", "1", target]);
+    }
+    command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -7382,10 +7589,7 @@ fn is_uuid_like(value: &str) -> bool {
 
 fn new_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
-    if File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_err()
-    {
+    if rand::rngs::OsRng.try_fill_bytes(&mut bytes).is_err() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -7551,7 +7755,9 @@ fn find_integration(store: &Value, integration_id: &str) -> Option<Value> {
 impl BotGatewayClient {
     fn start(extension: &BuiltinNodeExtension, state_dir: Option<&Path>) -> Result<Self, String> {
         let mut command = Command::new(&extension.node.executable);
-        command.arg(&extension.entry_path);
+        command
+            .arg(&extension.entry_path)
+            .env("CODEXL_HOME", codexl_home_dir());
         if let Some(state_dir) = state_dir {
             command.env(BOT_GATEWAY_STATE_DIR_ENV, state_dir);
             if let Some(proxy_url) = bot_gateway_proxy_url_from_state_dir(state_dir) {
@@ -8017,6 +8223,10 @@ fn expand_home_path(path: String) -> PathBuf {
 
 fn codexl_home_dir() -> PathBuf {
     super::codexl_home_dir()
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    super::user_home_dir()
 }
 
 fn timestamp_seconds() -> String {

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const codexlHome = process.env.CODEXL_HOME || join(homedir(), ".codexl");
+const codexlHome = process.env.CODEXL_HOME || defaultCodexlHome();
 const gatewayHome = resolve(
   process.env.CODEXL_NEXT_AI_GATEWAY_HOME || join(codexlHome, "next-ai-gateway"),
 );
@@ -30,3 +30,10 @@ if (!existsSync(configPath)) {
 }
 
 await import("./index.cjs");
+
+function defaultCodexlHome() {
+  if (process.platform === "win32" && process.env.APPDATA) {
+    return join(process.env.APPDATA, "CodexL");
+  }
+  return join(homedir(), ".codexl");
+}

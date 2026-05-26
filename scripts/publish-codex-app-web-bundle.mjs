@@ -159,7 +159,7 @@ Extraction options are forwarded:
 }
 
 function run(command, commandArgs) {
-  const result = spawnSync(command, commandArgs, {
+  const result = spawnSync(executableName(command), commandArgs, {
     cwd: repoRoot,
     env: process.env,
     stdio: "inherit",
@@ -170,6 +170,13 @@ function run(command, commandArgs) {
   if (result.status !== 0) {
     process.exit(result.status ?? 1);
   }
+}
+
+function executableName(command) {
+  if (process.platform === "win32" && command === "pnpm") {
+    return "pnpm.cmd";
+  }
+  return command;
 }
 
 function fail(message) {

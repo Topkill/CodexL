@@ -327,7 +327,11 @@ async fn create_provider(
 ) -> Result<AppConfig, String> {
     let profile = config::create_default_provider(provider)?;
     let mut config = state.config.lock().await;
-    config.add_provider_profile(profile);
+    if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
+        config.update_provider_profile(DEFAULT_PROVIDER_PROFILE_NAME, profile)?;
+    } else {
+        config.add_provider_profile(profile);
+    }
     config.save()?;
     Ok(config.clone())
 }

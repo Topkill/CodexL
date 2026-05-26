@@ -235,9 +235,30 @@ fn default_web_file_picker_path() -> PathBuf {
 }
 
 fn home_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    if cfg!(windows) {
+        env_path_without_home_expansion("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var("HOMEDRIVE").ok()?;
+                let path = std::env::var("HOMEPATH").ok()?;
+                let combined = format!("{}{}", drive.trim(), path.trim());
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(combined))
+                }
+            })
+            .or_else(|| env_path_without_home_expansion("HOME"))
+    } else {
+        env_path_without_home_expansion("HOME")
+    }
+}
+
+fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 fn path_to_string(path: &Path) -> String {

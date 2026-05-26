@@ -6,9 +6,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,12 +23,23 @@ const BASE_ARGS_ENV: &str = "CODEXL_CLAUDE_CODE_BASE_ARGS";
 const EXTRA_ARGS_ENV: &str = "CODEXL_CLAUDE_CODE_EXTRA_ARGS";
 const MODEL_ENV: &str = "CODEXL_CLAUDE_CODE_MODEL";
 const PERMISSION_MODE_ENV: &str = "CODEXL_CLAUDE_CODE_PERMISSION_MODE";
+const PERMISSION_PROMPT_TOOL_ENV: &str = "CODEXL_CLAUDE_CODE_PERMISSION_PROMPT_TOOL";
 const TURN_IDLE_TIMEOUT_MS_ENV: &str = "CODEXL_CLAUDE_CODE_TURN_IDLE_TIMEOUT_MS";
+const PERMISSION_APPROVAL_TIMEOUT_MS_ENV: &str =
+    "CODEXL_CLAUDE_CODE_PERMISSION_APPROVAL_TIMEOUT_MS";
+const CODEX_APP_SERVER_PROXY_ENV: &str = "CODEXL_CLAUDE_CODE_PROXY_CODEX_APP_SERVER";
+const APP_SERVER_LOG_PATH_ENV: &str = "CODEXL_CLAUDE_CODE_APP_SERVER_LOG";
 const CLAUDE_PATH_ENV: &str = "CLAUDE_PATH";
 const CLAUDE_PATH_OVERRIDE_ENV: &str = "CODEXL_CLAUDE_PATH";
 const DEFAULT_MODEL: &str = "claude-code";
-const DEFAULT_TURN_IDLE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PERMISSION_PROMPT_TOOL: &str = "stdio";
+const DEFAULT_TURN_IDLE_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_PERMISSION_APPROVAL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MIN_NATIVE_CLAUDE_BYTES: u64 = 5 * 1024 * 1024;
+const CLAUDE_THREAD_NAMES_FILE: &str = "codex-app-thread-names.json";
+const CLAUDE_TITLE_MATCH_MAX_DELTA_SECONDS: u64 = 6 * 60 * 60;
+const CLAUDE_RESULT_EXIT_GRACE_MS: u64 = 500;
+const CLAUDE_THREAD_STREAM_STATE_HEARTBEAT_MS: u64 = 1_000;
 const CLAUDE_STREAM_JSON_ARGS: &[&str] = &[
     "--output-format",
     "stream-json",
@@ -49,6 +60,7 @@ struct RunOptions {
 #[derive(Debug)]
 struct ClaudeAppServerState {
     active_processes: BTreeMap<(String, String), u32>,
+    app_responses: BTreeMap<String, Value>,
     interrupted_turns: BTreeSet<(String, String)>,
     threads: BTreeMap<String, ClaudeThread>,
     workspace_name: Option<String>,
@@ -68,6 +80,15 @@ struct ClaudeThread {
     archived: bool,
     name: Option<String>,
     turns: Vec<ClaudeTurn>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeGeneratedTitle {
+    source_prompt: String,
+    title: Option<String>,
+    cwd: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -160,8 +181,17 @@ where
     W: Write + Send + 'static,
 {
     let options = parse_options(args);
+    claude_code_log_event(
+        "app_server_start",
+        json!({
+            "workspaceName": options.workspace_name,
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    );
     let state = Arc::new(Mutex::new(ClaudeAppServerState {
         active_processes: BTreeMap::new(),
+        app_responses: BTreeMap::new(),
         interrupted_turns: BTreeSet::new(),
         threads: BTreeMap::new(),
         workspace_name: options.workspace_name,
@@ -189,6 +219,12 @@ where
             .join()
             .map_err(|_| "claude-code turn worker panicked".to_string())?;
     }
+    claude_code_log_event(
+        "app_server_stop",
+        json!({
+            "pid": std::process::id(),
+        }),
+    );
     Ok(0)
 }
 
@@ -212,6 +248,487 @@ fn parse_options(args: Vec<OsString>) -> RunOptions {
     RunOptions { workspace_name }
 }
 
+fn claude_code_log_event(event: &str, fields: Value) {
+    let Some(path) = claude_code_app_server_log_path() else {
+        return;
+    };
+    let mut object = serde_json::Map::new();
+    object.insert("tsMs".to_string(), json!(now_millis()));
+    object.insert("event".to_string(), json!(event));
+    if let Value::Object(fields) = fields {
+        for (key, value) in fields {
+            object.insert(key, value);
+        }
+    } else {
+        object.insert("data".to_string(), fields);
+    }
+    let Ok(line) = serde_json::to_string(&Value::Object(object)) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn claude_code_app_server_log_path() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os(APP_SERVER_LOG_PATH_ENV) {
+        let value = value.to_string_lossy();
+        let value = value.trim();
+        if value.is_empty()
+            || matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "none"
+            )
+        {
+            return None;
+        }
+        return Some(expand_log_path(value));
+    }
+    if cfg!(test) {
+        return None;
+    }
+    user_home_dir_for_log().map(|home| {
+        if cfg!(target_os = "macos") {
+            home.join("Library")
+                .join("Logs")
+                .join("com.openai.codex")
+                .join("claude-code-app-server.log")
+        } else {
+            home.join(".codexl").join("claude-code-app-server.log")
+        }
+    })
+}
+
+fn expand_log_path(value: &str) -> PathBuf {
+    if value == "~" {
+        if let Some(home) = user_home_dir_for_log() {
+            return home;
+        }
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = user_home_dir_for_log() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+fn user_home_dir_for_log() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn log_json_rpc_id(id: &Value) -> Value {
+    json_rpc_id_key(id)
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+fn log_request_params_summary(params: &Value) -> Value {
+    match params {
+        Value::Object(map) => json!({
+            "kind": "object",
+            "keys": map.keys().cloned().collect::<Vec<_>>(),
+        }),
+        Value::Array(values) => json!({
+            "kind": "array",
+            "len": values.len(),
+        }),
+        Value::Null => json!({ "kind": "null" }),
+        _ => json!({ "kind": "scalar" }),
+    }
+}
+
+fn log_text_preview(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn turn_work_log_fields(work: &TurnWork) -> Value {
+    json!({
+        "threadId": &work.thread_id,
+        "turnId": &work.turn_id,
+        "claudeSessionId": &work.claude_session_id,
+        "cwd": &work.cwd,
+        "resumeExisting": work.resume_existing,
+        "titleGeneration": is_claude_title_generation_prompt(&work.prompt),
+    })
+}
+
+fn stream_log_summary(stream: &ClaudeStreamState) -> Value {
+    json!({
+        "sawToolCall": stream.saw_tool_call,
+        "toolCalls": stream
+            .tool_calls
+            .iter()
+            .map(|(id, state)| {
+                json!({
+                    "id": id,
+                    "name": &state.name,
+                    "startedEmitted": state.started_emitted,
+                    "completed": stream.completed_tool_ids.contains(id),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "completedToolIds": stream.completed_tool_ids.iter().cloned().collect::<Vec<_>>(),
+        "resultSeen": claude_stream_result_seen(stream),
+        "emittedTextBytes": stream.emitted_text.len(),
+        "pendingAgentTextBytes": stream.pending_agent_text.len(),
+    })
+}
+
+fn claude_message_log_summary(message: &Value) -> Value {
+    let message_type = message.get("type").and_then(Value::as_str);
+    let mut summary = serde_json::Map::new();
+    summary.insert(
+        "type".to_string(),
+        message_type.map(Value::from).unwrap_or(Value::Null),
+    );
+    if let Some(parent_tool_use_id) = message.get("parent_tool_use_id").and_then(Value::as_str) {
+        summary.insert("parentToolUseId".to_string(), json!(parent_tool_use_id));
+    }
+    match message_type {
+        Some("stream_event") => {
+            if let Some(event) = message.get("event") {
+                summary.insert(
+                    "streamEventType".to_string(),
+                    event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(Value::from)
+                        .unwrap_or(Value::Null),
+                );
+                if let Some(content_block) = event.get("content_block") {
+                    summary.insert(
+                        "contentBlockType".to_string(),
+                        content_block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    );
+                    summary.insert(
+                        "toolId".to_string(),
+                        content_block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    );
+                    summary.insert(
+                        "toolName".to_string(),
+                        content_block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            }
+        }
+        Some("assistant") | Some("user") => {
+            if let Some(content) = message
+                .get("message")
+                .and_then(|message| message.get("content"))
+            {
+                summary.insert(
+                    "contentTypes".to_string(),
+                    claude_content_type_summary(content),
+                );
+            }
+        }
+        Some("result") => {
+            summary.insert(
+                "isError".to_string(),
+                json!(message
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)),
+            );
+            summary.insert(
+                "usage".to_string(),
+                json!(claude_result_usage_summary(message)),
+            );
+            summary.insert(
+                "resultPreview".to_string(),
+                json!(message
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(|value| log_text_preview(value, 300))),
+            );
+        }
+        Some("control_request") => {
+            summary.insert(
+                "requestId".to_string(),
+                json!(claude_control_request_id(message)),
+            );
+            summary.insert(
+                "subtype".to_string(),
+                json!(claude_control_request_subtype(message)),
+            );
+            summary.insert(
+                "toolName".to_string(),
+                json!(claude_permission_tool_name(message)),
+            );
+            summary.insert(
+                "serverName".to_string(),
+                json!(claude_permission_server_name(message)),
+            );
+        }
+        _ => {}
+    }
+    Value::Object(summary)
+}
+
+fn claude_content_type_summary(content: &Value) -> Value {
+    let values = match content {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+            .collect::<Vec<_>>(),
+        Value::Object(_) => vec![content
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("object")
+            .to_string()],
+        _ => vec!["scalar".to_string()],
+    };
+    json!(values)
+}
+
+#[derive(Debug)]
+struct McpMetadataRelayOptions {
+    server_name: String,
+    thread_id: String,
+    turn_id: String,
+    session_id: String,
+    cwd: String,
+    command: String,
+    args: Vec<String>,
+}
+
+pub fn run_mcp_metadata_relay(args: Vec<OsString>) -> Result<i32, String> {
+    let options = parse_mcp_metadata_relay_options(args)?;
+    claude_code_log_event(
+        "mcp_metadata_relay_start",
+        json!({
+            "serverName": &options.server_name,
+            "threadId": &options.thread_id,
+            "turnId": &options.turn_id,
+            "sessionId": &options.session_id,
+            "command": &options.command,
+            "args": &options.args,
+        }),
+    );
+    let mut command = Command::new(&options.command);
+    command
+        .args(&options.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to launch MCP metadata relay child: {}", err))?;
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open MCP metadata relay child stdin".to_string())?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture MCP metadata relay child stdout".to_string())?;
+    let stdout_handle = thread::spawn(move || {
+        let mut reader = BufReader::new(child_stdout);
+        let mut stdout = std::io::stdout();
+        let _ = std::io::copy(&mut reader, &mut stdout);
+        let _ = stdout.flush();
+    });
+
+    let mut stdin = BufReader::new(std::io::stdin());
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let size = stdin
+            .read_until(b'\n', &mut line)
+            .map_err(|err| format!("failed to read MCP metadata relay stdin: {}", err))?;
+        if size == 0 {
+            break;
+        }
+        let transformed = inject_mcp_codex_turn_metadata(&line, &options);
+        child_stdin
+            .write_all(&transformed)
+            .and_then(|_| child_stdin.flush())
+            .map_err(|err| format!("failed to write MCP metadata relay child stdin: {}", err))?;
+    }
+    drop(child_stdin);
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for MCP metadata relay child: {}", err))?;
+    let _ = stdout_handle.join();
+    claude_code_log_event(
+        "mcp_metadata_relay_stop",
+        json!({
+            "serverName": &options.server_name,
+            "threadId": &options.thread_id,
+            "turnId": &options.turn_id,
+            "success": status.success(),
+            "status": status.to_string(),
+        }),
+    );
+    Ok(status
+        .code()
+        .unwrap_or(if status.success() { 0 } else { 1 }))
+}
+
+fn parse_mcp_metadata_relay_options(
+    args: Vec<OsString>,
+) -> Result<McpMetadataRelayOptions, String> {
+    let args = args
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let mut server_name = String::new();
+    let mut thread_id = String::new();
+    let mut turn_id = String::new();
+    let mut session_id = String::new();
+    let mut cwd = String::new();
+    let mut command_index = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--server-name" => {
+                index += 1;
+                server_name = args.get(index).cloned().unwrap_or_default();
+            }
+            "--thread-id" => {
+                index += 1;
+                thread_id = args.get(index).cloned().unwrap_or_default();
+            }
+            "--turn-id" => {
+                index += 1;
+                turn_id = args.get(index).cloned().unwrap_or_default();
+            }
+            "--session-id" => {
+                index += 1;
+                session_id = args.get(index).cloned().unwrap_or_default();
+            }
+            "--cwd" => {
+                index += 1;
+                cwd = args.get(index).cloned().unwrap_or_default();
+            }
+            "--" => {
+                command_index = Some(index + 1);
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let command_index = command_index
+        .ok_or_else(|| "missing -- before MCP metadata relay child command".to_string())?;
+    let command = args
+        .get(command_index)
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "missing MCP metadata relay child command".to_string())?;
+    Ok(McpMetadataRelayOptions {
+        server_name,
+        thread_id,
+        turn_id,
+        session_id,
+        cwd,
+        command,
+        args: args.into_iter().skip(command_index + 1).collect(),
+    })
+}
+
+fn inject_mcp_codex_turn_metadata(line: &[u8], options: &McpMetadataRelayOptions) -> Vec<u8> {
+    let trimmed = trim_json_line(line);
+    let Ok(mut value) = serde_json::from_slice::<Value>(trimmed) else {
+        return line.to_vec();
+    };
+    let should_inject = value.get("method").and_then(Value::as_str) == Some("tools/call");
+    if !should_inject {
+        return line.to_vec();
+    }
+    let metadata = mcp_codex_turn_metadata(options);
+    let metadata_header = serde_json::to_string(&metadata).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        let params = object
+            .entry("params".to_string())
+            .or_insert_with(|| json!({}));
+        if !params.is_object() {
+            *params = json!({});
+        }
+        if let Some(params) = params.as_object_mut() {
+            let meta = params
+                .entry("_meta".to_string())
+                .or_insert_with(|| json!({}));
+            if !meta.is_object() {
+                *meta = json!({});
+            }
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert("x-codex-turn-metadata".to_string(), metadata.clone());
+                meta.insert("codexTurnMetadata".to_string(), metadata.clone());
+            }
+            let headers = params
+                .entry("headers".to_string())
+                .or_insert_with(|| json!({}));
+            if !headers.is_object() {
+                *headers = json!({});
+            }
+            if let Some(headers) = headers.as_object_mut() {
+                headers.insert(
+                    "x-codex-turn-metadata".to_string(),
+                    Value::String(metadata_header),
+                );
+            }
+        }
+    }
+    claude_code_log_event(
+        "mcp_metadata_relay_injected",
+        json!({
+            "serverName": &options.server_name,
+            "threadId": &options.thread_id,
+            "turnId": &options.turn_id,
+            "method": value.get("method").and_then(Value::as_str),
+            "id": value.get("id").map(log_json_rpc_id).unwrap_or(Value::Null),
+        }),
+    );
+    let mut output = serde_json::to_vec(&value).unwrap_or_else(|_| trimmed.to_vec());
+    output.push(b'\n');
+    output
+}
+
+fn mcp_codex_turn_metadata(options: &McpMetadataRelayOptions) -> Value {
+    json!({
+        "type": "thread-id",
+        "thread-id": &options.thread_id,
+        "threadId": &options.thread_id,
+        "turn-id": &options.turn_id,
+        "turnId": &options.turn_id,
+        "session_id": &options.session_id,
+        "turn_id": &options.turn_id,
+        "codex_session_id": &options.session_id,
+        "codex_thread_id": &options.thread_id,
+        "cwd": &options.cwd,
+        "source": "claude-code",
+        "server": &options.server_name,
+    })
+}
+
 fn handle_client_line<W>(
     line: &[u8],
     state: SharedState,
@@ -227,9 +744,42 @@ where
                 "[codexl-claude-code] ignoring invalid JSON-RPC line: {}",
                 err
             );
+            claude_code_log_event(
+                "client_line_invalid_json",
+                json!({
+                    "error": err.to_string(),
+                    "bytes": line.len(),
+                }),
+            );
             return Ok(None);
         }
     };
+
+    if value.get("method").is_none() {
+        if let Some(response_id) = value.get("id").and_then(json_rpc_id_key) {
+            let response = value
+                .get("result")
+                .cloned()
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .cloned()
+                        .map(|error| json!({ "error": error }))
+                })
+                .unwrap_or(Value::Null);
+            let mut state = lock_state(&state)?;
+            state.app_responses.insert(response_id, response);
+            claude_code_log_event(
+                "app_response_stashed",
+                json!({
+                    "id": log_json_rpc_id(value.get("id").unwrap_or(&Value::Null)),
+                    "hasError": value.get("error").is_some(),
+                    "resultSummary": log_request_params_summary(value.get("result").unwrap_or(&Value::Null)),
+                }),
+            );
+        }
+        return Ok(None);
+    }
 
     let method = value
         .get("method")
@@ -240,6 +790,43 @@ where
     }
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let params = value.get("params").cloned().unwrap_or(Value::Null);
+    claude_code_log_event(
+        "client_request",
+        json!({
+            "method": method,
+            "id": log_json_rpc_id(&id),
+            "params": log_request_params_summary(&params),
+        }),
+    );
+
+    if should_inject_codex_app_method(method) {
+        if let Some(result) = standalone_codex_app_result(method, &params) {
+            claude_code_log_event(
+                "codex_app_method_satisfied",
+                json!({
+                    "method": method,
+                    "id": log_json_rpc_id(&id),
+                    "result": log_request_params_summary(&result),
+                }),
+            );
+            write_response(&output, id, result)?;
+        } else {
+            claude_code_log_event(
+                "codex_app_method_unsupported",
+                json!({
+                    "method": method,
+                    "id": log_json_rpc_id(&id),
+                }),
+            );
+            write_error(
+                &output,
+                id,
+                -32601,
+                format!("Claude Code app-server does not support method: {}", method),
+            )?;
+        }
+        return Ok(None);
+    }
 
     match method {
         "initialize" => {
@@ -298,7 +885,12 @@ where
             let response = {
                 let state = lock_state(&state)?;
                 json!({
-                    "data": state.threads.keys().cloned().collect::<Vec<_>>(),
+                    "data": state
+                        .threads
+                        .values()
+                        .filter(|thread| !is_claude_title_generation_thread(thread))
+                        .map(|thread| thread.id.clone())
+                        .collect::<Vec<_>>(),
                     "nextCursor": Value::Null,
                 })
             };
@@ -364,11 +956,21 @@ where
                 state.start_turn(&params)?
             };
             write_response(&output, id, response)?;
+            claude_code_log_event(
+                "turn_start_response_sent",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "notificationCount": notifications.len(),
+                    "titleGeneration": is_claude_title_generation_prompt(&work.prompt),
+                }),
+            );
             for notification in notifications {
                 write_notification(&output, notification)?;
             }
             let worker_state = Arc::clone(&state);
             let worker_output = Arc::clone(&output);
+            claude_code_log_event("turn_worker_spawn", turn_work_log_fields(&work));
             return Ok(Some(thread::spawn(move || {
                 run_turn_worker(work, worker_state, worker_output);
             })));
@@ -380,7 +982,20 @@ where
             };
             write_response(&output, id, json!({}))?;
             if let Some(pid) = pid {
+                claude_code_log_event(
+                    "turn_interrupt_terminate_process",
+                    json!({
+                        "pid": pid,
+                    }),
+                );
                 terminate_process_group(pid);
+            } else {
+                claude_code_log_event(
+                    "turn_interrupt_no_process",
+                    json!({
+                        "params": log_request_params_summary(&params),
+                    }),
+                );
             }
         }
         "model/list" => {
@@ -402,21 +1017,25 @@ where
             )?;
         }
         "account/read" => {
+            let workspace_name = {
+                let state = lock_state(&state)?;
+                state.workspace_name.clone()
+            };
             write_response(
                 &output,
                 id,
-                json!({ "account": Value::Null, "requiresOpenaiAuth": false }),
+                claude_code_mock_account_read_result(workspace_name.as_deref()),
             )?;
         }
         "getAuthStatus" => {
+            let workspace_name = {
+                let state = lock_state(&state)?;
+                state.workspace_name.clone()
+            };
             write_response(
                 &output,
                 id,
-                json!({
-                    "authMethod": Value::Null,
-                    "authToken": Value::Null,
-                    "requiresOpenaiAuth": false,
-                }),
+                claude_code_mock_auth_status_result(&params, workspace_name.as_deref()),
             )?;
         }
         "permissionProfile/list"
@@ -456,6 +1075,1646 @@ where
         }
     }
     Ok(None)
+}
+
+fn should_inject_codex_app_method(method: &str) -> bool {
+    !is_claude_code_owned_method(method)
+}
+
+fn claude_code_mock_account_read_result(workspace_name: Option<&str>) -> Value {
+    json!({
+        "account": {
+            "type": "chatgpt",
+            "email": claude_code_mock_account_email(workspace_name),
+            "planType": "unknown",
+        },
+        "requiresOpenaiAuth": false,
+    })
+}
+
+fn claude_code_mock_auth_status_result(params: &Value, workspace_name: Option<&str>) -> Value {
+    let mut result = serde_json::Map::new();
+    result.insert("authMethod".to_string(), json!("chatgpt"));
+    result.insert(
+        "account".to_string(),
+        claude_code_mock_account_read_result(workspace_name)
+            .get("account")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    if params
+        .get("includeToken")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        result.insert("authToken".to_string(), Value::Null);
+    }
+    result.insert("requiresOpenaiAuth".to_string(), json!(false));
+    Value::Object(result)
+}
+
+fn claude_code_mock_account_email(workspace_name: Option<&str>) -> String {
+    workspace_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(PROVIDER_NAME)
+        .to_string()
+}
+
+fn is_claude_code_owned_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "thread/start"
+            | "thread/resume"
+            | "thread/read"
+            | "thread/list"
+            | "thread/loaded/list"
+            | "thread/turns/list"
+            | "thread/turns/items/list"
+            | "thread/archive"
+            | "thread/unarchive"
+            | "thread/unsubscribe"
+            | "thread/name/set"
+            | "thread/metadata/update"
+            | "turn/start"
+            | "turn/interrupt"
+            | "account/read"
+            | "getAuthStatus"
+            | "config/read"
+    )
+}
+
+fn standalone_codex_app_result(method: &str, params: &Value) -> Option<Value> {
+    match method {
+        "config/mcpServer/reload"
+        | "memory/reset"
+        | "experimentalFeature/enablement/set"
+        | "marketplace/add" => Some(json!({})),
+        "remoteControl/status/read" => Some(json!({
+            "enabled": false,
+            "status": "unavailable",
+        })),
+        "configRequirements/read" => Some(json!({ "requirements": Value::Null })),
+        "extension/list" | "extensions/list" => Some(json!({
+            "data": standalone_extension_list(),
+            "nextCursor": Value::Null,
+        })),
+        "hooks/list" => Some(json!({ "data": standalone_hooks_list(params) })),
+        "collaborationMode/list" => Some(json!({ "data": [] })),
+        "modelProvider/capabilities/read" => Some(json!({
+            "namespaceTools": false,
+            "imageGeneration": false,
+            "webSearch": false,
+        })),
+        "skills/list" => Some(json!({
+            "data": standalone_skill_list(),
+            "nextCursor": Value::Null,
+        })),
+        "plugin/list" => codex_cli_app_server_method_result(method, params)
+            .or_else(|| Some(standalone_plugin_list_result())),
+        "plugin/read" => codex_cli_app_server_method_result(method, params)
+            .or_else(|| Some(standalone_plugin_read_result(params))),
+        "plugin/install" => codex_cli_app_server_method_result(method, params)
+            .or_else(|| Some(standalone_plugin_install_result(params))),
+        "app/list" => Some(json!({
+            "data": standalone_app_list(),
+            "nextCursor": Value::Null,
+        })),
+        "mcpServerStatus/list" => Some(json!({
+            "data": standalone_mcp_server_status_list(),
+            "nextCursor": Value::Null,
+        })),
+        "model/list" | "permissionProfile/list" | "experimentalFeature/list" => Some(json!({
+            "data": [],
+            "nextCursor": Value::Null,
+        })),
+        _ => None,
+    }
+}
+
+fn standalone_skill_list() -> Vec<Value> {
+    let mut skills = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in codex_resource_roots("skills")
+        .into_iter()
+        .chain(codex_resource_roots("plugins"))
+    {
+        collect_skill_files(&root, 0, &mut |path| {
+            let key = canonical_key(path);
+            if seen.insert(key) {
+                if let Some(skill) = skill_json_from_path(path) {
+                    skills.push(skill);
+                }
+            }
+        });
+    }
+    skills.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    skills
+}
+
+fn skill_json_from_path(path: &Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let fallback_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill")
+        .to_string();
+    let name = front_matter_value(&content, "name")
+        .or_else(|| markdown_title(&content))
+        .unwrap_or(fallback_name);
+    let description = front_matter_value(&content, "description")
+        .or_else(|| markdown_first_paragraph(&content))
+        .unwrap_or_default();
+    Some(json!({
+        "id": name,
+        "name": name,
+        "title": markdown_title(&content).unwrap_or_else(|| name.clone()),
+        "description": description,
+        "path": path.to_string_lossy().to_string(),
+        "skillPath": path.to_string_lossy().to_string(),
+        "source": "filesystem",
+        "enabled": true,
+    }))
+}
+
+fn collect_skill_files<F>(dir: &Path, depth: usize, visitor: &mut F)
+where
+    F: FnMut(&Path),
+{
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() && path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+        {
+            visitor(&path);
+        } else if metadata.is_dir() {
+            collect_skill_files(&path, depth + 1, visitor);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StandalonePluginEntry {
+    marketplace_name: String,
+    marketplace_path: String,
+    manifest_path: PathBuf,
+    package_dir: PathBuf,
+    plugin: Value,
+}
+
+fn codex_cli_app_server_method_result(method: &str, params: &Value) -> Option<Value> {
+    if !codex_cli_app_server_proxy_enabled() {
+        return None;
+    }
+    let executable = codex_cli_app_server_executable()?;
+    let request_id = "__codexl_claude_code_proxy_request__";
+    let initialize_id = "__codexl_claude_code_proxy_initialize__";
+    let input = format!(
+        "{}\n{}\n{}\n",
+        json!({
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codexl-claude-code-app-server",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }),
+        json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        })
+    );
+    let mut command = Command::new(executable);
+    command
+        .arg("app-server")
+        .arg("--analytics-default-enabled")
+        .env("CODEX_HOME", codex_cli_app_server_codex_home())
+        .env_remove("CODEX_CLI_PATH")
+        .env_remove("CODEXL_REAL_CODEX_CLI_PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    {
+        let stdin = child.stdin.as_mut()?;
+        stdin.write_all(input.as_bytes()).ok()?;
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_str) != Some(request_id) {
+            continue;
+        }
+        if value.get("error").is_some() {
+            return None;
+        }
+        return value.get("result").cloned();
+    }
+    None
+}
+
+fn codex_cli_app_server_proxy_enabled() -> bool {
+    std::env::var(CODEX_APP_SERVER_PROXY_ENV)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
+}
+
+fn codex_cli_app_server_codex_home() -> String {
+    std::env::var("CODEX_HOME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let config = crate::config::AppConfig::load();
+            config.active_codex_home().map(str::to_string)
+        })
+        .unwrap_or_else(crate::config::default_codex_home)
+}
+
+fn codex_cli_app_server_executable() -> Option<String> {
+    for key in [
+        "CODEXL_REAL_CODEX_CLI_PATH",
+        "CODEXL_BUNDLED_CODEX_CLI_PATH",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if codex_cli_executable_usable(&value) {
+                return Some(value);
+            }
+        }
+    }
+    let config = crate::config::AppConfig::load();
+    if let Some(path) = bundled_codex_cli_path(&config.codex_path) {
+        let value = path.to_string_lossy().to_string();
+        if codex_cli_executable_usable(&value) {
+            return Some(value);
+        }
+    }
+    for app in [
+        "/Applications/Codex.app/Contents/MacOS/Codex",
+        "/Applications/OpenAI Codex.app/Contents/MacOS/OpenAI Codex",
+    ] {
+        if let Some(path) = bundled_codex_cli_path(app) {
+            let value = path.to_string_lossy().to_string();
+            if codex_cli_executable_usable(&value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn bundled_codex_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
+    let executable = PathBuf::from(codex_app_executable.trim());
+    let contents_dir = executable.parent()?.parent()?;
+    let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let candidate = contents_dir.join("Resources").join(file_name);
+    candidate.is_file().then_some(candidate)
+}
+
+fn codex_cli_executable_usable(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.contains("codexl-codex-cli-middleware") {
+        return false;
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if Path::new(value) == current {
+            return false;
+        }
+    }
+    Path::new(value).is_file()
+}
+
+fn standalone_plugin_list_result() -> Value {
+    let entries = standalone_plugin_entries();
+    let mut marketplaces = BTreeMap::<String, (String, Vec<Value>)>::new();
+    let mut data = Vec::new();
+    for entry in entries {
+        data.push(entry.plugin.clone());
+        marketplaces
+            .entry(entry.marketplace_name)
+            .or_insert_with(|| (entry.marketplace_path, Vec::new()))
+            .1
+            .push(entry.plugin);
+    }
+    let mut marketplace_values = marketplaces
+        .into_iter()
+        .map(|(name, (path, mut plugins))| {
+            plugins.sort_by(|left, right| {
+                left.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+            });
+            json!({
+                "name": name,
+                "path": path,
+                "interface": Value::Null,
+                "plugins": plugins,
+            })
+        })
+        .collect::<Vec<_>>();
+    marketplace_values.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    data.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+    });
+    json!({
+        "marketplaces": marketplace_values,
+        "marketplaceLoadErrors": [],
+        "featuredPluginIds": [],
+        "data": data,
+        "nextCursor": Value::Null,
+    })
+}
+
+fn standalone_plugin_entries() -> Vec<StandalonePluginEntry> {
+    let mut plugins = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in codex_resource_roots("plugins") {
+        collect_json_manifest_files(&root, 0, &["plugin.json"], &mut |path| {
+            if manifest_is_inside_codex_app_dir(path, ".codex-app") {
+                return;
+            }
+            let key = canonical_key(path);
+            if seen.insert(key) {
+                if let Some(plugin) = plugin_entry_from_manifest_path(path) {
+                    plugins.push(plugin);
+                }
+            }
+        });
+    }
+    plugins.sort_by(|left, right| {
+        left.plugin
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .plugin
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    plugins
+}
+
+fn plugin_entry_from_manifest_path(path: &Path) -> Option<StandalonePluginEntry> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&content).ok()?;
+    let object = value.as_object()?;
+    let package_dir = plugin_package_dir_for_manifest(path);
+    let marketplace_name = plugin_marketplace_name(path);
+    let marketplace_path = plugin_marketplace_path(path, &marketplace_name);
+    let fallback_name = package_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("plugin")
+        .to_string();
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&fallback_name)
+        .to_string();
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if marketplace_name == "filesystem" {
+                name.clone()
+            } else {
+                format!("{}@{}", name, marketplace_name)
+            }
+        });
+    let keywords = object
+        .get("keywords")
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let plugin = json!({
+        "id": id,
+        "name": name,
+        "shareContext": object.get("shareContext").cloned().unwrap_or(Value::Null),
+        "source": {
+            "type": "local",
+            "path": path_to_string(package_dir.clone()),
+        },
+        "installed": true,
+        "enabled": object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        "installPolicy": object
+            .get("installPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("AVAILABLE"),
+        "authPolicy": object
+            .get("authPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("ON_INSTALL"),
+        "availability": object
+            .get("availability")
+            .and_then(Value::as_str)
+            .unwrap_or("AVAILABLE"),
+        "interface": plugin_interface_json(object.get("interface"), &package_dir),
+        "keywords": keywords,
+        "path": path.to_string_lossy().to_string(),
+    });
+    Some(StandalonePluginEntry {
+        marketplace_name,
+        marketplace_path,
+        manifest_path: path.to_path_buf(),
+        package_dir,
+        plugin,
+    })
+}
+
+fn standalone_plugin_read_result(params: &Value) -> Value {
+    let Some(entry) = find_standalone_plugin_entry(params) else {
+        return json!({ "plugin": Value::Null });
+    };
+    json!({ "plugin": standalone_plugin_detail(&entry) })
+}
+
+fn standalone_plugin_install_result(params: &Value) -> Value {
+    let auth_policy = find_standalone_plugin_entry(params)
+        .and_then(|entry| {
+            entry
+                .plugin
+                .get("authPolicy")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "ON_INSTALL".to_string());
+    json!({
+        "authPolicy": auth_policy,
+        "appsNeedingAuth": [],
+    })
+}
+
+fn find_standalone_plugin_entry(params: &Value) -> Option<StandalonePluginEntry> {
+    let plugin_name = plugin_request_name(params)?;
+    let marketplace_path = params
+        .get("marketplacePath")
+        .or_else(|| params.get("marketplace_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    standalone_plugin_entries()
+        .into_iter()
+        .find(|entry| plugin_entry_matches_request(entry, plugin_name, marketplace_path))
+}
+
+fn plugin_request_name(params: &Value) -> Option<&str> {
+    ["pluginName", "plugin_name", "name", "id"]
+        .into_iter()
+        .find_map(|key| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn plugin_entry_matches_request(
+    entry: &StandalonePluginEntry,
+    plugin_name: &str,
+    marketplace_path: Option<&str>,
+) -> bool {
+    let Some(entry_name) = entry.plugin.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let entry_id = entry.plugin.get("id").and_then(Value::as_str);
+    let source_name = entry
+        .plugin
+        .pointer("/source/path")
+        .and_then(Value::as_str)
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str());
+    let name_matches = [Some(entry_name), entry_id, source_name]
+        .into_iter()
+        .flatten()
+        .any(|candidate| {
+            candidate == plugin_name
+                || candidate
+                    .strip_suffix(&format!("@{}", entry.marketplace_name))
+                    .is_some_and(|value| value == plugin_name)
+        });
+    if !name_matches {
+        return false;
+    }
+    let Some(marketplace_path) = marketplace_path else {
+        return true;
+    };
+    plugin_marketplace_path_matches(entry, marketplace_path)
+}
+
+fn plugin_marketplace_path_matches(entry: &StandalonePluginEntry, marketplace_path: &str) -> bool {
+    let marketplace_path = marketplace_path.trim();
+    if marketplace_path.is_empty() {
+        return true;
+    }
+    if marketplace_path == entry.marketplace_path {
+        return true;
+    }
+    let entry_key = canonical_key(Path::new(&entry.marketplace_path));
+    let request_key = canonical_key(Path::new(marketplace_path));
+    if entry_key == request_key {
+        return true;
+    }
+    marketplace_path.contains(&entry.marketplace_name)
+        || entry.marketplace_path.contains(marketplace_path)
+        || marketplace_path.contains(&entry.marketplace_path)
+}
+
+fn standalone_plugin_detail(entry: &StandalonePluginEntry) -> Value {
+    let manifest = read_json_file(&entry.manifest_path).unwrap_or_else(|| json!({}));
+    json!({
+        "marketplaceName": entry.marketplace_name,
+        "marketplacePath": entry.marketplace_path,
+        "summary": entry.plugin,
+        "description": manifest
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "skills": plugin_skill_details(entry, &manifest),
+        "hooks": plugin_hook_details(entry, &manifest),
+        "apps": plugin_app_details(entry, &manifest),
+        "mcpServers": plugin_mcp_server_names(entry, &manifest),
+    })
+}
+
+fn plugin_skill_details(entry: &StandalonePluginEntry, manifest: &Value) -> Vec<Value> {
+    let mut skill_paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in plugin_manifest_paths(manifest.get("skills"), &entry.package_dir) {
+        collect_plugin_skill_paths(&path, &mut skill_paths, &mut seen);
+    }
+    if skill_paths.is_empty() {
+        collect_plugin_skill_paths(
+            &entry.package_dir.join("skills"),
+            &mut skill_paths,
+            &mut seen,
+        );
+    }
+    let plugin_name = entry
+        .plugin
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("plugin");
+    let mut skills = skill_paths
+        .into_iter()
+        .filter_map(|path| plugin_skill_detail(plugin_name, &path))
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    skills
+}
+
+fn collect_plugin_skill_paths(
+    path: &Path,
+    skill_paths: &mut Vec<PathBuf>,
+    seen: &mut BTreeSet<String>,
+) {
+    if path.is_file() && path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        push_unique_path(skill_paths, seen, path.to_path_buf());
+    } else {
+        collect_skill_files(path, 0, &mut |skill_path| {
+            push_unique_path(skill_paths, seen, skill_path.to_path_buf());
+        });
+    }
+}
+
+fn plugin_skill_detail(plugin_name: &str, path: &Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let fallback_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill")
+        .to_string();
+    let skill_name = front_matter_value(&content, "name")
+        .or_else(|| markdown_title(&content))
+        .unwrap_or(fallback_name);
+    let full_name = if skill_name.contains(':') {
+        skill_name.clone()
+    } else {
+        format!("{}:{}", plugin_name, skill_name)
+    };
+    let description = front_matter_value(&content, "description")
+        .or_else(|| markdown_first_paragraph(&content))
+        .unwrap_or_default();
+    Some(json!({
+        "name": full_name,
+        "description": description,
+        "shortDescription": Value::Null,
+        "interface": Value::Null,
+        "path": path.to_string_lossy().to_string(),
+        "enabled": true,
+    }))
+}
+
+fn plugin_hook_details(entry: &StandalonePluginEntry, manifest: &Value) -> Vec<Value> {
+    if let Some(hooks) = manifest.get("hooks").and_then(Value::as_array) {
+        return hooks.clone();
+    }
+    plugin_manifest_paths(manifest.get("hooks"), &entry.package_dir)
+        .into_iter()
+        .filter_map(|path| read_json_file(&path))
+        .flat_map(|value| {
+            value
+                .get("hooks")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn plugin_app_details(entry: &StandalonePluginEntry, manifest: &Value) -> Vec<Value> {
+    let mut apps = Vec::new();
+    for path in plugin_manifest_paths(manifest.get("apps"), &entry.package_dir) {
+        let Some(value) = read_json_file(&path) else {
+            continue;
+        };
+        if let Some(values) = value.get("apps").and_then(Value::as_array) {
+            apps.extend(values.clone());
+            continue;
+        }
+        if let Some(values) = value.get("apps").and_then(Value::as_object) {
+            for (name, app) in values {
+                let mut app = app.clone();
+                if let Some(object) = app.as_object_mut() {
+                    object
+                        .entry("name".to_string())
+                        .or_insert_with(|| Value::String(name.clone()));
+                }
+                apps.push(app);
+            }
+        }
+    }
+    apps
+}
+
+fn plugin_mcp_server_names(entry: &StandalonePluginEntry, manifest: &Value) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    if let Some(servers) = manifest.get("mcpServers").and_then(Value::as_object) {
+        names.extend(servers.keys().cloned());
+    }
+    for path in plugin_manifest_paths(manifest.get("mcpServers"), &entry.package_dir) {
+        let Some(value) = read_json_file(&path) else {
+            continue;
+        };
+        if let Some(servers) = value.get("mcpServers").and_then(Value::as_object) {
+            names.extend(servers.keys().cloned());
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn plugin_manifest_paths(value: Option<&Value>, package_dir: &Path) -> Vec<PathBuf> {
+    match value {
+        Some(Value::String(path)) => non_empty_string(path)
+            .map(|path| vec![resolve_plugin_manifest_path(package_dir, &path)])
+            .unwrap_or_default(),
+        Some(Value::Array(paths)) => paths
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(non_empty_string)
+            .map(|path| resolve_plugin_manifest_path(package_dir, &path))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn resolve_plugin_manifest_path(package_dir: &Path, value: &str) -> PathBuf {
+    let expanded = crate::config::normalize_home_path(value.trim());
+    let path = PathBuf::from(expanded);
+    if path.is_absolute() {
+        path
+    } else {
+        package_dir.join(path)
+    }
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Value>(&content).ok()
+}
+
+fn plugin_marketplace_name(path: &Path) -> String {
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str().map(str::to_string),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for window in components.windows(2) {
+        if window[0] == "cache" && !window[1].is_empty() {
+            return window[1].clone();
+        }
+    }
+    "filesystem".to_string()
+}
+
+fn plugin_marketplace_path(path: &Path, marketplace_name: &str) -> String {
+    if marketplace_name == "filesystem" {
+        return path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_string_lossy()
+            .to_string();
+    }
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.file_name().and_then(|name| name.to_str()) == Some(marketplace_name) {
+            return candidate.to_string_lossy().to_string();
+        }
+        current = candidate.parent();
+    }
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn plugin_interface_json(interface: Option<&Value>, package_dir: &Path) -> Value {
+    let Some(interface) = interface.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let mut normalized = serde_json::Map::new();
+    for (key, value) in interface {
+        let normalized_key = match key.as_str() {
+            "websiteURL" => "websiteUrl",
+            "privacyPolicyURL" => "privacyPolicyUrl",
+            "termsOfServiceURL" => "termsOfServiceUrl",
+            other => other,
+        };
+        let normalized_value = match normalized_key {
+            "composerIcon" | "logo" => plugin_asset_value(package_dir, value),
+            "screenshots" => plugin_asset_array(package_dir, value),
+            _ => value.clone(),
+        };
+        normalized.insert(normalized_key.to_string(), normalized_value);
+    }
+    normalized
+        .entry("composerIconUrl".to_string())
+        .or_insert(Value::Null);
+    normalized
+        .entry("logoUrl".to_string())
+        .or_insert(Value::Null);
+    normalized
+        .entry("screenshotUrls".to_string())
+        .or_insert_with(|| json!([]));
+    Value::Object(normalized)
+}
+
+fn plugin_asset_array(package_dir: &Path, value: &Value) -> Value {
+    let Some(values) = value.as_array() else {
+        return json!([]);
+    };
+    Value::Array(
+        values
+            .iter()
+            .map(|value| plugin_asset_value(package_dir, value))
+            .collect(),
+    )
+}
+
+fn plugin_asset_value(package_dir: &Path, value: &Value) -> Value {
+    let Some(raw) = value.as_str() else {
+        return value.clone();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || Path::new(trimmed).is_absolute()
+    {
+        return Value::String(trimmed.to_string());
+    }
+    Value::String(package_dir.join(trimmed).to_string_lossy().to_string())
+}
+
+fn standalone_app_list() -> Vec<Value> {
+    let mut apps = Vec::new();
+    let mut seen = BTreeSet::new();
+    for kind in ["apps", "connectors"] {
+        for root in codex_resource_roots(kind) {
+            collect_json_manifest_files(
+                &root,
+                0,
+                &["app.json", "connector.json", "plugin.json"],
+                &mut |path| {
+                    let key = canonical_key(path);
+                    if seen.insert(key) {
+                        if let Some(app) = manifest_json_from_path(path, "app") {
+                            apps.push(app);
+                        }
+                    }
+                },
+            );
+        }
+    }
+    apps.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+    });
+    apps
+}
+
+fn collect_json_manifest_files<F>(dir: &Path, depth: usize, names: &[&str], visitor: &mut F)
+where
+    F: FnMut(&Path),
+{
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| names.contains(&name))
+        {
+            visitor(&path);
+        } else if metadata.is_dir() {
+            collect_json_manifest_files(&path, depth + 1, names, visitor);
+        }
+    }
+}
+
+fn manifest_json_from_path(path: &Path, kind: &str) -> Option<Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut value = serde_json::from_str::<Value>(&content).ok()?;
+    let object = value.as_object_mut()?;
+    let fallback_name = plugin_package_dir_for_manifest(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(kind)
+        .to_string();
+    let fallback_id = object
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&fallback_name)
+        .to_string();
+    if object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        object.insert("id".to_string(), Value::String(fallback_id.clone()));
+    }
+    if object
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        object.insert("name".to_string(), Value::String(fallback_name));
+    }
+    object.insert("type".to_string(), Value::String(kind.to_string()));
+    object.insert(
+        "source".to_string(),
+        Value::String("filesystem".to_string()),
+    );
+    object.insert(
+        "path".to_string(),
+        Value::String(path.to_string_lossy().to_string()),
+    );
+    object
+        .entry("enabled".to_string())
+        .or_insert(Value::Bool(true));
+    Some(value)
+}
+
+fn manifest_is_inside_codex_app_dir(path: &Path, dir_name: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy() == dir_name)
+}
+
+fn standalone_mcp_server_status_list() -> Vec<Value> {
+    let mut servers = BTreeMap::<String, StandaloneMcpServer>::new();
+    for config_path in codex_config_paths() {
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        for server in parse_mcp_servers_from_config(&content, &config_path) {
+            servers.entry(server.name.clone()).or_insert(server);
+        }
+    }
+    for config_path in codex_plugin_mcp_config_paths() {
+        let Ok(content) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+        for server in parse_mcp_servers_from_json(&value, &config_path, base_dir, "plugin") {
+            servers.entry(server.name.clone()).or_insert(server);
+        }
+    }
+    servers
+        .into_values()
+        .map(StandaloneMcpServer::to_json)
+        .collect()
+}
+
+fn claude_code_capability_args(work: &TurnWork) -> Vec<String> {
+    if is_claude_title_generation_prompt(&work.prompt) {
+        return Vec::new();
+    }
+    let mut args = Vec::new();
+    if let Some(mcp_config) = claude_code_mcp_config_json(work) {
+        args.push("--mcp-config".to_string());
+        args.push(mcp_config);
+    }
+    args
+}
+
+fn claude_code_mcp_config_json(work: &TurnWork) -> Option<String> {
+    let mut mcp_servers = serde_json::Map::new();
+    for server in standalone_mcp_server_status_list() {
+        if server.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(name) = server.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(command) = server
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let mut config = serde_json::Map::new();
+        config.insert("command".to_string(), Value::String(command.to_string()));
+        if let Some(args) = server.get("args").and_then(Value::as_array) {
+            config.insert("args".to_string(), Value::Array(args.clone()));
+        }
+        if let Some(cwd) = server
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            config.insert("cwd".to_string(), Value::String(cwd.to_string()));
+        }
+        if let Some(env) = server.get("env").filter(|env| env.is_object()) {
+            config.insert("env".to_string(), env.clone());
+        }
+        let claude_name = claude_code_mcp_server_name(name, &mcp_servers);
+        if claude_code_mcp_server_requires_metadata_relay(name, command) {
+            wrap_mcp_server_with_metadata_relay(&mut config, work, &claude_name);
+        }
+        mcp_servers.insert(claude_name, Value::Object(config));
+    }
+    if mcp_servers.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&json!({ "mcpServers": mcp_servers })).ok()
+}
+
+fn claude_code_mcp_config_log_summary(work: &TurnWork) -> Value {
+    let Some(config) = claude_code_mcp_config_json(work) else {
+        return json!({
+            "injected": false,
+            "servers": [],
+        });
+    };
+    let servers = serde_json::from_str::<Value>(&config)
+        .ok()
+        .and_then(|value| value.get("mcpServers").and_then(Value::as_object).cloned())
+        .map(|servers| {
+            servers
+                .into_iter()
+                .map(|(name, server)| {
+                    json!({
+                        "name": name,
+                        "command": server.get("command").and_then(Value::as_str),
+                        "cwd": server.get("cwd").and_then(Value::as_str),
+                        "args": server
+                            .get("args")
+                            .and_then(Value::as_array)
+                            .map(|args| args.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                        "envKeys": server
+                            .get("env")
+                            .and_then(Value::as_object)
+                            .map(|env| env.keys().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "injected": true,
+        "servers": servers,
+    })
+}
+
+fn claude_code_mcp_server_requires_metadata_relay(name: &str, command: &str) -> bool {
+    let lower_name = name.trim().to_ascii_lowercase();
+    lower_name == "computer-use" || command.contains("SkyComputerUseClient")
+}
+
+fn wrap_mcp_server_with_metadata_relay(
+    config: &mut serde_json::Map<String, Value>,
+    work: &TurnWork,
+    server_name: &str,
+) {
+    let Some(command) = config
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let real_args = config
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut args = vec![
+        crate::cli_middleware::CLAUDE_CODE_MCP_METADATA_RELAY_RUN_MODE_ARG.to_string(),
+        "--server-name".to_string(),
+        server_name.to_string(),
+        "--thread-id".to_string(),
+        work.thread_id.clone(),
+        "--turn-id".to_string(),
+        work.turn_id.clone(),
+        "--session-id".to_string(),
+        work.claude_session_id.clone(),
+        "--cwd".to_string(),
+        work.cwd.clone(),
+        "--".to_string(),
+        command,
+    ];
+    args.extend(real_args);
+    config.insert(
+        "command".to_string(),
+        Value::String(current_exe.to_string_lossy().to_string()),
+    );
+    config.insert(
+        "args".to_string(),
+        Value::Array(args.into_iter().map(Value::String).collect()),
+    );
+    let mut env = config
+        .get("env")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    env.insert(
+        "CODEX_SESSION_ID".to_string(),
+        json!(work.claude_session_id),
+    );
+    env.insert("CODEX_TURN_ID".to_string(), json!(work.turn_id));
+    env.insert("CODEX_THREAD_ID".to_string(), json!(work.thread_id));
+    config.insert("env".to_string(), Value::Object(env));
+}
+
+fn claude_code_mcp_server_name(name: &str, existing: &serde_json::Map<String, Value>) -> String {
+    let base = if claude_code_reserved_mcp_server_name(name) {
+        format!("codex-{name}")
+    } else {
+        name.to_string()
+    };
+    let mut candidate = base.clone();
+    let mut index = 2;
+    while existing.contains_key(&candidate) {
+        candidate = format!("{base}-{index}");
+        index += 1;
+    }
+    candidate
+}
+
+fn claude_code_reserved_mcp_server_name(name: &str) -> bool {
+    matches!(name.trim().to_ascii_lowercase().as_str(), "computer-use")
+}
+
+#[derive(Debug, Clone, Default)]
+struct StandaloneMcpServer {
+    name: String,
+    command: Option<String>,
+    args: Vec<String>,
+    enabled: bool,
+    config_path: String,
+    cwd: Option<String>,
+    env: Option<Value>,
+    source: String,
+}
+
+impl StandaloneMcpServer {
+    fn to_json(self) -> Value {
+        json!({
+            "id": self.name,
+            "name": self.name,
+            "serverName": self.name,
+            "server_name": self.name,
+            "status": if self.enabled { "configured" } else { "disabled" },
+            "enabled": self.enabled,
+            "command": self.command,
+            "args": self.args,
+            "transport": "stdio",
+            "cwd": self.cwd,
+            "env": self.env.unwrap_or_else(|| json!({})),
+            "source": self.source,
+            "configPath": self.config_path,
+            "config_path": self.config_path,
+            "error": Value::Null,
+        })
+    }
+}
+
+fn parse_mcp_servers_from_config(content: &str, config_path: &Path) -> Vec<StandaloneMcpServer> {
+    let mut servers = Vec::new();
+    let mut current: Option<StandaloneMcpServer> = None;
+    let mut in_env_table = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some(server) = current.take() {
+                servers.push(server);
+            }
+            let table = line.trim_matches(['[', ']']);
+            if let Some(name) = mcp_server_name_from_table(table) {
+                if table.contains(".env") {
+                    in_env_table = true;
+                    current = None;
+                } else {
+                    in_env_table = false;
+                    current = Some(StandaloneMcpServer {
+                        name,
+                        enabled: true,
+                        config_path: config_path.to_string_lossy().to_string(),
+                        source: "config".to_string(),
+                        ..StandaloneMcpServer::default()
+                    });
+                }
+            } else {
+                current = None;
+                in_env_table = false;
+            }
+            continue;
+        }
+        if in_env_table {
+            continue;
+        }
+        let Some(server) = current.as_mut() else {
+            continue;
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "command" => server.command = parse_toml_string(value),
+            "args" => server.args = parse_toml_string_array(value),
+            "enabled" => server.enabled = parse_toml_bool(value).unwrap_or(server.enabled),
+            "disabled" => {
+                if let Some(disabled) = parse_toml_bool(value) {
+                    server.enabled = !disabled;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(server) = current {
+        servers.push(server);
+    }
+    servers
+}
+
+fn codex_plugin_mcp_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in codex_resource_roots("plugins") {
+        collect_json_manifest_files(&root, 0, &["plugin.json"], &mut |path| {
+            let Some(mcp_path) = plugin_manifest_mcp_config_path(path) else {
+                return;
+            };
+            push_unique_path(&mut paths, &mut seen, mcp_path);
+        });
+        collect_json_manifest_files(&root, 0, &[".mcp.json"], &mut |path| {
+            push_unique_path(&mut paths, &mut seen, path.to_path_buf());
+        });
+    }
+    paths
+}
+
+fn plugin_manifest_mcp_config_path(path: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&content).ok()?;
+    let mcp_servers = value.get("mcpServers")?.as_str()?.trim();
+    if mcp_servers.is_empty() {
+        return None;
+    }
+    let mcp_path = PathBuf::from(mcp_servers);
+    if mcp_path.is_absolute() {
+        return Some(mcp_path);
+    }
+    Some(plugin_package_dir_for_manifest(path).join(mcp_path))
+}
+
+fn plugin_package_dir_for_manifest(path: &Path) -> PathBuf {
+    let manifest_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if manifest_dir.file_name().and_then(|value| value.to_str()) == Some(".codex-plugin") {
+        return manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf();
+    }
+    manifest_dir.to_path_buf()
+}
+
+fn parse_mcp_servers_from_json(
+    value: &Value,
+    config_path: &Path,
+    base_dir: &Path,
+    source: &str,
+) -> Vec<StandaloneMcpServer> {
+    let Some(servers_object) = value.get("mcpServers").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut servers = Vec::new();
+    for (name, server_value) in servers_object {
+        let Some(server_object) = server_value.as_object() else {
+            continue;
+        };
+        let cwd_path = server_object
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(|cwd| resolve_mcp_config_path(base_dir, cwd));
+        let command_base = cwd_path.as_deref().unwrap_or(base_dir);
+        let command = server_object
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| resolve_mcp_command(command_base, command));
+        let args = server_object
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let enabled = server_object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+            && !server_object
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        servers.push(StandaloneMcpServer {
+            name: name.to_string(),
+            command,
+            args,
+            enabled,
+            config_path: config_path.to_string_lossy().to_string(),
+            cwd: cwd_path.map(path_to_string),
+            env: server_object
+                .get("env")
+                .filter(|env| env.is_object())
+                .cloned(),
+            source: source.to_string(),
+        });
+    }
+    servers
+}
+
+fn resolve_mcp_config_path(base_dir: &Path, value: &str) -> PathBuf {
+    let value = value.trim();
+    if value.is_empty() {
+        return base_dir.to_path_buf();
+    }
+    let expanded = crate::config::normalize_home_path(value);
+    let path = PathBuf::from(expanded);
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn resolve_mcp_command(base_dir: &Path, command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() {
+        return String::new();
+    }
+    let expanded = crate::config::normalize_home_path(command);
+    let path = PathBuf::from(&expanded);
+    if path.is_absolute() || path.components().count() > 1 {
+        path_to_string(if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        })
+    } else {
+        expanded
+    }
+}
+
+fn path_to_string(path: PathBuf) -> String {
+    path.canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn mcp_server_name_from_table(table: &str) -> Option<String> {
+    let rest = table.strip_prefix("mcp_servers.")?;
+    let name = rest.split('.').next()?.trim().trim_matches('"');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn standalone_hooks_list(_params: &Value) -> Vec<Value> {
+    Vec::new()
+}
+
+fn standalone_extension_list() -> Vec<Value> {
+    [
+        crate::extensions::builtin_bot_gateway_status(),
+        crate::extensions::builtin_next_ai_gateway_status(),
+    ]
+    .into_iter()
+    .filter_map(|status| serde_json::to_value(status).ok())
+    .collect()
+}
+
+fn codex_resource_roots(kind: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
+    for home in codex_home_candidates() {
+        push_unique_path(&mut roots, &mut seen, home.join(kind));
+        push_unique_path(
+            &mut roots,
+            &mut seen,
+            home.join("vendor_imports").join(kind),
+        );
+    }
+    roots
+}
+
+fn codex_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for home in codex_home_candidates() {
+        push_unique_path(&mut paths, &mut seen, home.join("config.toml"));
+    }
+    paths
+}
+
+fn codex_home_candidates() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Ok(value) = std::env::var("CODEX_HOME") {
+        push_unique_path(
+            &mut homes,
+            &mut seen,
+            PathBuf::from(crate::config::normalize_home_path(&value)),
+        );
+    }
+    push_unique_path(
+        &mut homes,
+        &mut seen,
+        PathBuf::from(crate::config::default_codex_home()),
+    );
+    let config = crate::config::AppConfig::load();
+    push_unique_path(
+        &mut homes,
+        &mut seen,
+        PathBuf::from(crate::config::normalize_home_path(&config.codex_home)),
+    );
+    for profile in config.codex_home_profiles {
+        push_unique_path(
+            &mut homes,
+            &mut seen,
+            PathBuf::from(crate::config::normalize_home_path(&profile.path)),
+        );
+    }
+    for profile in config.provider_profiles {
+        push_unique_path(
+            &mut homes,
+            &mut seen,
+            PathBuf::from(crate::config::normalize_home_path(&profile.codex_home)),
+        );
+        push_unique_path(
+            &mut homes,
+            &mut seen,
+            crate::config::generated_codex_home(&profile),
+        );
+    }
+    homes
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<String>, path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let key = canonical_key(&path);
+    if seen.insert(key) {
+        paths.push(path);
+    }
+}
+
+fn canonical_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn front_matter_value(content: &str, key: &str) -> Option<String> {
+    let mut lines = content.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() == key {
+            return Some(trim_quoted(value.trim()).to_string());
+        }
+    }
+    None
+}
+
+fn markdown_title(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# ")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn markdown_first_paragraph(content: &str) -> Option<String> {
+    let mut in_front_matter = false;
+    let mut front_matter_seen = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" && !front_matter_seen {
+            in_front_matter = true;
+            front_matter_seen = true;
+            continue;
+        }
+        if trimmed == "---" && in_front_matter {
+            in_front_matter = false;
+            continue;
+        }
+        if in_front_matter || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let value = strip_toml_comment(value).trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(trim_quoted(value).to_string())
+}
+
+fn parse_toml_string_array(value: &str) -> Vec<String> {
+    let value = strip_toml_comment(value).trim();
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value);
+    inner
+        .split(',')
+        .map(|part| trim_quoted(part.trim()).to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn parse_toml_bool(value: &str) -> Option<bool> {
+    match strip_toml_comment(value).trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn strip_toml_comment(value: &str) -> &str {
+    value.split('#').next().unwrap_or(value)
+}
+
+fn trim_quoted(value: &str) -> &str {
+    value.trim().trim_matches('"').trim_matches('\'').trim()
 }
 
 impl ClaudeAppServerState {
@@ -515,14 +2774,24 @@ impl ClaudeAppServerState {
                 })
             })
             .ok_or_else(|| format!("thread not loaded: {}", thread_id))?;
+        if is_claude_title_generation_thread(thread) {
+            return Err(format!("thread not found: {}", thread_id));
+        }
         let include_turns = !params
             .get("excludeTurns")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let response = thread_runtime_response(thread, include_turns);
+        let mut response_thread = thread.clone();
+        let generated_titles = self.generated_titles();
+        apply_generated_titles_to_single_claude_thread(
+            &mut response_thread,
+            &generated_titles,
+            self.workspace_name.as_deref(),
+        );
+        let response = thread_runtime_response(&response_thread, include_turns);
         let notification = json!({
             "method": "thread/started",
-            "params": { "thread": thread.to_json(false) },
+            "params": { "thread": response_thread.to_json(false) },
         });
         Ok((response, notification))
     }
@@ -539,10 +2808,26 @@ impl ClaudeAppServerState {
             .get(thread_id)
             .or_else(|| self.threads.get(lookup_thread_id))
         {
+            if is_claude_title_generation_thread(thread) {
+                return Err(format!("thread not found: {}", thread_id));
+            }
+            let mut thread = thread.clone();
+            let generated_titles = self.generated_titles();
+            apply_generated_titles_to_single_claude_thread(
+                &mut thread,
+                &generated_titles,
+                self.workspace_name.as_deref(),
+            );
             return Ok(json!({ "thread": thread.to_json(include_turns) }));
         }
-        let thread = load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone())
+        let mut thread = load_claude_thread_by_id(lookup_thread_id, self.workspace_name.clone())
             .ok_or_else(|| format!("thread not found: {}", thread_id))?;
+        let generated_titles = self.generated_titles();
+        apply_generated_titles_to_single_claude_thread(
+            &mut thread,
+            &generated_titles,
+            self.workspace_name.as_deref(),
+        );
         Ok(json!({ "thread": thread.to_json(include_turns) }))
     }
 
@@ -552,9 +2837,19 @@ impl ClaudeAppServerState {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut threads = load_claude_threads(self.workspace_name.clone());
+        let mut generated_titles = load_claude_generated_titles();
         for thread in self.threads.values() {
+            if let Some(generated_title) = claude_generated_title_from_thread(thread) {
+                generated_titles.push(generated_title);
+                continue;
+            }
             threads.insert(thread.id.clone(), thread.clone());
         }
+        apply_generated_titles_to_claude_threads(
+            &mut threads,
+            &generated_titles,
+            self.workspace_name.as_deref(),
+        );
         let mut data = threads
             .values()
             .filter(|thread| thread_matches_list_params(thread, params, archived))
@@ -603,6 +2898,9 @@ impl ClaudeAppServerState {
                 .ok_or_else(|| format!("thread not found: {}", thread_id))?;
             &loaded_thread
         };
+        if is_claude_title_generation_thread(thread) {
+            return Err(format!("thread not found: {}", thread_id));
+        }
         let mut turns = thread.turns.clone();
         if !matches!(
             params.get("sortDirection").and_then(Value::as_str),
@@ -637,7 +2935,13 @@ impl ClaudeAppServerState {
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let thread = self.threads.get_mut(thread_id)?;
+        persist_claude_thread_name(thread_id, name.as_deref());
+        let lookup_thread_id = strip_local_thread_prefix(thread_id);
+        let thread = if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread
+        } else {
+            self.threads.get_mut(lookup_thread_id)?
+        };
         thread.name = name.clone();
         thread.updated_at = now_seconds();
         Some(json!({
@@ -667,6 +2971,7 @@ impl ClaudeAppServerState {
             .cloned()
             .unwrap_or_default();
         let prompt = prompt_from_input(&input);
+        let is_title_generation = is_claude_title_generation_prompt(&prompt);
         if thread.preview.is_empty() {
             thread.preview = prompt.chars().take(160).collect();
         }
@@ -705,14 +3010,27 @@ impl ClaudeAppServerState {
             prompt,
             resume_existing,
         };
-        Ok((
-            json!({ "turn": response_turn.clone() }),
+        claude_code_log_event(
+            "turn_start_prepared",
+            json!({
+                "threadId": &work.thread_id,
+                "turnId": &work.turn_id,
+                "claudeSessionId": &work.claude_session_id,
+                "cwd": &work.cwd,
+                "resumeExisting": work.resume_existing,
+                "titleGeneration": is_title_generation,
+                "promptPreview": log_text_preview(&work.prompt, 200),
+            }),
+        );
+        let notifications = if is_title_generation {
+            Vec::new()
+        } else {
             vec![
                 json!({
                     "method": "turn/started",
                     "params": {
                         "threadId": thread_id,
-                        "turn": response_turn,
+                        "turn": response_turn.clone(),
                     },
                 }),
                 json!({
@@ -724,21 +3042,57 @@ impl ClaudeAppServerState {
                         "startedAtMs": now_millis(),
                     },
                 }),
-            ],
+                claude_thread_stream_state_changed_notification(thread),
+            ]
+        };
+        Ok((
+            json!({ "turn": response_turn.clone() }),
+            notifications,
             work,
         ))
     }
 
     fn interrupt_turn(&mut self, params: &Value) -> Option<u32> {
         let thread_id = params.get("threadId").and_then(Value::as_str)?;
-        let turn_id = params.get("turnId").and_then(Value::as_str)?;
+        let requested_turn_id = params.get("turnId").and_then(Value::as_str);
         let thread = self.threads.get_mut(thread_id)?;
+        let turn_id = requested_turn_id
+            .filter(|turn_id| thread.turns.iter().any(|turn| turn.id == *turn_id))
+            .map(str::to_string)
+            .or_else(|| {
+                thread
+                    .turns
+                    .iter()
+                    .rev()
+                    .find(|turn| turn.status == TurnStatus::InProgress)
+                    .map(|turn| turn.id.clone())
+            })?;
         let turn = thread.turns.iter_mut().find(|turn| turn.id == turn_id)?;
         turn.status = TurnStatus::Interrupted;
         thread.updated_at = now_seconds();
-        let key = (thread_id.to_string(), turn_id.to_string());
+        let key = (thread_id.to_string(), turn_id.clone());
         self.interrupted_turns.insert(key.clone());
-        self.active_processes.get(&key).copied()
+        let pid = self.active_processes.get(&key).copied();
+        claude_code_log_event(
+            "turn_interrupt_registered",
+            json!({
+                "threadId": thread_id,
+                "requestedTurnId": requested_turn_id,
+                "turnId": turn_id,
+                "pid": pid,
+            }),
+        );
+        pid
+    }
+
+    fn generated_titles(&self) -> Vec<ClaudeGeneratedTitle> {
+        let mut generated_titles = load_claude_generated_titles();
+        generated_titles.extend(
+            self.threads
+                .values()
+                .filter_map(claude_generated_title_from_thread),
+        );
+        generated_titles
     }
 
     fn finish_turn(
@@ -746,34 +3100,63 @@ impl ClaudeAppServerState {
         thread_id: &str,
         turn_id: &str,
         result: ClaudeRunResult,
-    ) -> Option<(Option<Value>, Value)> {
-        let thread = self.threads.get_mut(thread_id)?;
-        let turn = thread.turns.iter_mut().find(|turn| turn.id == turn_id)?;
+    ) -> Option<FinishTurnNotifications> {
         let key = (thread_id.to_string(), turn_id.to_string());
         self.active_processes.remove(&key);
-        let interrupted =
-            self.interrupted_turns.remove(&key) || turn.status == TurnStatus::Interrupted;
-        turn.tool_items = result.tool_items;
-        let agent_item_streamed = result.agent_item_streamed;
-        turn.agent_text = result.text;
-        turn.duration_ms = Some(result.duration_ms);
-        turn.completed_at = Some(now_seconds());
-        if interrupted {
-            turn.status = TurnStatus::Interrupted;
-            turn.error = None;
-        } else if let Some(error) = result.error {
-            turn.status = TurnStatus::Failed;
-            turn.error = Some(error);
-        } else {
-            turn.status = TurnStatus::Completed;
-            turn.error = None;
+        let (item, turn_json, generated_title, thread_stream_state, is_title_generation) = {
+            let thread = self.threads.get_mut(thread_id)?;
+            let turn = thread.turns.iter_mut().find(|turn| turn.id == turn_id)?;
+            let interrupted =
+                self.interrupted_turns.remove(&key) || turn.status == TurnStatus::Interrupted;
+            turn.tool_items = result.tool_items;
+            let agent_item_streamed = result.agent_item_streamed;
+            turn.agent_text = result.text;
+            turn.duration_ms = Some(result.duration_ms);
+            turn.completed_at = Some(now_seconds());
+            if interrupted {
+                turn.status = TurnStatus::Interrupted;
+                turn.error = None;
+            } else if let Some(error) = result.error {
+                turn.status = TurnStatus::Failed;
+                turn.error = Some(error);
+            } else {
+                turn.status = TurnStatus::Completed;
+                turn.error = None;
+            }
+            thread.updated_at = turn.completed_at.unwrap_or_else(now_seconds);
+            let item = (!agent_item_streamed && !turn.agent_text.is_empty())
+                .then(|| turn.agent_item_json());
+            let turn_json = turn.to_json(false);
+            let generated_title = claude_generated_title_from_thread(thread);
+            let is_title_generation = generated_title.is_some();
+            let thread_stream_state = (!is_title_generation)
+                .then(|| claude_thread_stream_state_changed_notification(thread));
+            (
+                item,
+                turn_json,
+                generated_title,
+                thread_stream_state,
+                is_title_generation,
+            )
+        };
+        let mut extra_notifications = Vec::new();
+        if let Some(generated_title) = generated_title {
+            if let Some((target_thread_id, name)) = apply_generated_title_to_claude_threads(
+                &mut self.threads,
+                &generated_title,
+                self.workspace_name.as_deref(),
+            ) {
+                extra_notifications.push(json!({
+                    "method": "thread/name/updated",
+                    "params": {
+                        "threadId": target_thread_id,
+                        "name": name,
+                    },
+                }));
+            }
         }
-        thread.updated_at = turn.completed_at.unwrap_or_else(now_seconds);
-        let item =
-            (!agent_item_streamed && !turn.agent_text.is_empty()).then(|| turn.agent_item_json());
-        let turn_json = turn.to_json(false);
-        Some((
-            item.map(|item| {
+        Some(FinishTurnNotifications {
+            item_completed: (!is_title_generation).then(|| item).flatten().map(|item| {
                 json!({
                     "method": "item/completed",
                     "params": {
@@ -784,15 +3167,124 @@ impl ClaudeAppServerState {
                     },
                 })
             }),
-            json!({
-                "method": "turn/completed",
-                "params": {
-                    "threadId": thread_id,
-                    "turn": turn_json,
-                },
+            turn_completed: (!is_title_generation).then(|| {
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": turn_json,
+                    },
+                })
             }),
-        ))
+            thread_stream_state,
+            extra_notifications,
+        })
     }
+}
+
+struct FinishTurnNotifications {
+    item_completed: Option<Value>,
+    turn_completed: Option<Value>,
+    thread_stream_state: Option<Value>,
+    extra_notifications: Vec<Value>,
+}
+
+fn claude_thread_stream_state_changed_notification(thread: &ClaudeThread) -> Value {
+    json!({
+        "type": "ipc-broadcast",
+        "method": "thread-stream-state-changed",
+        "sourceClientId": "codexl-claude-code-app-server",
+        "version": 6,
+        "params": {
+            "conversationId": thread.id,
+            "hostId": "local",
+            "version": 6,
+            "change": {
+                "type": "snapshot",
+                "conversationState": claude_conversation_state(thread),
+            },
+        },
+    })
+}
+
+fn claude_conversation_state(thread: &ClaudeThread) -> Value {
+    json!({
+        "id": thread.id,
+        "turns": thread
+            .turns
+            .iter()
+            .map(|turn| claude_conversation_turn(thread, turn))
+            .collect::<Vec<_>>(),
+        "title": thread.name.clone().unwrap_or_default(),
+        "source": "cli",
+        "modelProvider": PROVIDER_NAME,
+        "latestModel": thread.model,
+        "latestReasoningEffort": Value::Null,
+        "previousTurnModel": Value::Null,
+        "latestCollaborationMode": Value::Null,
+        "hasUnreadTurn": false,
+        "threadGoal": Value::Null,
+        "threadGoalResumeConfirmation": Value::Null,
+        "completedThreadGoal": Value::Null,
+        "threadRuntimeStatus": thread.status_json(),
+        "rolloutPath": Value::Null,
+        "cwd": thread.cwd,
+        "gitInfo": Value::Null,
+        "resumeState": "resumed",
+        "latestTokenUsageInfo": Value::Null,
+        "workspaceKind": "project",
+        "workspaceBrowserRoot": Value::Null,
+        "turnsPagination": {
+            "olderCursor": Value::Null,
+            "isLoadingOlder": false,
+            "hasLoadedOldest": true,
+        },
+    })
+}
+
+fn claude_conversation_turn(thread: &ClaudeThread, turn: &ClaudeTurn) -> Value {
+    json!({
+        "params": {
+            "threadId": thread.id,
+            "input": turn.input,
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [&thread.cwd],
+            },
+            "model": thread.model,
+            "cwd": thread.cwd,
+            "attachments": [],
+            "effort": Value::Null,
+            "summary": "none",
+            "personality": Value::Null,
+            "outputSchema": Value::Null,
+            "collaborationMode": Value::Null,
+        },
+        "turnId": turn.id,
+        "turnStartedAtMs": seconds_to_millis_value(turn.started_at),
+        "durationMs": turn.duration_ms,
+        "finalAssistantStartedAtMs": turn.completed_at.map(seconds_to_millis),
+        "status": turn.status.as_protocol_str(),
+        "error": turn.error.as_ref().map(|message| {
+            json!({
+                "message": message,
+                "codexErrorInfo": Value::Null,
+                "additionalDetails": Value::Null,
+            })
+        }),
+        "diff": Value::Null,
+        "items": turn.items_json(),
+    })
+}
+
+fn seconds_to_millis(value: i64) -> i64 {
+    value.saturating_mul(1000)
+}
+
+fn seconds_to_millis_value(value: i64) -> Value {
+    json!(seconds_to_millis(value))
 }
 
 impl ClaudeThread {
@@ -973,7 +3465,8 @@ fn load_claude_thread_from_params(
     if !is_claude_transcript_path(Path::new(path)) {
         return None;
     }
-    let mut thread = load_claude_thread_from_transcript_path(Path::new(path), workspace_name)?;
+    let mut thread =
+        load_claude_thread_from_transcript_path(Path::new(path), workspace_name.clone())?;
     if let Some(cwd) = params
         .get("cwd")
         .and_then(Value::as_str)
@@ -981,6 +3474,7 @@ fn load_claude_thread_from_params(
     {
         thread.cwd = normalize_cwd(Some(cwd));
     }
+    apply_generated_titles_to_claude_thread(&mut thread, workspace_name.as_deref());
     Some(thread)
 }
 
@@ -989,11 +3483,13 @@ fn load_claude_thread_by_id(
     workspace_name: Option<String>,
 ) -> Option<ClaudeThread> {
     let thread_id = strip_local_thread_prefix(thread_id);
-    claude_transcript_files()
+    let mut thread = claude_transcript_files()
         .into_iter()
         .filter(|path| path.file_stem().and_then(|value| value.to_str()) == Some(thread_id))
         .filter_map(|path| load_claude_thread_from_transcript_path(&path, workspace_name.clone()))
-        .max_by_key(|thread| thread.updated_at)
+        .max_by_key(|thread| thread.updated_at)?;
+    apply_generated_titles_to_claude_thread(&mut thread, workspace_name.as_deref());
+    Some(thread)
 }
 
 fn strip_local_thread_prefix(thread_id: &str) -> &str {
@@ -1002,7 +3498,12 @@ fn strip_local_thread_prefix(thread_id: &str) -> &str {
 
 fn load_claude_threads(workspace_name: Option<String>) -> BTreeMap<String, ClaudeThread> {
     let mut threads = BTreeMap::new();
+    let mut generated_titles = Vec::new();
     for path in claude_transcript_files() {
+        if let Some(generated_title) = load_claude_generated_title_from_transcript_path(&path) {
+            generated_titles.push(generated_title);
+            continue;
+        }
         if let Some(thread) = load_claude_thread_from_transcript_path(&path, workspace_name.clone())
         {
             threads
@@ -1015,6 +3516,11 @@ fn load_claude_threads(workspace_name: Option<String>) -> BTreeMap<String, Claud
                 .or_insert(thread);
         }
     }
+    apply_generated_titles_to_claude_threads(
+        &mut threads,
+        &generated_titles,
+        workspace_name.as_deref(),
+    );
     threads
 }
 
@@ -1023,17 +3529,17 @@ fn load_claude_thread_from_transcript_path(
     workspace_name: Option<String>,
 ) -> Option<ClaudeThread> {
     let transcript = std::fs::read_to_string(path).ok()?;
-    let metadata = std::fs::metadata(path).ok();
-    let fallback_updated_at = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(system_time_to_unix_seconds)
-        .unwrap_or_else(now_seconds);
-    let fallback_created_at = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.created().ok())
-        .and_then(system_time_to_unix_seconds)
-        .unwrap_or(fallback_updated_at);
+    let (fallback_created_at, fallback_updated_at) = transcript_fallback_times(path);
+    if claude_generated_title_from_transcript(
+        &transcript,
+        path,
+        fallback_created_at,
+        fallback_updated_at,
+    )
+    .is_some()
+    {
+        return None;
+    }
     let path_session_id = path.file_stem()?.to_string_lossy().to_string();
 
     let mut session_id = path_session_id.clone();
@@ -1165,6 +3671,8 @@ fn load_claude_thread_from_transcript_path(
         preview = session_id.clone();
     }
 
+    let name = persisted_claude_thread_name(&session_id).or(workspace_name);
+
     Some(ClaudeThread {
         id: session_id.clone(),
         session_id: session_id.clone(),
@@ -1176,9 +3684,359 @@ fn load_claude_thread_from_transcript_path(
         created_at,
         updated_at,
         archived: false,
-        name: workspace_name,
+        name,
         turns,
     })
+}
+
+fn load_claude_generated_title_from_transcript_path(path: &Path) -> Option<ClaudeGeneratedTitle> {
+    let transcript = std::fs::read_to_string(path).ok()?;
+    let (fallback_created_at, fallback_updated_at) = transcript_fallback_times(path);
+    claude_generated_title_from_transcript(
+        &transcript,
+        path,
+        fallback_created_at,
+        fallback_updated_at,
+    )
+}
+
+fn load_claude_generated_titles() -> Vec<ClaudeGeneratedTitle> {
+    claude_transcript_files()
+        .into_iter()
+        .filter_map(|path| load_claude_generated_title_from_transcript_path(&path))
+        .collect()
+}
+
+fn claude_generated_title_from_transcript(
+    transcript: &str,
+    path: &Path,
+    fallback_created_at: i64,
+    fallback_updated_at: i64,
+) -> Option<ClaudeGeneratedTitle> {
+    let mut cwd = String::new();
+    let mut created_at = fallback_created_at;
+    let mut updated_at = fallback_updated_at;
+    let mut source_prompt = None;
+    let mut assistant_title = None;
+    let mut ai_title = None;
+
+    for value in transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if let Some(entry_cwd) = value.get("cwd").and_then(Value::as_str) {
+            if !entry_cwd.trim().is_empty() {
+                cwd = entry_cwd.to_string();
+            }
+        }
+        if let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_seconds)
+        {
+            created_at = created_at.min(timestamp);
+            updated_at = updated_at.max(timestamp);
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("user")
+                if !value
+                    .get("isSidechain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && source_prompt.is_none() =>
+            {
+                if let Some(input) = user_input_from_transcript_entry(&value) {
+                    let prompt = prompt_from_input(&input);
+                    source_prompt = extract_claude_title_generation_source_prompt(&prompt);
+                }
+            }
+            Some("assistant")
+                if !value
+                    .get("isSidechain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false) =>
+            {
+                if let Some(text) = assistant_text_from_transcript_entry(&value) {
+                    assistant_title = sanitize_generated_thread_title(&text);
+                }
+            }
+            Some("ai-title") => {
+                let title_text = value
+                    .get("aiTitle")
+                    .or_else(|| value.get("title"))
+                    .and_then(Value::as_str);
+                if let Some(title_text) = title_text {
+                    ai_title = sanitize_generated_thread_title(title_text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let source_prompt = source_prompt?;
+    if cwd.is_empty() {
+        cwd = cwd_from_claude_project_dir(path).unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .to_string_lossy()
+                .to_string()
+        });
+    }
+
+    Some(ClaudeGeneratedTitle {
+        source_prompt,
+        title: ai_title.or(assistant_title),
+        cwd,
+        created_at,
+        updated_at,
+    })
+}
+
+fn claude_generated_title_from_thread(thread: &ClaudeThread) -> Option<ClaudeGeneratedTitle> {
+    let source_prompt =
+        extract_claude_title_generation_source_prompt(&thread_initial_prompt(thread))?;
+    let title = thread
+        .turns
+        .iter()
+        .rev()
+        .find_map(|turn| sanitize_generated_thread_title(&turn.agent_text));
+    Some(ClaudeGeneratedTitle {
+        source_prompt,
+        title,
+        cwd: thread.cwd.clone(),
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+    })
+}
+
+fn is_claude_title_generation_thread(thread: &ClaudeThread) -> bool {
+    claude_generated_title_from_thread(thread).is_some()
+}
+
+fn is_claude_title_generation_prompt(prompt: &str) -> bool {
+    extract_claude_title_generation_source_prompt(prompt).is_some()
+}
+
+fn extract_claude_title_generation_source_prompt(prompt: &str) -> Option<String> {
+    let normalized = prompt.replace("\r\n", "\n");
+    let trimmed = normalized.trim_start();
+    if !trimmed.starts_with("You are a helpful assistant. You will be presented with a user prompt")
+        || !trimmed.contains("Generate a concise UI title")
+    {
+        return None;
+    }
+    let (_, source_prompt) = trimmed.split_once("User prompt:\n")?;
+    let source_prompt = source_prompt.trim();
+    (!source_prompt.is_empty()).then(|| source_prompt.to_string())
+}
+
+fn sanitize_generated_thread_title(text: &str) -> Option<String> {
+    let title = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    let mut chars = title.chars();
+    let mut truncated = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    Some(truncated)
+}
+
+fn apply_generated_titles_to_claude_threads(
+    threads: &mut BTreeMap<String, ClaudeThread>,
+    generated_titles: &[ClaudeGeneratedTitle],
+    workspace_name: Option<&str>,
+) {
+    let mut generated_titles = generated_titles
+        .iter()
+        .filter(|generated_title| generated_title.title.is_some())
+        .collect::<Vec<_>>();
+    generated_titles.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+
+    for generated_title in generated_titles {
+        apply_generated_title_to_claude_threads(threads, generated_title, workspace_name);
+    }
+}
+
+fn apply_generated_title_to_claude_threads(
+    threads: &mut BTreeMap<String, ClaudeThread>,
+    generated_title: &ClaudeGeneratedTitle,
+    workspace_name: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let title = generated_title.title.clone()?;
+    let thread_id = generated_title_target_thread_id(threads, generated_title)?;
+    let thread = threads.get_mut(&thread_id)?;
+    if !should_replace_thread_name(thread.name.as_deref(), workspace_name) {
+        return None;
+    }
+    if thread.name.as_deref() == Some(title.as_str()) {
+        return None;
+    }
+    thread.name = Some(title.clone());
+    persist_claude_thread_name(&thread_id, Some(&title));
+    Some((thread_id, Some(title)))
+}
+
+fn apply_generated_titles_to_single_claude_thread(
+    thread: &mut ClaudeThread,
+    generated_titles: &[ClaudeGeneratedTitle],
+    workspace_name: Option<&str>,
+) {
+    let mut threads = BTreeMap::new();
+    threads.insert(thread.id.clone(), thread.clone());
+    apply_generated_titles_to_claude_threads(&mut threads, generated_titles, workspace_name);
+    if let Some(updated) = threads.remove(&thread.id) {
+        *thread = updated;
+    }
+}
+
+fn apply_generated_titles_to_claude_thread(
+    thread: &mut ClaudeThread,
+    workspace_name: Option<&str>,
+) {
+    let generated_titles = load_claude_generated_titles();
+    apply_generated_titles_to_single_claude_thread(thread, &generated_titles, workspace_name);
+}
+
+fn generated_title_target_thread_id(
+    threads: &BTreeMap<String, ClaudeThread>,
+    generated_title: &ClaudeGeneratedTitle,
+) -> Option<String> {
+    threads
+        .values()
+        .filter(|thread| generated_title_matches_thread(thread, generated_title))
+        .min_by_key(|thread| {
+            thread
+                .created_at
+                .abs_diff(generated_title.created_at)
+                .min(thread.updated_at.abs_diff(generated_title.created_at))
+        })
+        .filter(|thread| {
+            thread
+                .created_at
+                .abs_diff(generated_title.created_at)
+                .min(thread.updated_at.abs_diff(generated_title.created_at))
+                <= CLAUDE_TITLE_MATCH_MAX_DELTA_SECONDS
+        })
+        .map(|thread| thread.id.clone())
+}
+
+fn generated_title_matches_thread(
+    thread: &ClaudeThread,
+    generated_title: &ClaudeGeneratedTitle,
+) -> bool {
+    if is_claude_title_generation_thread(thread) {
+        return false;
+    }
+    if thread.cwd != generated_title.cwd {
+        return false;
+    }
+    let source_prompt = compact_cli_text(&generated_title.source_prompt);
+    if source_prompt.is_empty() {
+        return false;
+    }
+    let thread_prompt = compact_cli_text(&thread_initial_prompt(thread));
+    if thread_prompt.is_empty() {
+        return false;
+    }
+    thread_prompt == source_prompt
+        || thread_prompt.contains(&source_prompt)
+        || source_prompt.contains(&thread_prompt)
+}
+
+fn thread_initial_prompt(thread: &ClaudeThread) -> String {
+    thread
+        .turns
+        .first()
+        .map(|turn| prompt_from_input(&turn.input))
+        .unwrap_or_else(|| thread.preview.clone())
+}
+
+fn should_replace_thread_name(current: Option<&str>, workspace_name: Option<&str>) -> bool {
+    let current = current.map(str::trim).filter(|value| !value.is_empty());
+    match current {
+        None => true,
+        Some(current) => {
+            workspace_name
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                == Some(current)
+        }
+    }
+}
+
+fn transcript_fallback_times(path: &Path) -> (i64, i64) {
+    let metadata = std::fs::metadata(path).ok();
+    let fallback_updated_at = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_to_unix_seconds)
+        .unwrap_or_else(now_seconds);
+    let fallback_created_at = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(system_time_to_unix_seconds)
+        .unwrap_or(fallback_updated_at);
+    (fallback_created_at, fallback_updated_at)
+}
+
+fn persisted_claude_thread_name(thread_id: &str) -> Option<String> {
+    let thread_id = strip_local_thread_prefix(thread_id);
+    load_claude_thread_names().get(thread_id).cloned()
+}
+
+fn persist_claude_thread_name(thread_id: &str, name: Option<&str>) {
+    let thread_id = strip_local_thread_prefix(thread_id).trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let mut names = load_claude_thread_names();
+    if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
+        names.insert(thread_id.to_string(), name.to_string());
+    } else {
+        names.remove(thread_id);
+    }
+    let Some(path) = claude_thread_names_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&names) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
+fn load_claude_thread_names() -> BTreeMap<String, String> {
+    let Some(path) = claude_thread_names_path() else {
+        return BTreeMap::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) else {
+        return BTreeMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(key, value)| {
+            let name = value.as_str()?.trim();
+            (!key.trim().is_empty() && !name.is_empty()).then(|| (key, name.to_string()))
+        })
+        .collect()
+}
+
+fn claude_thread_names_path() -> Option<PathBuf> {
+    Some(
+        user_home_dir()?
+            .join(".claude")
+            .join(CLAUDE_THREAD_NAMES_FILE),
+    )
 }
 
 fn user_input_from_transcript_entry(value: &Value) -> Option<Vec<Value>> {
@@ -1250,11 +4108,34 @@ fn claude_transcript_files() -> Vec<PathBuf> {
 }
 
 fn claude_projects_dir() -> Option<PathBuf> {
-    Some(
-        PathBuf::from(std::env::var_os("HOME")?)
-            .join(".claude")
-            .join("projects"),
-    )
+    Some(user_home_dir()?.join(".claude").join("projects"))
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_path_without_home_expansion("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var("HOMEDRIVE").ok()?;
+                let path = std::env::var("HOMEPATH").ok()?;
+                let combined = format!("{}{}", drive.trim(), path.trim());
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(combined))
+                }
+            })
+            .or_else(|| env_path_without_home_expansion("HOME"))
+    } else {
+        env_path_without_home_expansion("HOME")
+    }
+}
+
+fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn is_claude_transcript_path(path: &Path) -> bool {
@@ -1327,7 +4208,19 @@ fn run_turn_worker<W>(work: TurnWork, state: SharedState, output: SharedOutput<W
 where
     W: Write + Send + 'static,
 {
+    claude_code_log_event("turn_worker_start", turn_work_log_fields(&work));
     let result = run_claude_code_turn(&work, Arc::clone(&state), Arc::clone(&output));
+    claude_code_log_event(
+        "turn_worker_result",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "hasError": result.error.is_some(),
+            "textBytes": result.text.len(),
+            "toolItemCount": result.tool_items.len(),
+            "agentItemStreamed": result.agent_item_streamed,
+        }),
+    );
     let notifications = match lock_state(&state)
         .ok()
         .and_then(|mut state| state.finish_turn(&work.thread_id, &work.turn_id, result))
@@ -1335,10 +4228,25 @@ where
         Some(notifications) => notifications,
         None => return,
     };
-    if let Some(item_completed) = notifications.0 {
+    if let Some(item_completed) = notifications.item_completed {
         let _ = write_notification(&output, item_completed);
     }
-    let _ = write_notification(&output, notifications.1);
+    for notification in notifications.extra_notifications {
+        let _ = write_notification(&output, notification);
+    }
+    if let Some(turn_completed) = notifications.turn_completed {
+        let _ = write_notification(&output, turn_completed);
+    }
+    if let Some(thread_stream_state) = notifications.thread_stream_state {
+        let _ = write_notification(&output, thread_stream_state);
+    }
+    claude_code_log_event(
+        "turn_worker_notifications_sent",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+        }),
+    );
 }
 
 fn run_claude_code_turn<W>(
@@ -1350,9 +4258,56 @@ where
     W: Write,
 {
     let started = Instant::now();
+    claude_code_log_event(
+        "claude_command_prepare",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "command": log_text_preview(&claude_command_display(work), 4000),
+            "mcpConfig": if is_claude_title_generation_prompt(&work.prompt) {
+                json!({ "injected": false, "reason": "title_generation" })
+            } else {
+                claude_code_mcp_config_log_summary(work)
+            },
+        }),
+    );
     let mut command = claude_command(work);
     command.current_dir(&work.cwd);
     run_claude_code_turn_stream_json(command, work, state, output, started)
+}
+
+fn emit_current_thread_stream_state<W>(
+    state: &SharedState,
+    output: &SharedOutput<W>,
+    thread_id: &str,
+) where
+    W: Write,
+{
+    let notification = lock_state(state).ok().and_then(|state| {
+        state
+            .threads
+            .get(thread_id)
+            .map(claude_thread_stream_state_changed_notification)
+    });
+    if let Some(notification) = notification {
+        let _ = write_notification(output, notification);
+        claude_code_log_event(
+            "thread_stream_state_emit",
+            json!({
+                "threadId": thread_id,
+            }),
+        );
+    }
+}
+
+#[derive(Debug)]
+enum ClaudeChildEvent {
+    StdoutLine(String),
+    StderrLine(String),
+    StdoutDone,
+    StderrDone,
+    StdoutError(String),
+    StderrError(String),
 }
 
 fn run_claude_code_turn_stream_json<W>(
@@ -1377,6 +4332,14 @@ where
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
+            claude_code_log_event(
+                "claude_spawn_failed",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "error": err.to_string(),
+                }),
+            );
             return ClaudeRunResult {
                 text: String::new(),
                 error: Some(format!("failed to launch Claude Code: {}", err)),
@@ -1386,15 +4349,37 @@ where
             };
         }
     };
+    claude_code_log_event(
+        "claude_spawned",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "pid": child.id(),
+        }),
+    );
     if let Ok(mut state) = lock_state(&state) {
         state
             .active_processes
             .insert((work.thread_id.clone(), work.turn_id.clone()), child.id());
     }
+    let emit_thread_stream_state =
+        extract_claude_title_generation_source_prompt(&work.prompt).is_none();
+    if emit_thread_stream_state {
+        emit_current_thread_stream_state(&state, &output, &work.thread_id);
+    }
 
     let mut child_stdin = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
+            claude_code_log_event(
+                "claude_stdio_missing",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "stream": "stdin",
+                    "pid": child.id(),
+                }),
+            );
             terminate_process_group(child.id());
             let _ = child.wait();
             remove_active_process(&state, work);
@@ -1410,6 +4395,15 @@ where
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            claude_code_log_event(
+                "claude_stdio_missing",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "stream": "stdout",
+                    "pid": child.id(),
+                }),
+            );
             terminate_process_group(child.id());
             let _ = child.wait();
             remove_active_process(&state, work);
@@ -1422,22 +4416,34 @@ where
             };
         }
     };
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut text = String::new();
-            let _ = reader.read_to_string(&mut text);
-            text
-        })
-    });
+    let (event_tx, event_rx) = mpsc::channel();
+    let stdout_handle = spawn_claude_child_line_reader(stdout, event_tx.clone(), true);
+    let mut stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_claude_child_line_reader(stderr, event_tx.clone(), false));
+    drop(event_tx);
 
     let stdin_payload = claude_stream_json_input(work);
     if let Err(err) = child_stdin
         .write_all(stdin_payload.as_bytes())
         .and_then(|_| child_stdin.flush())
     {
+        claude_code_log_event(
+            "claude_stdin_write_failed",
+            json!({
+                "threadId": &work.thread_id,
+                "turnId": &work.turn_id,
+                "pid": child.id(),
+                "error": err.to_string(),
+            }),
+        );
         terminate_process_group(child.id());
         let _ = child.wait();
+        let _ = stdout_handle.join();
+        if let Some(handle) = stderr_handle.take() {
+            let _ = handle.join();
+        }
         remove_active_process(&state, work);
         return ClaudeRunResult {
             text: String::new(),
@@ -1450,59 +4456,303 @@ where
             agent_item_streamed: false,
         };
     }
-    drop(child_stdin);
+    claude_code_log_event(
+        "claude_stdin_prompt_sent",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "pid": child.id(),
+            "bytes": stdin_payload.len(),
+        }),
+    );
 
     let mut stream = ClaudeStreamState::default();
     let mut command_output = String::new();
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(trimmed) {
-                    Ok(message) => handle_claude_stream_message(
-                        &message,
-                        work,
-                        &output,
-                        &mut stream,
-                        &mut command_output,
-                    ),
-                    Err(_) => {
-                        command_output.push_str(&line);
+    let mut stderr_output = String::new();
+    let mut stdout_done = false;
+    let mut stderr_done = stderr_handle.is_none();
+    let mut child_status = None;
+    let mut last_child_event = Instant::now();
+    let idle_timeout = claude_turn_idle_timeout();
+    let mut result_seen_at: Option<Instant> = None;
+    let mut last_thread_stream_state_heartbeat = Instant::now();
+
+    while child_status.is_none() || !stdout_done || !stderr_done {
+        match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                last_child_event = Instant::now();
+                match event {
+                    ClaudeChildEvent::StdoutLine(line) => {
+                        if let Err(err) = handle_claude_stdout_line(
+                            &line,
+                            work,
+                            &state,
+                            &output,
+                            &mut child_stdin,
+                            &mut stream,
+                            &mut command_output,
+                        ) {
+                            command_output.push_str(&format!("[claude-control]\n{}\n", err.trim()));
+                            terminate_process_group(child.id());
+                            child_status = Some(child.wait());
+                        }
+                    }
+                    ClaudeChildEvent::StderrLine(line) => {
+                        stderr_output.push_str(&line);
+                        stderr_output.push('\n');
+                        claude_code_log_event(
+                            "claude_stderr_line",
+                            json!({
+                                "threadId": &work.thread_id,
+                                "turnId": &work.turn_id,
+                                "linePreview": log_text_preview(&line, 500),
+                            }),
+                        );
+                    }
+                    ClaudeChildEvent::StdoutDone => {
+                        claude_code_log_event(
+                            "claude_stdout_done",
+                            json!({
+                                "threadId": &work.thread_id,
+                                "turnId": &work.turn_id,
+                            }),
+                        );
+                        stdout_done = true;
+                    }
+                    ClaudeChildEvent::StderrDone => {
+                        claude_code_log_event(
+                            "claude_stderr_done",
+                            json!({
+                                "threadId": &work.thread_id,
+                                "turnId": &work.turn_id,
+                            }),
+                        );
+                        stderr_done = true;
+                    }
+                    ClaudeChildEvent::StdoutError(err) => {
+                        claude_code_log_event(
+                            "claude_stdout_read_error",
+                            json!({
+                                "threadId": &work.thread_id,
+                                "turnId": &work.turn_id,
+                                "error": &err,
+                            }),
+                        );
+                        stdout_done = true;
+                        command_output.push_str(&format!(
+                            "[stdout]\nfailed to read Claude Code stdout: {}\n",
+                            err
+                        ));
+                    }
+                    ClaudeChildEvent::StderrError(err) => {
+                        claude_code_log_event(
+                            "claude_stderr_read_error",
+                            json!({
+                                "threadId": &work.thread_id,
+                                "turnId": &work.turn_id,
+                                "error": &err,
+                            }),
+                        );
+                        stderr_done = true;
+                        command_output.push_str(&format!(
+                            "[stderr]\nfailed to read Claude Code stderr: {}\n",
+                            err
+                        ));
                     }
                 }
             }
-            Err(err) => {
-                terminate_process_group(child.id());
-                let _ = child.wait();
-                remove_active_process(&state, work);
-                finalize_open_tool_calls(&output, work, &mut stream, false);
-                let agent_item_streamed = !stream.emitted_text.is_empty();
-                return ClaudeRunResult {
-                    text: stream.emitted_text,
-                    error: Some(format!("failed to read Claude Code stdout: {}", err)),
-                    duration_ms: elapsed_millis(started),
-                    tool_items: stream.completed_tool_items,
-                    agent_item_streamed,
-                };
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stdout_done = true;
+                stderr_done = true;
             }
+        }
+
+        if result_seen_at.is_none() && claude_stream_result_seen(&stream) {
+            result_seen_at = Some(Instant::now());
+            claude_code_log_event(
+                "claude_result_seen",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "stream": stream_log_summary(&stream),
+                }),
+            );
+        }
+
+        if emit_thread_stream_state
+            && child_status.is_none()
+            && last_thread_stream_state_heartbeat.elapsed()
+                >= Duration::from_millis(CLAUDE_THREAD_STREAM_STATE_HEARTBEAT_MS)
+        {
+            emit_current_thread_stream_state(&state, &output, &work.thread_id);
+            last_thread_stream_state_heartbeat = Instant::now();
+        }
+
+        if child_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    claude_code_log_event(
+                        "claude_child_exited",
+                        json!({
+                            "threadId": &work.thread_id,
+                            "turnId": &work.turn_id,
+                            "pid": child.id(),
+                            "success": status.success(),
+                            "status": status.to_string(),
+                        }),
+                    );
+                    child_status = Some(Ok(status));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    claude_code_log_event(
+                        "claude_child_wait_error",
+                        json!({
+                            "threadId": &work.thread_id,
+                            "turnId": &work.turn_id,
+                            "pid": child.id(),
+                            "error": err.to_string(),
+                        }),
+                    );
+                    child_status = Some(Err(err));
+                }
+            }
+        }
+
+        if child_status.is_none() && turn_was_interrupted(&state, work) {
+            claude_code_log_event(
+                "claude_turn_interrupted",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "pid": child.id(),
+                    "stream": stream_log_summary(&stream),
+                }),
+            );
+            terminate_process_group(child.id());
+            child_status = Some(child.wait());
+        }
+
+        if child_status.is_none()
+            && result_seen_at.is_some_and(|seen_at| {
+                seen_at.elapsed() >= Duration::from_millis(CLAUDE_RESULT_EXIT_GRACE_MS)
+            })
+        {
+            remove_active_process(&state, work);
+            if !stderr_output.trim().is_empty() {
+                command_output.push_str("[stderr]\n");
+                command_output.push_str(stderr_output.trim());
+                command_output.push('\n');
+            }
+            if stream.saw_tool_call {
+                flush_pending_agent_text_as_reasoning(&output, work, &mut stream);
+            } else {
+                flush_pending_agent_text_as_agent(&output, work, &mut stream);
+            }
+            emit_reasoning_completed_if_started(&output, work, &stream);
+
+            let success = stream.result_error.is_none();
+            finalize_open_tool_calls(&output, work, &mut stream, success);
+            let agent_item_streamed = !stream.emitted_text.is_empty();
+            let final_text = if stream.emitted_text.is_empty() {
+                stream
+                    .result_text
+                    .clone()
+                    .or_else(|| latest_claude_transcript_assistant_text(work))
+                    .unwrap_or_default()
+            } else {
+                stream.emitted_text.clone()
+            };
+            let duration_ms = elapsed_millis(started);
+            let error = stream
+                .result_error
+                .take()
+                .map(|error| non_empty_join(&[error, command_output.clone()], "\n"));
+            claude_code_log_event(
+                "claude_turn_finish_after_result",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "pid": child.id(),
+                    "durationMs": duration_ms,
+                    "hasError": error.is_some(),
+                    "stream": stream_log_summary(&stream),
+                }),
+            );
+            detach_completed_claude_child(
+                child,
+                child_stdin,
+                stdout_handle,
+                stderr_handle.take(),
+                event_rx,
+            );
+            return ClaudeRunResult {
+                text: final_text,
+                error,
+                duration_ms,
+                tool_items: stream.completed_tool_items,
+                agent_item_streamed,
+            };
+        }
+
+        if child_status.is_none() && last_child_event.elapsed() >= idle_timeout {
+            claude_code_log_event(
+                "claude_idle_timeout",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "pid": child.id(),
+                    "idleTimeoutMs": idle_timeout.as_millis(),
+                    "stdoutDone": stdout_done,
+                    "stderrDone": stderr_done,
+                    "stream": stream_log_summary(&stream),
+                    "stderrPreview": log_text_preview(stderr_output.trim(), 1000),
+                    "commandOutputPreview": log_text_preview(&command_output, 1000),
+                }),
+            );
+            terminate_process_group(child.id());
+            let _ = child.wait();
+            let _ = stdout_handle.join();
+            if let Some(handle) = stderr_handle.take() {
+                let _ = handle.join();
+            }
+            remove_active_process(&state, work);
+            if !stderr_output.trim().is_empty() {
+                command_output.push_str("[stderr]\n");
+                command_output.push_str(stderr_output.trim());
+                command_output.push('\n');
+            }
+            finalize_open_tool_calls(&output, work, &mut stream, false);
+            let agent_item_streamed = !stream.emitted_text.is_empty();
+            return ClaudeRunResult {
+                text: stream.emitted_text,
+                error: Some(non_empty_join(
+                    &[
+                        format!(
+                            "Claude Code produced no output for {}ms",
+                            idle_timeout.as_millis()
+                        ),
+                        command_output,
+                    ],
+                    "\n",
+                )),
+                duration_ms: elapsed_millis(started),
+                tool_items: stream.completed_tool_items,
+                agent_item_streamed,
+            };
         }
     }
 
-    let status = child.wait();
+    let status = child_status.unwrap_or_else(|| child.wait());
+    let _ = stdout_handle.join();
+    if let Some(handle) = stderr_handle.take() {
+        let _ = handle.join();
+    }
     remove_active_process(&state, work);
-    let stderr = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    if !stderr.trim().is_empty() {
+    if !stderr_output.trim().is_empty() {
         command_output.push_str("[stderr]\n");
-        command_output.push_str(stderr.trim());
+        command_output.push_str(stderr_output.trim());
         command_output.push('\n');
     }
     if stream.saw_tool_call {
@@ -1527,6 +4777,20 @@ where
             } else {
                 stream.emitted_text.clone()
             };
+            claude_code_log_event(
+                "claude_turn_finish_after_exit",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "durationMs": duration_ms,
+                    "processSuccess": status.success(),
+                    "success": success,
+                    "status": status.to_string(),
+                    "stream": stream_log_summary(&stream),
+                    "stderrPreview": log_text_preview(stderr_output.trim(), 1000),
+                    "commandOutputPreview": log_text_preview(&command_output, 1000),
+                }),
+            );
             if success {
                 ClaudeRunResult {
                     text: final_text,
@@ -1545,7 +4809,6 @@ where
                                 .unwrap_or_default(),
                             stream.result_error.unwrap_or_default(),
                             command_output,
-                            stderr,
                         ],
                         "\n",
                     )),
@@ -1558,6 +4821,16 @@ where
         Err(err) => {
             finalize_open_tool_calls(&output, work, &mut stream, false);
             let agent_item_streamed = !stream.emitted_text.is_empty();
+            claude_code_log_event(
+                "claude_turn_finish_wait_error",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "durationMs": duration_ms,
+                    "error": err.to_string(),
+                    "stream": stream_log_summary(&stream),
+                }),
+            );
             ClaudeRunResult {
                 text: stream.emitted_text,
                 error: Some(format!("failed to wait for Claude Code: {}", err)),
@@ -1567,6 +4840,464 @@ where
             }
         }
     }
+}
+
+fn spawn_claude_child_line_reader<R>(
+    stream: R,
+    sender: mpsc::Sender<ClaudeChildEvent>,
+    stdout: bool,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            let event = match line {
+                Ok(line) if stdout => ClaudeChildEvent::StdoutLine(line),
+                Ok(line) => ClaudeChildEvent::StderrLine(line),
+                Err(err) if stdout => ClaudeChildEvent::StdoutError(err.to_string()),
+                Err(err) => ClaudeChildEvent::StderrError(err.to_string()),
+            };
+            if sender.send(event).is_err() {
+                return;
+            }
+        }
+        let _ = sender.send(if stdout {
+            ClaudeChildEvent::StdoutDone
+        } else {
+            ClaudeChildEvent::StderrDone
+        });
+    })
+}
+
+fn claude_stream_result_seen(stream: &ClaudeStreamState) -> bool {
+    stream.result_text.is_some() || stream.result_error.is_some()
+}
+
+#[cfg(unix)]
+fn detach_completed_claude_child(
+    mut child: std::process::Child,
+    child_stdin: std::process::ChildStdin,
+    stdout_handle: thread::JoinHandle<()>,
+    stderr_handle: Option<thread::JoinHandle<()>>,
+    event_rx: mpsc::Receiver<ClaudeChildEvent>,
+) {
+    thread::spawn(move || {
+        let _child_stdin = child_stdin;
+        loop {
+            match event_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = child.wait();
+        let _ = stdout_handle.join();
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn detach_completed_claude_child(
+    mut child: std::process::Child,
+    child_stdin: std::process::ChildStdin,
+    stdout_handle: thread::JoinHandle<()>,
+    stderr_handle: Option<thread::JoinHandle<()>>,
+    event_rx: mpsc::Receiver<ClaudeChildEvent>,
+) {
+    thread::spawn(move || {
+        let _child_stdin = child_stdin;
+        while child.try_wait().ok().flatten().is_none() {
+            match event_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = child.wait();
+        let _ = stdout_handle.join();
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+    });
+}
+
+fn handle_claude_stdout_line<W, S>(
+    line: &str,
+    work: &TurnWork,
+    state: &SharedState,
+    output: &SharedOutput<W>,
+    child_stdin: &mut S,
+    stream: &mut ClaudeStreamState,
+    command_output: &mut String,
+) -> Result<(), String>
+where
+    W: Write,
+    S: Write,
+{
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let message = match serde_json::from_str::<Value>(trimmed) {
+        Ok(message) => message,
+        Err(_) => {
+            command_output.push_str(line);
+            command_output.push('\n');
+            claude_code_log_event(
+                "claude_stdout_non_json",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "linePreview": log_text_preview(line, 500),
+                }),
+            );
+            return Ok(());
+        }
+    };
+    claude_code_log_event(
+        "claude_stdout_message",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "message": claude_message_log_summary(&message),
+        }),
+    );
+    if is_claude_permission_control_request(&message) {
+        let request_id = claude_control_request_id(&message);
+        let control_response = match request_codex_app_permissions(&message, work, state, output) {
+            Ok(response) => response,
+            Err(err) => {
+                command_output.push_str(&format!("[permission]\n{}\n", err.trim()));
+                claude_control_response_denied(&request_id, &err)
+            }
+        };
+        return write_claude_child_json_line(child_stdin, &control_response);
+    }
+    handle_claude_stream_message(&message, work, output, stream, command_output);
+    Ok(())
+}
+
+fn request_codex_app_permissions<W: Write>(
+    message: &Value,
+    work: &TurnWork,
+    state: &SharedState,
+    output: &SharedOutput<W>,
+) -> Result<Value, String> {
+    let request_id = claude_control_request_id(message);
+    let _ = take_app_response(state, &request_id);
+    claude_code_log_event(
+        "permission_request_emit",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "requestId": &request_id,
+            "toolName": claude_permission_tool_name(message),
+            "serverName": claude_permission_server_name(message),
+        }),
+    );
+    write_json_line(
+        output,
+        &json!({
+            "id": request_id,
+            "method": "item/permissions/requestApproval",
+            "params": codex_app_permission_request_params(work, &request_id, message),
+        }),
+    )?;
+    let approval = wait_for_codex_app_response(state, work, &request_id)?;
+    claude_code_log_event(
+        "permission_response_received",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "requestId": &request_id,
+            "allows": codex_permission_response_allows(&approval),
+            "response": log_request_params_summary(&approval),
+        }),
+    );
+    Ok(claude_control_response_for_permission(
+        message,
+        &request_id,
+        &approval,
+    ))
+}
+
+fn wait_for_codex_app_response(
+    state: &SharedState,
+    work: &TurnWork,
+    request_id: &str,
+) -> Result<Value, String> {
+    let started = Instant::now();
+    let timeout = claude_permission_approval_timeout();
+    while started.elapsed() < timeout {
+        if let Some(response) = take_app_response(state, request_id) {
+            return Ok(response);
+        }
+        if turn_was_interrupted(state, work) {
+            claude_code_log_event(
+                "permission_response_interrupted",
+                json!({
+                    "threadId": &work.thread_id,
+                    "turnId": &work.turn_id,
+                    "requestId": request_id,
+                }),
+            );
+            return Err(format!(
+                "permission request {} was interrupted before approval",
+                request_id
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    claude_code_log_event(
+        "permission_response_timeout",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "requestId": request_id,
+            "timeoutMs": timeout.as_millis(),
+        }),
+    );
+    Err(format!(
+        "timed out waiting for Codex App permission approval: {}",
+        request_id
+    ))
+}
+
+fn codex_app_permission_request_params(
+    work: &TurnWork,
+    request_id: &str,
+    message: &Value,
+) -> Value {
+    let tool_name = claude_permission_tool_name(message).unwrap_or_else(|| "tool".to_string());
+    let server_name = claude_permission_server_name(message);
+    let tool_label = server_name
+        .as_deref()
+        .map(|server| format!("{server}/{tool_name}"))
+        .unwrap_or(tool_name);
+    json!({
+        "threadId": &work.thread_id,
+        "turnId": &work.turn_id,
+        "itemId": claude_permission_item_id(message).unwrap_or_else(|| request_id.to_string()),
+        "reason": format!("Claude Code wants to use {tool_label}."),
+        "permissions": codex_app_permissions_for_claude_request(work, message),
+    })
+}
+
+fn codex_app_permissions_for_claude_request(work: &TurnWork, message: &Value) -> Value {
+    let tool_name = claude_permission_tool_name(message)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut permissions = serde_json::Map::new();
+    permissions.insert("network".to_string(), json!({ "enabled": true }));
+    let file_related = tool_name.is_empty()
+        || tool_name.contains("bash")
+        || tool_name.contains("edit")
+        || tool_name.contains("file")
+        || tool_name.contains("read")
+        || tool_name.contains("write")
+        || tool_name.contains("grep")
+        || tool_name.contains("glob")
+        || tool_name.contains("ls")
+        || tool_name.contains("notebook");
+    if file_related {
+        permissions.insert(
+            "fileSystem".to_string(),
+            json!({
+                "read": [{ "type": "path", "path": &work.cwd }],
+                "write": [{ "type": "path", "path": &work.cwd }],
+            }),
+        );
+    }
+    Value::Object(permissions)
+}
+
+fn is_claude_permission_control_request(message: &Value) -> bool {
+    if message.get("type").and_then(Value::as_str) != Some("control_request") {
+        return false;
+    }
+    let subtype = claude_control_request_subtype(message)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if subtype == "initialize" {
+        return false;
+    }
+    subtype.contains("permission")
+        || subtype.contains("tool")
+        || subtype.contains("can_use")
+        || claude_permission_tool_name(message).is_some()
+}
+
+fn claude_control_request_subtype(message: &Value) -> Option<String> {
+    first_non_empty_string_at(
+        message,
+        &[
+            "/request/subtype",
+            "/request/type",
+            "/subtype",
+            "/control_request/subtype",
+        ],
+    )
+}
+
+fn claude_control_request_id(message: &Value) -> String {
+    message
+        .get("request_id")
+        .or_else(|| message.get("id"))
+        .and_then(json_rpc_id_key)
+        .unwrap_or_else(new_uuid_v4)
+}
+
+fn claude_permission_tool_name(message: &Value) -> Option<String> {
+    first_non_empty_string_at(
+        message,
+        &[
+            "/request/tool_name",
+            "/request/toolName",
+            "/request/tool/name",
+            "/request/name",
+            "/params/tool_name",
+            "/params/toolName",
+            "/tool_name",
+            "/toolName",
+            "/name",
+        ],
+    )
+}
+
+fn claude_permission_server_name(message: &Value) -> Option<String> {
+    first_non_empty_string_at(
+        message,
+        &[
+            "/request/server_name",
+            "/request/serverName",
+            "/request/mcp_server_name",
+            "/request/mcpServerName",
+            "/params/server_name",
+            "/params/serverName",
+        ],
+    )
+}
+
+fn claude_permission_item_id(message: &Value) -> Option<String> {
+    first_non_empty_string_at(
+        message,
+        &[
+            "/request/tool_use_id",
+            "/request/toolUseId",
+            "/request/tool/id",
+            "/request/itemId",
+            "/request/item_id",
+            "/params/tool_use_id",
+            "/params/toolUseId",
+        ],
+    )
+}
+
+fn claude_permission_request_input(message: &Value) -> Option<&Value> {
+    [
+        "/request/input",
+        "/request/tool_input",
+        "/request/toolInput",
+        "/request/arguments",
+        "/params/input",
+        "/params/tool_input",
+        "/params/toolInput",
+        "/params/arguments",
+    ]
+    .iter()
+    .filter_map(|pointer| message.pointer(pointer))
+    .find(|value| !value.is_null())
+}
+
+fn first_non_empty_string_at(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn claude_control_response_for_permission(
+    message: &Value,
+    request_id: &str,
+    approval: &Value,
+) -> Value {
+    if codex_permission_response_allows(approval) {
+        let mut response = serde_json::Map::new();
+        response.insert("behavior".to_string(), json!("allow"));
+        if let Some(input) = claude_permission_request_input(message) {
+            response.insert("updatedInput".to_string(), input.clone());
+        }
+        json!({
+            "type": "control_response",
+            "request_id": request_id,
+            "response": Value::Object(response),
+        })
+    } else {
+        claude_control_response_denied(request_id, "Denied in Codex App")
+    }
+}
+
+fn claude_control_response_denied(request_id: &str, message: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "request_id": request_id,
+        "response": {
+            "behavior": "deny",
+            "message": message,
+        },
+    })
+}
+
+fn codex_permission_response_allows(response: &Value) -> bool {
+    if response.get("error").is_some() {
+        return false;
+    }
+    if let Some(approved) = response.get("approved").and_then(Value::as_bool) {
+        return approved;
+    }
+    if let Some(permissions) = response.get("permissions") {
+        return permission_value_allows(permissions);
+    }
+    if let Some(result) = response.get("result") {
+        return codex_permission_response_allows(result);
+    }
+    false
+}
+
+fn permission_value_allows(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Array(values) => !values.is_empty() && values.iter().any(permission_value_allows),
+        Value::Object(values) => {
+            if let Some(enabled) = values.get("enabled").and_then(Value::as_bool) {
+                return enabled;
+            }
+            !values.is_empty() && values.values().any(permission_value_allows)
+        }
+        _ => true,
+    }
+}
+
+fn write_claude_child_json_line<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
+    let mut line = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+    line.push(b'\n');
+    writer
+        .write_all(&line)
+        .and_then(|_| writer.flush())
+        .map_err(|err| format!("failed to write Claude Code control response: {}", err))
 }
 
 fn claude_stream_json_input(work: &TurnWork) -> String {
@@ -1832,6 +5563,22 @@ fn handle_claude_result_message<W>(
 ) where
     W: Write,
 {
+    claude_code_log_event(
+        "claude_result_message",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "isError": message
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            "usage": claude_result_usage_summary(message),
+            "resultPreview": message
+                .get("result")
+                .and_then(Value::as_str)
+                .map(|value| log_text_preview(value, 500)),
+        }),
+    );
     if let Some(result) = message.get("result").and_then(Value::as_str) {
         if !result.trim().is_empty() {
             stream.result_text = Some(result.to_string());
@@ -2058,6 +5805,16 @@ fn emit_tool_use_event<W>(
         .filter(|value| !value.is_null())
         .cloned()
         .unwrap_or_else(|| json!({}));
+    claude_code_log_event(
+        "claude_tool_use",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "toolId": tool_id,
+            "toolName": tool_name,
+            "arguments": log_request_params_summary(&arguments),
+        }),
+    );
     emit_tool_call_started(output, work, stream, tool_id, tool_name, arguments);
     let _ = command_output;
 }
@@ -2088,6 +5845,16 @@ fn emit_tool_result_event<W>(
         .get("content")
         .and_then(claude_text_from_content)
         .unwrap_or_else(|| compact_json(block));
+    claude_code_log_event(
+        "claude_tool_result",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "toolId": tool_id,
+            "status": status,
+            "resultPreview": log_text_preview(&result, 500),
+        }),
+    );
     complete_tool_call(
         output,
         work,
@@ -2132,6 +5899,20 @@ fn emit_tool_call_started<W>(
         }
     }
     maybe_emit_tool_call_started(output, work, stream, &tool_id, false);
+    claude_code_log_event(
+        "tool_call_started",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "toolId": &tool_id,
+            "toolName": &tool_name,
+            "arguments": stream
+                .tool_calls
+                .get(&tool_id)
+                .map(|state| log_request_params_summary(&state.arguments))
+                .unwrap_or_else(|| json!({ "kind": "unknown" })),
+        }),
+    );
 }
 
 fn maybe_emit_tool_call_started<W>(
@@ -2185,6 +5966,19 @@ fn update_tool_call_arguments<W>(
         }
     }
     maybe_emit_tool_call_started(output, work, stream, &tool_id, false);
+    claude_code_log_event(
+        "tool_call_arguments_updated",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "toolId": &tool_id,
+            "arguments": stream
+                .tool_calls
+                .get(&tool_id)
+                .map(|state| log_request_params_summary(&state.arguments))
+                .unwrap_or_else(|| json!({ "kind": "unknown" })),
+        }),
+    );
 }
 
 fn complete_tool_call<W>(
@@ -2216,6 +6010,19 @@ fn complete_tool_call<W>(
         if success { "completed" } else { "failed" },
         result.as_deref(),
         Value::Null,
+    );
+    claude_code_log_event(
+        "tool_call_completed",
+        json!({
+            "threadId": &work.thread_id,
+            "turnId": &work.turn_id,
+            "toolId": &tool_id,
+            "toolName": &state.name,
+            "success": success,
+            "resultPreview": result
+                .as_deref()
+                .map(|value| log_text_preview(value, 500)),
+        }),
     );
     stream.completed_tool_items.push(item.clone());
     let _ = write_notification(
@@ -2478,6 +6285,7 @@ where
                 error: Some("failed to open Claude Code stdin".to_string()),
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
+                agent_item_streamed: false,
             };
         }
     };
@@ -2496,6 +6304,7 @@ where
                 error: Some("failed to capture Claude Code stdout".to_string()),
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
+                agent_item_streamed: false,
             };
         }
     };
@@ -2528,6 +6337,7 @@ where
             )),
             duration_ms: elapsed_millis(started),
             tool_items: Vec::new(),
+            agent_item_streamed: false,
         };
     }
     drop(child_stdin);
@@ -3285,6 +7095,14 @@ fn claude_command(work: &TurnWork) -> Command {
     {
         command.arg("--permission-mode").arg(permission_mode);
     }
+    if let Some(permission_prompt_tool) = claude_permission_prompt_tool_arg() {
+        command
+            .arg("--permission-prompt-tool")
+            .arg(permission_prompt_tool);
+    }
+    for arg in claude_code_capability_args(work) {
+        command.arg(arg);
+    }
     for arg in env_args(EXTRA_ARGS_ENV, &[]) {
         command.arg(arg);
     }
@@ -3299,6 +7117,16 @@ fn remove_active_process(state: &SharedState, work: &TurnWork) {
     }
 }
 
+fn turn_was_interrupted(state: &SharedState, work: &TurnWork) -> bool {
+    lock_state(state)
+        .map(|state| {
+            state
+                .interrupted_turns
+                .contains(&(work.thread_id.clone(), work.turn_id.clone()))
+        })
+        .unwrap_or(false)
+}
+
 fn claude_turn_idle_timeout() -> Duration {
     std::env::var(TURN_IDLE_TIMEOUT_MS_ENV)
         .ok()
@@ -3306,6 +7134,32 @@ fn claude_turn_idle_timeout() -> Duration {
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_TURN_IDLE_TIMEOUT_MS))
+}
+
+fn claude_permission_approval_timeout() -> Duration {
+    std::env::var(PERMISSION_APPROVAL_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_PERMISSION_APPROVAL_TIMEOUT_MS))
+}
+
+fn claude_permission_prompt_tool_arg() -> Option<String> {
+    let value = std::env::var(PERMISSION_PROMPT_TOOL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_PERMISSION_PROMPT_TOOL.to_string());
+    let normalized = value.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "0" | "false" | "off" | "no" | "none" | "disabled"
+    ) {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[cfg(unix)]
@@ -3774,6 +7628,11 @@ fn claude_command_display(work: &TurnWork) -> String {
         parts.push("--permission-mode".to_string());
         parts.push(permission_mode);
     }
+    if let Some(permission_prompt_tool) = claude_permission_prompt_tool_arg() {
+        parts.push("--permission-prompt-tool".to_string());
+        parts.push(permission_prompt_tool);
+    }
+    parts.extend(claude_code_capability_args(work));
     parts.extend(env_args(EXTRA_ARGS_ENV, &[]));
     parts
         .into_iter()
@@ -3800,9 +7659,7 @@ fn latest_claude_transcript_assistant_text(work: &TurnWork) -> Option<String> {
 }
 
 fn claude_transcript_path(work: &TurnWork) -> Option<PathBuf> {
-    let projects_dir = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".claude")
-        .join("projects");
+    let projects_dir = claude_projects_dir()?;
     let filename = format!("{}.jsonl", work.claude_session_id);
     for dir_name in claude_project_dir_candidates(&work.cwd) {
         let path = projects_dir.join(dir_name).join(&filename);
@@ -4508,6 +8365,23 @@ fn trim_json_line(line: &[u8]) -> &[u8] {
         .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line))
 }
 
+fn json_rpc_id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        Value::Number(_) | Value::Bool(_) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+fn take_app_response(state: &SharedState, request_id: &str) -> Option<Value> {
+    lock_state(state)
+        .ok()
+        .and_then(|mut state| state.app_responses.remove(request_id))
+}
+
 fn lock_state(
     state: &SharedState,
 ) -> Result<std::sync::MutexGuard<'_, ClaudeAppServerState>, String> {
@@ -4639,6 +8513,110 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_log_event_writes_configured_log_file() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_log_path = std::env::var_os(APP_SERVER_LOG_PATH_ENV);
+        let root = test_dir("app-server-log");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let log_path = root.join("claude-code-app-server.log");
+        std::env::set_var(APP_SERVER_LOG_PATH_ENV, &log_path);
+
+        claude_code_log_event(
+            "test_event",
+            json!({
+                "threadId": "thread",
+            }),
+        );
+
+        let content = std::fs::read_to_string(&log_path).expect("read log file");
+        let line = content.lines().last().expect("log line");
+        let value = serde_json::from_str::<Value>(line).expect("parse log json");
+        assert_eq!(
+            value.get("event").and_then(Value::as_str),
+            Some("test_event")
+        );
+        assert_eq!(
+            value.get("threadId").and_then(Value::as_str),
+            Some("thread")
+        );
+
+        restore_env(APP_SERVER_LOG_PATH_ENV, old_log_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_metadata_relay_injects_codex_turn_metadata_into_tool_calls() {
+        let options = McpMetadataRelayOptions {
+            server_name: "codex-computer-use".to_string(),
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            cwd: "/tmp/work".to_string(),
+            command: "computer-use".to_string(),
+            args: vec!["mcp".to_string()],
+        };
+        let output = inject_mcp_codex_turn_metadata(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}"#,
+            &options,
+        );
+        let value = serde_json::from_slice::<Value>(&output).expect("parse transformed json");
+
+        assert_eq!(
+            value.pointer("/params/_meta/x-codex-turn-metadata/type"),
+            Some(&json!("thread-id"))
+        );
+        assert_eq!(
+            value.pointer("/params/_meta/x-codex-turn-metadata/thread-id"),
+            Some(&json!("thread-1"))
+        );
+        assert_eq!(
+            value
+                .pointer("/params/headers/x-codex-turn-metadata")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|metadata| metadata
+                    .get("thread-id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)),
+            Some("thread-1".to_string())
+        );
+    }
+
+    #[test]
+    fn interrupt_turn_falls_back_to_active_thread_turn() {
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        };
+        let (thread_response, _) = state.start_thread(&json!({ "cwd": "/tmp" }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "hello" }],
+            }))
+            .expect("start turn");
+        state
+            .active_processes
+            .insert((work.thread_id.clone(), work.turn_id.clone()), 1234);
+
+        let pid = state.interrupt_turn(&json!({
+            "threadId": work.thread_id.clone(),
+            "turnId": "stale-turn-id",
+        }));
+
+        assert_eq!(pid, Some(1234));
+        assert!(state.interrupted_turns.contains(&(thread_id, work.turn_id)));
+    }
+
+    #[test]
     fn initialize_response_includes_codex_app_required_fields() {
         let root = test_dir("initialize");
         std::fs::create_dir_all(&root).expect("create temp dir");
@@ -4682,6 +8660,437 @@ mod tests {
         assert_eq!(config_result.get("layers"), Some(&json!([])));
         assert_eq!(output.lines().count(), 2);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_capability_methods_work_without_codex_cli() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("standalone-capabilities");
+        let codex_home = root.join(".codex");
+        let output_path = root.join("out.jsonl");
+        let skill_dir = codex_home.join("skills").join("demo-skill");
+        let plugin_package_dir = codex_home.join("plugins").join("demo-plugin");
+        let plugin_dir = plugin_package_dir.join(".codex-plugin");
+        let plugin_skill_dir = plugin_package_dir.join("skills").join("plugin-skill");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        std::fs::create_dir_all(&plugin_skill_dir).expect("create plugin skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: "demo-skill"
+description: "Demo skill from CODEX_HOME."
+---
+
+# Demo Skill
+
+Use this skill for standalone tests.
+"#,
+        )
+        .expect("write skill");
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{
+  "id": "demo.plugin",
+  "name": "Demo Plugin",
+  "description": "Demo plugin from CODEX_HOME",
+  "version": "1.2.3",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}"#,
+        )
+        .expect("write plugin");
+        std::fs::write(
+            plugin_skill_dir.join("SKILL.md"),
+            r#"---
+name: "plugin-skill"
+description: "Demo plugin skill."
+---
+
+# Plugin Skill
+
+Use this skill from the demo plugin.
+"#,
+        )
+        .expect("write plugin skill");
+        std::fs::write(
+            plugin_package_dir.join(".mcp.json"),
+            r#"{
+  "mcpServers": {
+    "computer-use": {
+      "command": "./Computer Use.app/Contents/MacOS/ComputerUse",
+      "args": ["mcp"],
+      "cwd": "."
+    }
+  }
+}"#,
+        )
+        .expect("write plugin mcp config");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[mcp_servers.demo_mcp]
+command = "node"
+args = ["server.js", "--stdio"]
+"#,
+        )
+        .expect("write config");
+
+        let old_home = std::env::var_os("HOME");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        let old_proxy = std::env::var_os(CODEX_APP_SERVER_PROXY_ENV);
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var(CODEX_APP_SERVER_PROXY_ENV, "0");
+
+        let input = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            json!({"id":"1","method":"initialize","params":{}}),
+            json!({"id":"2","method":"skills/list","params":{"cwd":root}}),
+            json!({"id":"3","method":"mcpServerStatus/list","params":{}}),
+            json!({"id":"4","method":"plugin/list","params":{}}),
+            json!({"id":"5","method":"plugin/read","params":{"pluginName":"Demo Plugin","marketplacePath":plugin_dir}}),
+            json!({"id":"6","method":"plugin/install","params":{"pluginName":"Demo Plugin","marketplacePath":plugin_dir}}),
+            json!({"id":"7","method":"account/read","params":{}}),
+            json!({"id":"8","method":"getAuthStatus","params":{"includeToken":true}})
+        );
+        run_stdio_app_server_with_io(
+            vec![],
+            std::io::Cursor::new(input.into_bytes()),
+            File::create(&output_path).expect("create output"),
+        )
+        .expect("run app server");
+
+        let responses = json_lines(&std::fs::read_to_string(&output_path).expect("read output"));
+        let skills = response_by_id(&responses, "2")
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .expect("skill data");
+        assert!(skills
+            .iter()
+            .any(|skill| skill.get("name").and_then(Value::as_str) == Some("demo-skill")));
+        let mcp_servers = response_by_id(&responses, "3")
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .expect("mcp server data");
+        assert!(mcp_servers
+            .iter()
+            .any(|server| server.get("name").and_then(Value::as_str) == Some("demo_mcp")));
+        let computer_use = mcp_servers
+            .iter()
+            .find(|server| server.get("name").and_then(Value::as_str) == Some("computer-use"))
+            .expect("computer-use plugin mcp server");
+        assert_eq!(
+            computer_use.get("source").and_then(Value::as_str),
+            Some("plugin")
+        );
+        assert_eq!(
+            computer_use
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|command| command.ends_with("Computer Use.app/Contents/MacOS/ComputerUse")),
+            Some(true)
+        );
+        assert_eq!(
+            computer_use.pointer("/args/0").and_then(Value::as_str),
+            Some("mcp")
+        );
+        let plugins = response_by_id(&responses, "4")
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .expect("plugin data");
+        assert!(plugins
+            .iter()
+            .any(|plugin| plugin.get("name").and_then(Value::as_str) == Some("Demo Plugin")));
+        let plugin_result = response_by_id(&responses, "4")
+            .get("result")
+            .expect("plugin result");
+        let marketplaces = plugin_result
+            .get("marketplaces")
+            .and_then(Value::as_array)
+            .expect("plugin marketplaces");
+        assert!(marketplaces.iter().any(|marketplace| {
+            marketplace.get("name").and_then(Value::as_str) == Some("filesystem")
+                && marketplace
+                    .get("plugins")
+                    .and_then(Value::as_array)
+                    .is_some_and(|plugins| {
+                        plugins.iter().any(|plugin| {
+                            plugin.get("name").and_then(Value::as_str) == Some("Demo Plugin")
+                                && plugin.pointer("/source/type").and_then(Value::as_str)
+                                    == Some("local")
+                        })
+                    })
+        }));
+        assert_eq!(
+            plugin_result
+                .get("marketplaceLoadErrors")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            plugin_result
+                .get("featuredPluginIds")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let plugin_detail = response_by_id(&responses, "5")
+            .pointer("/result/plugin")
+            .expect("plugin detail");
+        assert_eq!(
+            plugin_detail
+                .pointer("/summary/name")
+                .and_then(Value::as_str),
+            Some("Demo Plugin")
+        );
+        assert_eq!(
+            plugin_detail.get("marketplaceName").and_then(Value::as_str),
+            Some("filesystem")
+        );
+        assert_eq!(
+            plugin_detail
+                .pointer("/skills/0/name")
+                .and_then(Value::as_str),
+            Some("Demo Plugin:plugin-skill")
+        );
+        assert_eq!(
+            plugin_detail
+                .pointer("/mcpServers/0")
+                .and_then(Value::as_str),
+            Some("computer-use")
+        );
+        assert_eq!(
+            response_by_id(&responses, "6")
+                .pointer("/result/authPolicy")
+                .and_then(Value::as_str),
+            Some("ON_INSTALL")
+        );
+        assert_eq!(
+            response_by_id(&responses, "6")
+                .pointer("/result/appsNeedingAuth")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let account = response_by_id(&responses, "7")
+            .pointer("/result/account")
+            .expect("mock account");
+        assert_eq!(account.get("type").and_then(Value::as_str), Some("chatgpt"));
+        assert_eq!(
+            account.get("email").and_then(Value::as_str),
+            Some(PROVIDER_NAME)
+        );
+        assert_eq!(
+            account.get("planType").and_then(Value::as_str),
+            Some("unknown")
+        );
+        assert_eq!(
+            response_by_id(&responses, "7").pointer("/result/requiresOpenaiAuth"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            response_by_id(&responses, "8").pointer("/result/authMethod"),
+            Some(&json!("chatgpt"))
+        );
+        assert_eq!(
+            response_by_id(&responses, "8").pointer("/result/authToken"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            response_by_id(&responses, "8").pointer("/result/requiresOpenaiAuth"),
+            Some(&Value::Bool(false))
+        );
+
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: root.to_string_lossy().to_string(),
+            prompt: "hello".to_string(),
+            resume_existing: false,
+        };
+        let command = claude_command_display(&work);
+        assert!(!command.contains("--plugin-dir"), "{command}");
+        assert!(command.contains("--mcp-config"), "{command}");
+        let mcp_config = claude_code_mcp_config_json(&work).expect("mcp config json");
+        let mcp_config: Value = serde_json::from_str(&mcp_config).expect("parse mcp config");
+        let servers = mcp_config
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .expect("mcp servers");
+        let computer_use = servers
+            .get("codex-computer-use")
+            .expect("computer use server");
+        assert_eq!(
+            computer_use.get("command").and_then(Value::as_str),
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_string))
+                .as_deref()
+        );
+        assert!(computer_use
+            .get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| args.iter().any(|arg| {
+                arg.as_str()
+                    == Some(crate::cli_middleware::CLAUDE_CODE_MCP_METADATA_RELAY_RUN_MODE_ARG)
+            })));
+        assert!(servers.get("computer-use").is_none());
+        let title_command = claude_command_display(&TurnWork {
+            thread_id: "title-thread".to_string(),
+            turn_id: "title-turn".to_string(),
+            agent_item_id: "title-agent".to_string(),
+            cli_item_id: "title-cli".to_string(),
+            claude_session_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            cwd: root.to_string_lossy().to_string(),
+            prompt: "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\nhello".to_string(),
+            resume_existing: false,
+        });
+        assert!(!title_command.contains("--mcp-config"), "{title_command}");
+
+        restore_env("HOME", old_home);
+        restore_env("CODEX_HOME", old_codex_home);
+        restore_env(CODEX_APP_SERVER_PROXY_ENV, old_proxy);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_lifecycle_emits_thread_stream_state_snapshots() {
+        let root = test_dir("thread-stream-state");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        };
+        let _ = state.start_thread(&json!({
+            "cwd": root.to_string_lossy(),
+            "model": "sonnet",
+        }));
+        let thread_id = state.threads.keys().next().expect("thread id").to_string();
+
+        let (_, notifications, work) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "use computer" }],
+            }))
+            .expect("start turn");
+        let started_snapshot = notifications
+            .iter()
+            .find(|notification| {
+                notification.get("method").and_then(Value::as_str)
+                    == Some("thread-stream-state-changed")
+            })
+            .expect("started thread stream snapshot");
+        assert_eq!(
+            started_snapshot
+                .pointer("/params/change/conversationState/threadRuntimeStatus/type")
+                .and_then(Value::as_str),
+            Some("active")
+        );
+        assert_eq!(
+            started_snapshot
+                .pointer("/params/change/conversationState/turns/0/status")
+                .and_then(Value::as_str),
+            Some("inProgress")
+        );
+
+        let finished = state
+            .finish_turn(
+                &work.thread_id,
+                &work.turn_id,
+                ClaudeRunResult {
+                    text: "done".to_string(),
+                    error: None,
+                    duration_ms: 12,
+                    tool_items: Vec::new(),
+                    agent_item_streamed: false,
+                },
+            )
+            .expect("finish turn");
+        assert_eq!(
+            finished
+                .thread_stream_state
+                .as_ref()
+                .expect("thread stream state")
+                .get("method")
+                .and_then(Value::as_str),
+            Some("thread-stream-state-changed")
+        );
+        assert_eq!(
+            finished
+                .thread_stream_state
+                .as_ref()
+                .expect("thread stream state")
+                .pointer("/params/change/conversationState/threadRuntimeStatus/type")
+                .and_then(Value::as_str),
+            Some("idle")
+        );
+        assert_eq!(
+            finished
+                .thread_stream_state
+                .as_ref()
+                .expect("thread stream state")
+                .pointer("/params/change/conversationState/turns/0/status")
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_read_proxies_to_bundled_codex_app_server_when_available() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("plugin-proxy");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let fake_codex = root.join("codex");
+        write_executable(
+            &fake_codex,
+            br#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *"__codexl_claude_code_proxy_request__"*)
+      printf '%s\n' '{"id":"__codexl_claude_code_proxy_request__","result":{"plugin":{"summary":{"name":"proxied-plugin"},"skills":[],"hooks":[],"apps":[],"mcpServers":[]}}}'
+      ;;
+  esac
+done
+"#,
+        );
+
+        let old_proxy = std::env::var_os(CODEX_APP_SERVER_PROXY_ENV);
+        let old_bundled = std::env::var_os("CODEXL_BUNDLED_CODEX_CLI_PATH");
+        let old_real = std::env::var_os("CODEXL_REAL_CODEX_CLI_PATH");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var(CODEX_APP_SERVER_PROXY_ENV, "1");
+        std::env::set_var("CODEXL_BUNDLED_CODEX_CLI_PATH", &fake_codex);
+        std::env::remove_var("CODEXL_REAL_CODEX_CLI_PATH");
+        std::env::set_var("CODEX_HOME", &root);
+
+        let result = standalone_codex_app_result(
+            "plugin/read",
+            &json!({"pluginName":"computer-use","marketplacePath":"openai-bundled"}),
+        )
+        .expect("plugin/read result");
+        assert_eq!(
+            result
+                .pointer("/plugin/summary/name")
+                .and_then(Value::as_str),
+            Some("proxied-plugin")
+        );
+
+        restore_env(CODEX_APP_SERVER_PROXY_ENV, old_proxy);
+        restore_env("CODEXL_BUNDLED_CODEX_CLI_PATH", old_bundled);
+        restore_env("CODEXL_REAL_CODEX_CLI_PATH", old_real);
+        restore_env("CODEX_HOME", old_codex_home);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4897,9 +9306,324 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
     }
 
     #[test]
+    fn thread_list_hides_title_generation_transcripts_and_uses_generated_title() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-title-transcripts");
+        let cwd = root.join("workspace");
+        let title_session_id = "55555555-5555-4555-8555-555555555555";
+        let main_session_id = "66666666-6666-4666-8666-666666666666";
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(&cwd));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let title_transcript_path = projects_dir.join(format!("{title_session_id}.jsonl"));
+        let main_transcript_path = projects_dir.join(format!("{main_session_id}.jsonl"));
+        let title_prompt = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\n你是谁";
+        std::fs::write(
+            &title_transcript_path,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": title_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:00.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{ "type": "text", "text": title_prompt }]
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": title_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:03.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "Fallback title" }]
+                    }
+                }),
+                json!({
+                    "type": "ai-title",
+                    "sessionId": title_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:04.000Z",
+                    "aiTitle": "Explain who I am"
+                })
+            ),
+        )
+        .expect("write title transcript");
+        std::fs::write(
+            &main_transcript_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": main_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:01.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "你是谁"
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": main_session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:05.000Z",
+                    "uuid": "assistant-message",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "我是 Claude。" }]
+                    }
+                })
+            ),
+        )
+        .expect("write main transcript");
+        std::env::set_var("HOME", &root);
+        assert!(load_claude_thread_by_id(title_session_id, None).is_none());
+
+        let output_path = root.join("out.jsonl");
+        let input = format!(
+            "{}\n{}\n{}\n",
+            json!({"id":"1","method":"initialize","params":{}}),
+            json!({"id":"2","method":"thread/list","params":{"limit":10}}),
+            json!({"id":"3","method":"thread/read","params":{"threadId":main_session_id,"includeTurns":true}})
+        );
+
+        run_stdio_app_server_with_io(
+            vec![],
+            std::io::Cursor::new(input.into_bytes()),
+            File::create(&output_path).expect("create output"),
+        )
+        .expect("run app server");
+
+        let responses = json_lines(&std::fs::read_to_string(&output_path).expect("read output"));
+        let listed_threads = response_by_id(&responses, "2")
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .expect("listed threads");
+        assert_eq!(listed_threads.len(), 1, "{listed_threads:#?}");
+        let listed = &listed_threads[0];
+        assert_eq!(
+            listed.get("id").and_then(Value::as_str),
+            Some(main_session_id)
+        );
+        assert_eq!(
+            listed.get("name").and_then(Value::as_str),
+            Some("Explain who I am")
+        );
+        assert_eq!(
+            response_by_id(&responses, "3")
+                .pointer("/result/thread/name")
+                .and_then(Value::as_str),
+            Some("Explain who I am")
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_list_hides_in_memory_title_generation_thread_and_updates_main_title() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-title-in-memory");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let cwd = root.join("workspace").to_string_lossy().to_string();
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: Some("workspace".to_string()),
+        };
+        let (main_response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let main_thread_id = main_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("main thread id")
+            .to_string();
+        let (_, _, main_work) = state
+            .start_turn(&json!({
+                "threadId": main_thread_id,
+                "input": [{ "type": "text", "text": "hi" }],
+            }))
+            .expect("start main turn");
+        state
+            .finish_turn(
+                &main_work.thread_id,
+                &main_work.turn_id,
+                ClaudeRunResult {
+                    text: "Hello".to_string(),
+                    error: None,
+                    duration_ms: 1,
+                    tool_items: Vec::new(),
+                    agent_item_streamed: true,
+                },
+            )
+            .expect("finish main turn");
+
+        let (title_response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let title_thread_id = title_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("title thread id")
+            .to_string();
+        let title_prompt = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\nhi";
+        let (_, title_start_notifications, title_work) = state
+            .start_turn(&json!({
+                "threadId": title_thread_id,
+                "input": [{ "type": "text", "text": title_prompt }],
+            }))
+            .expect("start title turn");
+        assert!(
+            title_start_notifications.is_empty(),
+            "title generation turn should not be exposed as a visible turn"
+        );
+        let title_notifications = state
+            .finish_turn(
+                &title_work.thread_id,
+                &title_work.turn_id,
+                ClaudeRunResult {
+                    text: "Greeting".to_string(),
+                    error: None,
+                    duration_ms: 1,
+                    tool_items: Vec::new(),
+                    agent_item_streamed: true,
+                },
+            )
+            .expect("finish title turn");
+
+        assert!(title_notifications.item_completed.is_none());
+        assert!(title_notifications.turn_completed.is_none());
+        assert!(title_notifications.thread_stream_state.is_none());
+        assert_eq!(
+            title_notifications
+                .extra_notifications
+                .first()
+                .and_then(|notification| notification.pointer("/params/threadId"))
+                .and_then(Value::as_str),
+            Some(main_thread_id.as_str())
+        );
+        assert_eq!(
+            title_notifications
+                .extra_notifications
+                .first()
+                .and_then(|notification| notification.pointer("/params/name"))
+                .and_then(Value::as_str),
+            Some("Greeting")
+        );
+
+        let listed = state.thread_list(&json!({ "limit": 10 }));
+        let listed_threads = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("listed threads");
+        assert_eq!(listed_threads.len(), 1, "{listed_threads:#?}");
+        assert_eq!(
+            listed_threads[0].get("id").and_then(Value::as_str),
+            Some(main_thread_id.as_str())
+        );
+        assert_eq!(
+            listed_threads[0].get("name").and_then(Value::as_str),
+            Some("Greeting")
+        );
+        assert!(state
+            .thread_read(&json!({ "threadId": title_thread_id }))
+            .is_err());
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_name_set_persists_claude_thread_title() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-title-persistence");
+        let cwd = root.join("workspace");
+        let session_id = "77777777-7777-4777-8777-777777777777";
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(&cwd));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::write(
+            projects_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:00.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "hello"
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "timestamp": "2026-05-25T07:00:01.000Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "opus",
+                        "content": [{ "type": "text", "text": "hi" }]
+                    }
+                })
+            ),
+        )
+        .expect("write transcript");
+        std::env::set_var("HOME", &root);
+
+        let output_path = root.join("out.jsonl");
+        let input = format!(
+            "{}\n{}\n{}\n",
+            json!({"id":"1","method":"initialize","params":{}}),
+            json!({"id":"2","method":"thread/name/set","params":{"threadId":session_id,"name":"Custom title"}}),
+            json!({"id":"3","method":"thread/list","params":{"limit":10}})
+        );
+
+        run_stdio_app_server_with_io(
+            vec![],
+            std::io::Cursor::new(input.into_bytes()),
+            File::create(&output_path).expect("create output"),
+        )
+        .expect("run app server");
+
+        let responses = json_lines(&std::fs::read_to_string(&output_path).expect("read output"));
+        assert_eq!(
+            response_by_id(&responses, "3")
+                .pointer("/result/data/0/name")
+                .and_then(Value::as_str),
+            Some("Custom title")
+        );
+        assert!(root
+            .join(".claude")
+            .join(CLAUDE_THREAD_NAMES_FILE)
+            .is_file());
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resume_unknown_thread_does_not_create_empty_claude_session() {
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -4955,6 +9679,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
 
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -4977,6 +9702,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
     fn started_thread_first_turn_uses_session_id_not_resume() {
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -5060,6 +9786,141 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
     }
 
     #[test]
+    fn claude_command_uses_stdio_permission_prompt_by_default() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_prompt_tool = std::env::var_os(PERMISSION_PROMPT_TOOL_ENV);
+        std::env::remove_var(PERMISSION_PROMPT_TOOL_ENV);
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: "hello".to_string(),
+            resume_existing: false,
+        };
+
+        assert!(claude_command_display(&work).contains("--permission-prompt-tool stdio"));
+        std::env::set_var(PERMISSION_PROMPT_TOOL_ENV, "none");
+        assert!(!claude_command_display(&work).contains("--permission-prompt-tool"));
+
+        restore_env(PERMISSION_PROMPT_TOOL_ENV, old_prompt_tool);
+    }
+
+    #[test]
+    fn json_rpc_response_is_stashed_for_pending_app_request() {
+        let state = Arc::new(Mutex::new(ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        }));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        let worker = handle_client_line(
+            br#"{"id":"perm-1","result":{"permissions":{"network":{"enabled":true}},"scope":"turn"}}"#,
+            Arc::clone(&state),
+            Arc::clone(&output),
+        )
+        .expect("handle response");
+
+        assert!(worker.is_none());
+        assert_eq!(
+            take_app_response(&state, "perm-1")
+                .expect("stored response")
+                .pointer("/permissions/network/enabled"),
+            Some(&Value::Bool(true))
+        );
+        assert!(output.lock().expect("output lock").is_empty());
+    }
+
+    #[test]
+    fn claude_permission_request_round_trips_through_codex_app_response() {
+        let state = Arc::new(Mutex::new(ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        }));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: "/tmp/workspace".to_string(),
+            prompt: "hello".to_string(),
+            resume_existing: false,
+        };
+        let message = json!({
+            "type": "control_request",
+            "request_id": "perm-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "mcp__computer-use__screenshot",
+                "input": { "display": 0 }
+            }
+        });
+        let worker_state = Arc::clone(&state);
+        let worker_output = Arc::clone(&output);
+        let handle = thread::spawn(move || {
+            request_codex_app_permissions(&message, &work, &worker_state, &worker_output)
+        });
+
+        for _ in 0..50 {
+            let current =
+                String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8");
+            if current.contains(r#""method":"item/permissions/requestApproval""#) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let emitted = String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8");
+        assert!(
+            emitted.contains(r#""method":"item/permissions/requestApproval""#),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(r#""network":{"enabled":true}"#),
+            "{emitted}"
+        );
+
+        handle_client_line(
+            br#"{"id":"perm-1","result":{"permissions":{"network":{"enabled":true}},"scope":"turn"}}"#,
+            Arc::clone(&state),
+            Arc::clone(&output),
+        )
+        .expect("handle app response");
+        let response = handle
+            .join()
+            .expect("permission worker")
+            .expect("permission response");
+
+        assert_eq!(
+            response.get("type").and_then(Value::as_str),
+            Some("control_response")
+        );
+        assert_eq!(
+            response.get("request_id").and_then(Value::as_str),
+            Some("perm-1")
+        );
+        assert_eq!(
+            response
+                .pointer("/response/behavior")
+                .and_then(Value::as_str),
+            Some("allow")
+        );
+        assert_eq!(
+            response.pointer("/response/updatedInput/display"),
+            Some(&json!(0))
+        );
+    }
+
+    #[test]
     fn claude_stream_json_input_matches_sdk_shape() {
         let work = TurnWork {
             thread_id: "thread".to_string(),
@@ -5108,6 +9969,157 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
                 .and_then(Value::as_str),
             Some("hello")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_json_reemits_active_thread_state_after_claude_starts() {
+        let root = test_dir("stream-json-thread-state-heartbeat");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let fake_claude = root.join("fake-claude");
+        let fake_claude_script = r#"#!/bin/sh
+IFS= read -r _line || true
+printf '%s\n' '{"type":"result","is_error":false,"result":"done","duration_ms":10}'
+"#;
+        write_executable(&fake_claude, fake_claude_script.as_bytes());
+
+        let mut initial_state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        };
+        let (thread_response, _) = initial_state.start_thread(&json!({
+            "cwd": root.to_string_lossy(),
+        }));
+        let thread_id = thread_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, work) = initial_state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "use computer" }],
+            }))
+            .expect("start turn");
+        let state = Arc::new(Mutex::new(initial_state));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        let result = run_claude_code_turn_stream_json(
+            Command::new(&fake_claude),
+            &work,
+            Arc::clone(&state),
+            Arc::clone(&output),
+            Instant::now(),
+        );
+
+        assert_eq!(result.error, None);
+        let output =
+            String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8 output");
+        let messages = json_lines(&output);
+        let active_snapshot = messages
+            .iter()
+            .find(|message| {
+                message.get("method").and_then(Value::as_str) == Some("thread-stream-state-changed")
+                    && message
+                        .pointer("/params/change/conversationState/threadRuntimeStatus/type")
+                        .and_then(Value::as_str)
+                        == Some("active")
+            })
+            .expect("active thread stream state snapshot");
+        assert_eq!(
+            active_snapshot
+                .pointer("/params/change/conversationState/turns/0/status")
+                .and_then(Value::as_str),
+            Some("inProgress")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_json_turn_finishes_after_result_even_if_child_stays_open() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_timeout = std::env::var_os(TURN_IDLE_TIMEOUT_MS_ENV);
+        std::env::set_var(TURN_IDLE_TIMEOUT_MS_ENV, "2000");
+
+        let root = test_dir("persistent-stream-json");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let fake_claude = root.join("fake-claude");
+        let pid_path = root.join("fake-claude.pid");
+        let killed_path = root.join("fake-claude.killed");
+        let fake_claude_script = r#"#!/bin/sh
+trap 'printf killed > "__KILLED_PATH__"; exit 143' TERM INT HUP
+printf '%s' "$$" > "__PID_PATH__"
+printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Persistent done"}]}}'
+printf '%s\n' '{"type":"result","is_error":false,"result":"Persistent done","duration_ms":10}'
+sleep 60
+"#
+        .replace("__KILLED_PATH__", killed_path.to_string_lossy().as_ref())
+        .replace("__PID_PATH__", pid_path.to_string_lossy().as_ref());
+        write_executable(&fake_claude, fake_claude_script.as_bytes());
+
+        let state = Arc::new(Mutex::new(ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: None,
+        }));
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: root.to_string_lossy().to_string(),
+            prompt: "hello".to_string(),
+            resume_existing: false,
+        };
+        let started = Instant::now();
+        let result = run_claude_code_turn_stream_json(
+            Command::new(&fake_claude),
+            &work,
+            Arc::clone(&state),
+            Arc::clone(&output),
+            started,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stream-json result should finish the turn promptly"
+        );
+        assert_eq!(result.text, "Persistent done");
+        assert_eq!(result.error, None);
+        assert!(result.agent_item_streamed);
+        assert!(state
+            .lock()
+            .expect("state lock")
+            .active_processes
+            .is_empty());
+        let output =
+            String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8 output");
+        assert!(output.contains(r#""method":"item/agentMessage/delta""#));
+        assert!(output.contains("Persistent done"));
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !killed_path.exists(),
+            "result completion should not terminate Claude Code"
+        );
+
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .expect("pid file")
+            .trim()
+            .parse::<u32>()
+        {
+            terminate_process_group(pid);
+        }
+        restore_env(TURN_IDLE_TIMEOUT_MS_ENV, old_timeout);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5510,6 +10522,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
     fn finish_turn_skips_final_agent_completed_item_after_streaming() {
         let mut state = ClaudeAppServerState {
             active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
             interrupted_turns: BTreeSet::new(),
             threads: BTreeMap::new(),
             workspace_name: None,
@@ -5527,7 +10540,7 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             }))
             .expect("start turn");
 
-        let (item_notification, turn_notification) = state
+        let notifications = state
             .finish_turn(
                 &work.thread_id,
                 &work.turn_id,
@@ -5541,9 +10554,14 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             )
             .expect("finish turn");
 
-        assert!(item_notification.is_none());
+        assert!(notifications.item_completed.is_none());
         assert_eq!(
-            turn_notification.get("method").and_then(Value::as_str),
+            notifications
+                .turn_completed
+                .as_ref()
+                .expect("turn completed")
+                .get("method")
+                .and_then(Value::as_str),
             Some("turn/completed")
         );
         let turn_items = state

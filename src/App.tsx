@@ -1356,7 +1356,7 @@ function App() {
       gatewayProfileEnabled ? loadGatewayModels() : Promise.resolve([]),
       detectCodexAppPath(),
     ]);
-    const nextMode: ProviderMode = providers.length > 0 ? "existing" : "none";
+    const nextMode: ProviderMode = providers.length > 0 ? "existing" : "new";
     setForm({
       ...emptyForm,
       ...defaultRemoteFrontendFormFields(detectedCodexAppPath),
@@ -1387,7 +1387,7 @@ function App() {
       setForm(emptyForm);
       const isGatewayProfile =
         gatewayProfileEnabled && profile.provider_name === NEXT_AI_GATEWAY_PROVIDER_NAME;
-      const [providers, , models] = await Promise.all([
+      const [providers, detectedCodexAppPath, models] = await Promise.all([
         loadDefaultProviders(),
         detectCodexAppPath(),
         isGatewayProfile ? loadGatewayModels() : Promise.resolve([]),
@@ -1399,7 +1399,7 @@ function App() {
           ...emptyForm,
           workspaceName: profile.name,
           proxyUrl: profile.proxy_url || "",
-          ...profileRemoteFrontendFormFields(profile),
+          ...profileRemoteFrontendFormFields(profile, detectedCodexAppPath),
           ...botFormFields(profile.bot, profile.name),
         });
         setSettingsOpen(true);
@@ -1417,7 +1417,7 @@ function App() {
           providerName: profile.codex_profile_name || profile.name,
           gatewayModel: profile.model,
           proxyUrl: profile.proxy_url || "",
-          ...profileRemoteFrontendFormFields(profile),
+          ...profileRemoteFrontendFormFields(profile, detectedCodexAppPath),
           ...botFormFields(profile.bot, profile.name),
         });
         if (models.length > 0 && !models.includes(profile.model)) {
@@ -1438,7 +1438,7 @@ function App() {
           ...emptyForm,
           workspaceName: profile.name,
           proxyUrl: profile.proxy_url || "",
-          ...profileRemoteFrontendFormFields(profile),
+          ...profileRemoteFrontendFormFields(profile, detectedCodexAppPath),
           existingProfileName: profile.codex_profile_name || profile.name,
           existingBaseUrl: profile.base_url || "",
           existingModel:
@@ -1457,7 +1457,7 @@ function App() {
         ...emptyForm,
         workspaceName: profile.name,
         proxyUrl: profile.proxy_url || "",
-        ...profileRemoteFrontendFormFields(profile),
+        ...profileRemoteFrontendFormFields(profile, detectedCodexAppPath),
         existingProfileName: selected.name,
         existingBaseUrl: profile.base_url || selected.base_url || "",
         existingApiKey: selected.api_key || "",
@@ -4332,8 +4332,12 @@ function SettingsDialog({
                 !newProviderActive && "text-muted-foreground hover:bg-transparent",
               )}
               type="button"
-              disabled={isEditingDefaultWorkspace || (dialogMode === "edit" && !gatewayEnabled)}
-              onClick={() => onSelectProviderMode(gatewayEnabled ? "gateway" : "new")}
+              disabled={dialogMode === "edit" && !isEditingDefaultWorkspace && !gatewayEnabled}
+              onClick={() =>
+                onSelectProviderMode(
+                  isEditingDefaultWorkspace ? "new" : gatewayEnabled ? "gateway" : "new",
+                )
+              }
             >
               {strings.newProvider}
             </Button>
@@ -4574,7 +4578,6 @@ function SettingsDialog({
                 ref={providerNameInputRef}
                 type="text"
                 placeholder="nextai"
-                disabled={isEditingDefaultWorkspace}
                 value={form.providerName}
                 onChange={(event) =>
                   onSetForm((current) => ({ ...current, providerName: event.target.value }))
@@ -4614,7 +4617,6 @@ function SettingsDialog({
                     <SelectItem
                       value="third-party"
                       disabled={
-                        isEditingDefaultWorkspace ||
                         (dialogMode === "edit" && providerMode !== "new")
                       }
                     >
@@ -5797,9 +5799,14 @@ function defaultRemoteFrontendFormFields(codexAppPath: string): Partial<Provider
   };
 }
 
-function profileRemoteFrontendFormFields(profile: ProviderProfile): Partial<ProviderForm> {
+function profileRemoteFrontendFormFields(
+  profile: ProviderProfile,
+  codexAppPath = "",
+): Partial<ProviderForm> {
+  const remoteFrontendMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode);
   return {
-    remoteFrontendMode: normalizeRemoteFrontendMode(profile.remote_frontend_mode),
+    remoteFrontendMode:
+      remoteFrontendMode === "app" && !codexAppPath.trim() ? "cli" : remoteFrontendMode,
     remoteWebAssetRegistryUrl:
       normalizeRegistryUrl(profile.remote_web_asset_registry_url || "") ||
       DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL,

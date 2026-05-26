@@ -1,6 +1,6 @@
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -576,8 +576,8 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load() -> Self {
-        let mut config = config_path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+        let mut config = std::fs::read_to_string(config_path())
+            .ok()
             .and_then(|content| serde_json::from_str::<AppConfig>(&content).ok())
             .unwrap_or_default();
         config.normalize();
@@ -586,7 +586,7 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = config_path().ok_or_else(|| "Could not resolve config path".to_string())?;
+        let path = config_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -1003,17 +1003,15 @@ impl RemoteCloudAuthConfig {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
+fn config_path() -> PathBuf {
     if let Ok(path) = std::env::var("CODEXL_CONFIG_PATH") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
-            return Some(PathBuf::from(normalize_home_path(trimmed)));
+            return PathBuf::from(normalize_home_path(trimmed));
         }
     }
 
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".codexl").join("config.json"))
+    codexl_home_dir().join("config.json")
 }
 
 pub fn default_codex_home() -> String {
@@ -1023,14 +1021,9 @@ pub fn default_codex_home() -> String {
         .map(|value| normalize_home_path(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(|home| {
-                    PathBuf::from(home)
-                        .join(".codex")
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .unwrap_or_else(|_| ".codex".to_string())
+            user_home_dir()
+                .map(|home| home.join(".codex").to_string_lossy().to_string())
+                .unwrap_or_else(|| ".codex".to_string())
         })
 }
 
@@ -1040,14 +1033,7 @@ pub fn default_codex_config_path() -> PathBuf {
 
 pub fn generated_codex_home(profile: &ProviderProfile) -> PathBuf {
     let slug = slugify(&profile.name);
-    std::env::var("HOME")
-        .map(|home| {
-            PathBuf::from(home)
-                .join(".codexl")
-                .join("codex-homes")
-                .join(&slug)
-        })
-        .unwrap_or_else(|_| PathBuf::from(".codexl").join("codex-homes").join(slug))
+    codexl_home_dir().join("codex-homes").join(&slug)
 }
 
 pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
@@ -1057,14 +1043,7 @@ pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
     } else {
         name
     });
-    std::env::var("HOME")
-        .map(|home| {
-            PathBuf::from(home)
-                .join(".codexl")
-                .join("bot-gateway")
-                .join(&slug)
-        })
-        .unwrap_or_else(|_| PathBuf::from(".codexl").join("bot-gateway").join(slug))
+    codexl_home_dir().join("bot-gateway").join(slug)
 }
 
 pub fn ensure_provider_codex_home(profile: &ProviderProfile) -> Result<String, String> {
@@ -1215,7 +1194,11 @@ pub fn update_default_provider_selection(input: ExistingProviderRequest) -> Resu
 }
 
 pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProfile, String> {
-    let workspace_name = workspace_name_or_default(&input.workspace_name, &input.name)?;
+    let workspace_name = if input.workspace_name.trim() == DEFAULT_PROVIDER_PROFILE_NAME {
+        DEFAULT_PROVIDER_PROFILE_NAME.to_string()
+    } else {
+        workspace_name_or_default(&input.workspace_name, &input.name)?
+    };
     validate_provider_name(&input.name)?;
     let provider = DefaultProviderProfile {
         name: input.name.trim().to_string(),
@@ -1236,7 +1219,6 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
     }
 
     write_default_provider_profile(&provider, true)?;
-    write_provider_codex_home_config(&provider, true)?;
 
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
@@ -1250,7 +1232,17 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
     );
     profile.bot = input.bot;
     profile.bot.normalize_for_profile(&profile.name);
-    write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
+
+    if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
+        let path = default_codex_config_path();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = set_top_level_model_config(&content, &provider.model);
+        std::fs::write(path, updated).map_err(|e| e.to_string())?;
+    } else {
+        write_provider_codex_home_config(&provider, true)?;
+        write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
+    }
+
     Ok(profile)
 }
 
@@ -1744,14 +1736,66 @@ fn ensure_trailing_newline(content: &str) -> String {
 pub fn normalize_home_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| trimmed.to_string());
+        return user_home_dir()
+            .map(|home| home.to_string_lossy().to_string())
+            .unwrap_or_else(|| trimmed.to_string());
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest).to_string_lossy().to_string();
+        if let Some(home) = user_home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("~\\") {
+        if let Some(home) = user_home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
         }
     }
     trimmed.to_string()
+}
+
+fn codexl_home_dir() -> PathBuf {
+    std::env::var("CODEXL_HOME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(normalize_home_path(&value)))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                if let Some(app_data) = env_path_without_home_expansion("APPDATA") {
+                    return app_data.join("CodexL");
+                }
+            }
+            user_home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codexl")
+        })
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_path_without_home_expansion("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var("HOMEDRIVE").ok()?;
+                let path = std::env::var("HOMEPATH").ok()?;
+                let combined = format!("{}{}", drive.trim(), path.trim());
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(combined))
+                }
+            })
+            .or_else(|| env_path_without_home_expansion("HOME"))
+    } else {
+        env_path_without_home_expansion("HOME")
+    }
+}
+
+fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn parse_default_provider_profiles(content: &str) -> Vec<DefaultProviderProfile> {
@@ -2429,10 +2473,7 @@ fn is_uuid_like(value: &str) -> bool {
 
 fn new_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_err()
-    {
+    if rand::rngs::OsRng.try_fill_bytes(&mut bytes).is_err() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -2542,7 +2583,7 @@ fn default_provider_profile() -> ProviderProfile {
         base_url: String::new(),
         model: String::new(),
         proxy_url: String::new(),
-        remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+        remote_frontend_mode: default_remote_frontend_mode(),
         remote_web_asset_registry_url: String::new(),
         remote_web_asset_version: "latest".to_string(),
         codex_home: default_codex_home(),
@@ -2563,12 +2604,30 @@ fn default_provider_profile() -> ProviderProfile {
         if !model.is_empty() {
             profile.model = model;
         }
+        if profile.provider_name.is_empty() && !profile.model.is_empty() {
+            if let Some(default_profile) = parse_default_provider_profiles(&content)
+                .into_iter()
+                .find(|item| item.model == profile.model)
+            {
+                profile.codex_profile_name = default_profile.name;
+                profile.provider_name = default_profile.provider_name;
+                profile.base_url = default_profile.base_url;
+            }
+        }
         if !profile.model.is_empty() && profile.provider_name.is_empty() {
             profile.provider_name = "default".to_string();
         }
     }
 
     profile
+}
+
+fn default_remote_frontend_mode() -> String {
+    if cfg!(windows) {
+        REMOTE_FRONTEND_MODE_CLI.to_string()
+    } else {
+        REMOTE_FRONTEND_MODE_APP.to_string()
+    }
 }
 
 fn is_default_provider(profile: &ProviderProfile) -> bool {

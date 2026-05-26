@@ -4679,9 +4679,30 @@ fn home_directory() -> PathBuf {
 }
 
 fn home_directory_opt() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    if cfg!(windows) {
+        env_path_without_home_expansion("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var("HOMEDRIVE").ok()?;
+                let path = std::env::var("HOMEPATH").ok()?;
+                let combined = format!("{}{}", drive.trim(), path.trim());
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(combined))
+                }
+            })
+            .or_else(|| env_path_without_home_expansion("HOME"))
+    } else {
+        env_path_without_home_expansion("HOME")
+    }
+}
+
+fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 fn cli_frontend_compat_endpoint_response(
@@ -4710,7 +4731,9 @@ fn cli_frontend_compat_endpoint_response(
         "get-configuration" => Some(json!({ "value": Value::Null })),
         "get-copilot-api-proxy-info" => Some(Value::Null),
         "home-directory" => Some(json!({
-            "homeDirectory": std::env::var("HOME").unwrap_or_default(),
+            "homeDirectory": home_directory_opt()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default(),
         })),
         "inbox-items" => Some(json!({ "items": [] })),
         "is-copilot-api-available" => Some(json!(false)),
@@ -5217,8 +5240,8 @@ fn cli_projectless_thread_from_session_meta_line(
 }
 
 fn cli_projectless_workspace_root_for_cwd(cwd: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let workspace_root = Path::new(&home).join("Documents").join("Codex");
+    let home = home_directory_opt()?;
+    let workspace_root = home.join("Documents").join("Codex");
     if cli_is_projectless_cwd_under_root(Path::new(cwd.trim()), &workspace_root) {
         Some(workspace_root)
     } else {
@@ -5311,11 +5334,10 @@ fn create_cli_projectless_thread_cwd(
     directory_name: Option<&str>,
     prompt: &str,
 ) -> Result<Value, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let home = home_directory_opt().ok_or_else(|| "home directory is not set".to_string())?;
     let seconds = now_millis() / 1000;
     let slug_source = directory_name.unwrap_or(prompt);
-    let (cwd, workspace_root) =
-        projectless_thread_paths_for_home(Path::new(&home), slug_source, seconds);
+    let (cwd, workspace_root) = projectless_thread_paths_for_home(&home, slug_source, seconds);
     std::fs::create_dir_all(&cwd).map_err(|err| {
         format!(
             "failed to create projectless Codex session directory {}: {}",

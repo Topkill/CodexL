@@ -160,6 +160,7 @@ fn start_process(
     command
         .arg(&extension.entry_path)
         .current_dir(&extension.root_dir)
+        .env("CODEXL_HOME", super::super::codexl_home_dir())
         .env("GATEWAY_CONFIG_PATH", config_path)
         .env("CODEXL_NEXT_AI_GATEWAY_CONFIG_PATH", config_path)
         .stdin(Stdio::null())

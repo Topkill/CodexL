@@ -4,7 +4,7 @@ pub(crate) mod gateway;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -709,44 +709,48 @@ fn extract_plugin_package_archive(
             spec.name
         ));
     }
-    validate_tar_archive_paths(spec, archive_path)?;
-    run_command(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(extract_dir),
-        &format!("failed to extract {} plugin package", spec.name),
-    )
-}
-
-fn validate_tar_archive_paths(
-    spec: BuiltinNodeExtensionSpec,
-    archive_path: &Path,
-) -> Result<(), String> {
-    let output = Command::new("tar")
-        .arg("-tzf")
-        .arg(archive_path)
-        .output()
-        .map_err(|err| format!("failed to inspect {} plugin package: {}", spec.name, err))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!("failed to inspect {} plugin package", spec.name)
-        } else {
-            format!("failed to inspect {} plugin package: {}", spec.name, stderr)
-        });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for entry in stdout.lines() {
-        if !is_safe_archive_entry(entry) {
+    let file = File::open(archive_path).map_err(|err| {
+        format!(
+            "failed to open {} plugin package {}: {}",
+            spec.name,
+            archive_path.to_string_lossy(),
+            err
+        )
+    })?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|err| format!("failed to read {} plugin package: {}", spec.name, err))?;
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|err| format!("failed to read {} plugin package: {}", spec.name, err))?;
+        let path = archive_entry_path(&entry)?;
+        if !is_safe_archive_entry(&path) {
             return Err(format!(
                 "unsafe path in {} plugin package: {}",
-                spec.name, entry
+                spec.name, path
+            ));
+        }
+        let unpacked = entry.unpack_in(extract_dir).map_err(|err| {
+            format!(
+                "failed to extract {} plugin package entry {}: {}",
+                spec.name, path, err
+            )
+        })?;
+        if !unpacked {
+            return Err(format!(
+                "unsafe path in {} plugin package: {}",
+                spec.name, path
             ));
         }
     }
     Ok(())
+}
+
+fn archive_entry_path<R: std::io::Read>(entry: &tar::Entry<'_, R>) -> Result<String, String> {
+    String::from_utf8(entry.path_bytes().into_owned())
+        .map_err(|_| "archive contains a non-UTF-8 path".to_string())
 }
 
 fn extracted_plugin_root(extract_dir: &Path) -> Result<PathBuf, String> {
@@ -1159,15 +1163,42 @@ fn extract_archive(
             "failed to extract Node.js zip archive",
         )
     } else {
-        run_command(
-            Command::new("tar")
-                .arg("-xzf")
-                .arg(archive_path)
-                .arg("-C")
-                .arg(extract_dir),
-            "failed to extract Node.js tar archive",
-        )
+        extract_tar_gz_archive(archive_path, extract_dir, "Node.js tar archive")
     }
+}
+
+fn extract_tar_gz_archive(
+    archive_path: &Path,
+    extract_dir: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let file = File::open(archive_path).map_err(|err| {
+        format!(
+            "failed to open {} {}: {}",
+            label,
+            archive_path.to_string_lossy(),
+            err
+        )
+    })?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|err| format!("failed to read {}: {}", label, err))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|err| format!("failed to read {}: {}", label, err))?;
+        let path = archive_entry_path(&entry)?;
+        if !is_safe_archive_entry(&path) {
+            return Err(format!("unsafe path in {}: {}", label, path));
+        }
+        let unpacked = entry
+            .unpack_in(extract_dir)
+            .map_err(|err| format!("failed to extract {} entry {}: {}", label, path, err))?;
+        if !unpacked {
+            return Err(format!("unsafe path in {}: {}", label, path));
+        }
+    }
+    Ok(())
 }
 
 fn powershell_executable() -> &'static str {

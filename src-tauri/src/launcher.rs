@@ -1,6 +1,6 @@
 use crate::cli_middleware;
 use crate::config::BotProfileConfig;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 const DEFAULT_MAC_APP_NAMES: &[&str] = &["Codex.app", "OpenAI Codex.app"];
+const DEFAULT_WINDOWS_APP_DIRS: &[&str] = &["Codex", "OpenAI Codex"];
+const DEFAULT_WINDOWS_EXE_NAMES: &[&str] = &["Codex.exe", "OpenAI Codex.exe"];
 
 #[derive(Debug)]
 pub struct CodexLaunch {
@@ -18,6 +20,8 @@ pub struct CodexLaunch {
 pub fn find_codex_app() -> Option<String> {
     if cfg!(target_os = "macos") {
         find_mac_app()
+    } else if cfg!(windows) {
+        find_windows_app()
     } else {
         None
     }
@@ -148,6 +152,11 @@ pub fn stop_codex(child: &mut Child) -> std::io::Result<()> {
         let _ = send_signal("-KILL", &process_group);
     }
 
+    #[cfg(windows)]
+    {
+        let _ = terminate_process_tree(pid);
+    }
+
     child.kill().ok();
     child.wait().ok();
     Ok(())
@@ -194,7 +203,37 @@ pub fn stop_stale_profile_processes(profile_name: &str) -> Result<(), String> {
 
         terminate_pids(pids);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let entries = windows_process_entries()?;
+        let mut pids = BTreeSet::new();
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_codex_app_server_for_profile(&entry.command, profile_name))
+        {
+            pids.insert(entry.pid);
+            if let Some(parent) = entries.iter().find(|parent| {
+                parent.pid == entry.ppid && is_codexl_middleware_command(&parent.command)
+            }) {
+                pids.insert(parent.pid);
+                collect_windows_descendant_pids(&entries, parent.pid, &mut pids);
+            } else {
+                collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+            }
+        }
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_orphaned_codexl_extension_process_windows(entry))
+        {
+            pids.insert(entry.pid);
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        terminate_pids_windows(pids);
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = profile_name;
     }
@@ -232,7 +271,38 @@ pub fn stop_profile_extension_processes(profile_name: &str) -> Result<(), String
 
         terminate_pids(pids);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let entries = windows_process_entries()?;
+        let mut pids = BTreeSet::new();
+        let mut candidate_descendants = BTreeSet::new();
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_codex_app_server_for_profile(&entry.command, profile_name))
+        {
+            collect_windows_descendant_pids(&entries, entry.pid, &mut candidate_descendants);
+        }
+
+        for entry in entries.iter().filter(|entry| {
+            candidate_descendants.contains(&entry.pid)
+                && is_codexl_extension_process(&entry.command)
+        }) {
+            pids.insert(entry.pid);
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_orphaned_codexl_extension_process_windows(entry))
+        {
+            pids.insert(entry.pid);
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        terminate_pids_windows(pids);
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = profile_name;
     }
@@ -255,6 +325,21 @@ pub fn stop_all_extension_processes() -> Result<(), String> {
         }
 
         terminate_pids(pids);
+    }
+    #[cfg(windows)]
+    {
+        let entries = windows_process_entries()?;
+        let mut pids = BTreeSet::new();
+
+        for entry in entries
+            .iter()
+            .filter(|entry| is_codexl_extension_process(&entry.command))
+        {
+            pids.insert(entry.pid);
+            collect_windows_descendant_pids(&entries, entry.pid, &mut pids);
+        }
+
+        terminate_pids_windows(pids);
     }
 
     Ok(())
@@ -283,6 +368,28 @@ fn terminate_pids(mut pids: BTreeSet<u32>) {
     std::thread::sleep(std::time::Duration::from_millis(500));
     for pid in &pids {
         let _ = send_signal("-KILL", &pid.to_string());
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+}
+
+#[cfg(windows)]
+fn terminate_pids_windows(mut pids: BTreeSet<u32>) {
+    pids.remove(&std::process::id());
+    if pids.is_empty() {
+        return;
+    }
+
+    for pid in &pids {
+        let _ = terminate_process_tree(*pid);
     }
 }
 
@@ -392,13 +499,13 @@ fn configure_proxy_env(command: &mut Command, proxy_url: Option<&str>) {
 }
 
 fn find_mac_app() -> Option<String> {
-    let home = std::env::var("HOME").ok();
+    let home = user_home_dir();
     let candidates: Vec<PathBuf> = DEFAULT_MAC_APP_NAMES
         .iter()
         .flat_map(|name| {
             let mut paths = vec![PathBuf::from("/Applications").join(name)];
             if let Some(ref h) = home {
-                paths.push(PathBuf::from(h).join("Applications").join(name));
+                paths.push(h.join("Applications").join(name));
             }
             paths
         })
@@ -412,6 +519,112 @@ fn find_mac_app() -> Option<String> {
         }
     }
     None
+}
+
+fn find_windows_app() -> Option<String> {
+    for key in ["CODEXL_CODEX_PATH", "CODEX_APP_PATH"] {
+        if let Some(path) = env_path(key) {
+            if path.is_file() {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    for candidate in windows_app_candidates() {
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn windows_app_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for key in [
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ] {
+        if let Some(path) = env_path(key) {
+            roots.push(path);
+        }
+    }
+    if let Some(home) = user_home_dir() {
+        roots.push(home.join("AppData").join("Local"));
+        roots.push(home.join("AppData").join("Roaming"));
+    }
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        let install_roots = [
+            root.clone(),
+            root.join("Programs"),
+            root.join("Programs").join("OpenAI"),
+        ];
+        for install_root in install_roots {
+            for dir_name in DEFAULT_WINDOWS_APP_DIRS {
+                for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
+                    candidates.push(install_root.join(dir_name).join(exe_name));
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(expand_home_path)
+}
+
+fn expand_home_path(value: String) -> PathBuf {
+    let trimmed = value.trim();
+    if trimmed == "~" {
+        return user_home_dir().unwrap_or_else(|| PathBuf::from(trimmed));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = user_home_dir() {
+            return home.join(rest);
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("~\\") {
+        if let Some(home) = user_home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_path_without_home_expansion("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var("HOMEDRIVE").ok()?;
+                let path = std::env::var("HOMEPATH").ok()?;
+                let combined = format!("{}{}", drive.trim(), path.trim());
+                if combined.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(combined))
+                }
+            })
+            .or_else(|| env_path_without_home_expansion("HOME"))
+    } else {
+        env_path_without_home_expansion("HOME")
+    }
+}
+
+fn env_path_without_home_expansion(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(unix)]
@@ -464,15 +677,90 @@ fn collect_descendant_pids(entries: &[ProcessEntry], root_pid: u32, pids: &mut B
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct WindowsProcessEntry {
+    pid: u32,
+    ppid: u32,
+    command: String,
+}
+
+#[cfg(windows)]
+fn windows_process_entries() -> Result<Vec<WindowsProcessEntry>, String> {
+    let script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress";
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|err| format!("failed to inspect running processes: {}", err))?;
+    if !output.status.success() {
+        return Err("failed to inspect running processes".to_string());
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse running processes: {}", err))?;
+    let mut entries = Vec::new();
+    match &value {
+        serde_json::Value::Array(items) => {
+            entries.extend(items.iter().filter_map(parse_windows_process_entry));
+        }
+        serde_json::Value::Object(_) => {
+            if let Some(entry) = parse_windows_process_entry(&value) {
+                entries.push(entry);
+            }
+        }
+        _ => {}
+    }
+    Ok(entries)
+}
+
+#[cfg(windows)]
+fn parse_windows_process_entry(value: &serde_json::Value) -> Option<WindowsProcessEntry> {
+    let pid = value.get("ProcessId")?.as_u64()? as u32;
+    let ppid = value
+        .get("ParentProcessId")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as u32;
+    let command = value
+        .get("CommandLine")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(WindowsProcessEntry { pid, ppid, command })
+}
+
+#[cfg(windows)]
+fn collect_windows_descendant_pids(
+    entries: &[WindowsProcessEntry],
+    root_pid: u32,
+    pids: &mut BTreeSet<u32>,
+) {
+    let mut frontier = vec![root_pid];
+    while let Some(parent_pid) = frontier.pop() {
+        for entry in entries.iter().filter(|entry| entry.ppid == parent_pid) {
+            if pids.insert(entry.pid) {
+                frontier.push(entry.pid);
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn is_codex_app_server_for_profile(command: &str, profile_name: &str) -> bool {
     (command.contains(" app-server")
         && command_matches_profile(command, profile_name)
-        && command.contains(".app/Contents/Resources/codex"))
+        && command_looks_like_codex_app_server(command))
         || is_claude_code_app_server_for_profile(command, profile_name)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn command_looks_like_codex_app_server(command: &str) -> bool {
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains(".app/contents/resources/codex")
+        || normalized.contains("codex.exe")
+        || normalized.split_whitespace().any(|token| token == "codex")
+}
+
+#[cfg(any(unix, windows))]
 fn command_matches_profile(command: &str, profile_name: &str) -> bool {
     command.contains(&format!("profile=\"{}\"", profile_name))
         || command.contains(&format!("profile='{}'", profile_name))
@@ -481,36 +769,42 @@ fn command_matches_profile(command: &str, profile_name: &str) -> bool {
             .any(|token| token == format!("profile={}", profile_name))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_codexl_middleware_command(command: &str) -> bool {
     (command.contains("--codexl-cli-middleware") && command.contains("app-server"))
         || command.contains("--codexl-claude-code-app-server")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_claude_code_app_server_for_profile(command: &str, profile_name: &str) -> bool {
     command.contains("--codexl-claude-code-app-server")
-        && command.contains(&format!("--workspace-name {}", profile_name))
+        && (command.contains(&format!("--workspace-name {}", profile_name))
+            || command.contains(&format!("--workspace-name \"{}\"", profile_name))
+            || command.contains(&format!("--workspace-name '{}'", profile_name)))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_bot_gateway_stdio_command(command: &str) -> bool {
-    command.contains("/bot-gateway/") && command.contains("/stdio/stdio.js")
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/bot-gateway/") && normalized.contains("/stdio/stdio.js")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_next_ai_gateway_command(command: &str) -> bool {
-    command.contains("/next-ai-gateway/") && command.contains("/gateway/start.js")
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/next-ai-gateway/") && normalized.contains("/gateway/start.js")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_bot_media_mcp_command(command: &str) -> bool {
     command.contains("--codexl-bot-media-mcp")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_codexl_extension_process(command: &str) -> bool {
-    command.contains("/.codexl/extensions/")
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/.codexl/extensions/")
+        || normalized.contains("/codexl/extensions/")
         || is_bot_gateway_stdio_command(command)
         || is_next_ai_gateway_command(command)
         || is_bot_media_mcp_command(command)
@@ -519,6 +813,11 @@ fn is_codexl_extension_process(command: &str) -> bool {
 #[cfg(unix)]
 fn is_orphaned_codexl_extension_process(entry: &ProcessEntry) -> bool {
     entry.ppid == 1 && is_codexl_extension_process(&entry.command)
+}
+
+#[cfg(windows)]
+fn is_orphaned_codexl_extension_process_windows(entry: &WindowsProcessEntry) -> bool {
+    entry.ppid <= 4 && is_codexl_extension_process(&entry.command)
 }
 
 fn executable_from_app_bundle(app_path: &Path) -> Option<String> {
@@ -553,10 +852,22 @@ fn executable_from_app_bundle(app_path: &Path) -> Option<String> {
 
 fn bundled_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
     let executable = PathBuf::from(codex_app_executable);
-    let contents_dir = executable.parent()?.parent()?;
     let file_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let candidate = contents_dir.join("Resources").join(file_name);
-    candidate.is_file().then_some(candidate)
+    let mut candidates = Vec::new();
+
+    if cfg!(windows) {
+        if let Some(app_dir) = executable.parent() {
+            candidates.push(app_dir.join("resources").join(file_name));
+            candidates.push(app_dir.join("Resources").join(file_name));
+        }
+    }
+
+    if let Some(contents_dir) = executable.parent().and_then(|parent| parent.parent()) {
+        candidates.push(contents_dir.join("Resources").join(file_name));
+        candidates.push(contents_dir.join("resources").join(file_name));
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 fn read_bundle_executable(info_path: &Path) -> Option<String> {

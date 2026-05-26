@@ -471,6 +471,7 @@ version = "1.0.8"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "futures-util",
  "http-body-util",
  "hyper",
@@ -481,6 +482,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

@@ -388,10 +388,7 @@ pub(super) fn web_cache_resource_paths(
         &mut paths,
         &web_path_with_query(WEB_BRIDGE_SCRIPT_PATH, None),
     );
-    push_web_cache_path(
-        &mut paths,
-        &web_plugin_runtime_script_src(),
-    );
+    push_web_cache_path(&mut paths, &web_plugin_runtime_script_src());
 
     for resource in resources {
         if resource.url.starts_with("data:") || resource.is_main_frame {
