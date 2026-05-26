@@ -19,6 +19,7 @@ import {
   ExternalLink,
   FolderOpen,
   Globe,
+  ImageIcon,
   Languages,
   LayoutDashboard,
   LockKeyhole,
@@ -43,6 +44,7 @@ import {
   Sun,
   Terminal,
   Trash2,
+  Wrench,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -586,16 +588,76 @@ type GatewayProviderForm = {
   models: string;
   raw: JsonObject;
 };
+type GatewayMcpServerTransport = "stdio" | "websocket";
+type GatewayMcpServerForm = {
+  id: string;
+  name: string;
+  transport: GatewayMcpServerTransport;
+  command: string;
+  args: string;
+  cwd: string;
+  url: string;
+  headersJson: string;
+  envJson: string;
+  apiKey: string;
+  apiKeyEnv: string;
+  protocolVersion: string;
+  startupTimeoutMs: string;
+  requestTimeoutMs: string;
+  raw: JsonObject;
+};
+type GatewayVirtualToolVisibility = "internal" | "client";
+type GatewayVirtualBaseModelMode = "request" | "fixed" | "strip_prefix" | "strip_suffix";
+type GatewayVirtualToolForm = {
+  id: string;
+  name: string;
+  description: string;
+  visibility: GatewayVirtualToolVisibility;
+  inputSchemaJson: string;
+  raw: JsonObject;
+};
+type GatewayVirtualProfileForm = {
+  id: string;
+  profileId: string;
+  key: string;
+  displayName: string;
+  description: string;
+  enabled: boolean;
+  exactAliases: string;
+  prefixes: string;
+  suffixes: string;
+  baseModelMode: GatewayVirtualBaseModelMode;
+  fixedModel: string;
+  matchMultimodal: boolean;
+  matchWebSearch: boolean;
+  maxTurns: string;
+  maxToolCalls: string;
+  clientToolsPolicy: "allow" | "deny";
+  includeInGatewayModels: boolean;
+  tools: GatewayVirtualToolForm[];
+  raw: JsonObject;
+};
 type GatewayConfigForm = {
   host: string;
   port: string;
   providers: GatewayProviderForm[];
+  mcpServers: GatewayMcpServerForm[];
+  virtualModelProfiles: GatewayVirtualProfileForm[];
   rawConfig: JsonObject;
 };
 type GatewayProviderDialogState = {
   mode: "add" | "edit";
   provider: GatewayProviderForm;
 };
+type GatewayMcpServerDialogState = {
+  mode: "add" | "edit";
+  server: GatewayMcpServerForm;
+};
+type GatewayVirtualProfileDialogState = {
+  mode: "add" | "edit";
+  profile: GatewayVirtualProfileForm;
+};
+type GatewaySettingsTab = "providers" | "mcp" | "tools";
 
 type ProviderForm = {
   workspaceName: string;
@@ -893,6 +955,44 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     addProvider: t("gateway.addProvider"),
     editProvider: t("gateway.editProvider"),
     providerDialogDescription: t("gateway.providerDialogDescription"),
+    mcpServers: t("gateway.mcpServers"),
+    addMcpServer: t("gateway.addMcpServer"),
+    editMcpServer: t("gateway.editMcpServer"),
+    mcpServerDialogDescription: t("gateway.mcpServerDialogDescription"),
+    transport: t("gateway.transport"),
+    command: t("gateway.command"),
+    args: t("gateway.args"),
+    cwd: t("gateway.cwd"),
+    url: t("gateway.url"),
+    envJson: t("gateway.envJson"),
+    headersJson: t("gateway.headersJson"),
+    apiKeyEnv: t("gateway.apiKeyEnv"),
+    protocolVersion: t("gateway.protocolVersion"),
+    startupTimeoutMs: t("gateway.startupTimeoutMs"),
+    requestTimeoutMs: t("gateway.requestTimeoutMs"),
+    toolInjection: t("gateway.toolInjection"),
+    virtualModelProfiles: t("gateway.virtualModelProfiles"),
+    addVirtualProfile: t("gateway.addVirtualProfile"),
+    editVirtualProfile: t("gateway.editVirtualProfile"),
+    virtualProfileDialogDescription: t("gateway.virtualProfileDialogDescription"),
+    profileKey: t("gateway.profileKey"),
+    description: t("gateway.descriptionField"),
+    enabled: t("gateway.enabled"),
+    exactAliases: t("gateway.exactAliases"),
+    prefixes: t("gateway.prefixes"),
+    suffixes: t("gateway.suffixes"),
+    baseModelMode: t("gateway.baseModelMode"),
+    fixedModel: t("gateway.fixedModel"),
+    matchMultimodal: t("gateway.matchMultimodal"),
+    matchWebSearch: t("gateway.matchWebSearch"),
+    maxTurns: t("gateway.maxTurns"),
+    maxToolCalls: t("gateway.maxToolCalls"),
+    clientToolsPolicy: t("gateway.clientToolsPolicy"),
+    includeInGatewayModels: t("gateway.includeInGatewayModels"),
+    tools: t("gateway.tools"),
+    addTool: t("gateway.addTool"),
+    visibility: t("gateway.visibility"),
+    inputSchemaJson: t("gateway.inputSchemaJson"),
     reload: t("actions.reload"),
     updateIdle: t("updates.idle"),
     updateCurrent: t("updates.current"),
@@ -3746,6 +3846,10 @@ function GatewaySettingsPanel({
   onChange: React.Dispatch<React.SetStateAction<GatewayConfigForm | null>>;
 }) {
   const [providerDialog, setProviderDialog] = useState<GatewayProviderDialogState | null>(null);
+  const [mcpServerDialog, setMcpServerDialog] = useState<GatewayMcpServerDialogState | null>(null);
+  const [virtualProfileDialog, setVirtualProfileDialog] =
+    useState<GatewayVirtualProfileDialogState | null>(null);
+  const [activeGatewayTab, setActiveGatewayTab] = useState<GatewaySettingsTab>("providers");
 
   if (!form) {
     return (
@@ -3785,6 +3889,44 @@ function GatewaySettingsPanel({
           }
         : current,
     );
+  const openAddMcpServerDialog = () =>
+    setMcpServerDialog({
+      mode: "add",
+      server: createGatewayMcpServerForm(),
+    });
+  const openEditMcpServerDialog = (server: GatewayMcpServerForm) =>
+    setMcpServerDialog({
+      mode: "edit",
+      server: cloneGatewayMcpServerForm(server),
+    });
+  const updateDialogMcpServer = (patch: Partial<GatewayMcpServerForm>) =>
+    setMcpServerDialog((current) =>
+      current
+        ? {
+            ...current,
+            server: { ...current.server, ...patch },
+          }
+        : current,
+    );
+  const openAddVirtualProfileDialog = () =>
+    setVirtualProfileDialog({
+      mode: "add",
+      profile: createGatewayVirtualProfileForm(),
+    });
+  const openEditVirtualProfileDialog = (profile: GatewayVirtualProfileForm) =>
+    setVirtualProfileDialog({
+      mode: "edit",
+      profile: cloneGatewayVirtualProfileForm(profile),
+    });
+  const updateDialogVirtualProfile = (patch: Partial<GatewayVirtualProfileForm>) =>
+    setVirtualProfileDialog((current) =>
+      current
+        ? {
+            ...current,
+            profile: { ...current.profile, ...patch },
+          }
+        : current,
+    );
   const saveProviderDialog = () => {
     if (!providerDialog) return;
 
@@ -3808,6 +3950,61 @@ function GatewaySettingsPanel({
     });
     setProviderDialog(null);
   };
+  const saveMcpServerDialog = () => {
+    if (!mcpServerDialog) return;
+
+    const nextServer = cloneGatewayMcpServerForm(mcpServerDialog.server);
+    onChange((current) => {
+      if (!current) return current;
+
+      if (mcpServerDialog.mode === "add") {
+        return {
+          ...current,
+          mcpServers: [...current.mcpServers, nextServer],
+        };
+      }
+
+      return {
+        ...current,
+        mcpServers: current.mcpServers.map((server) =>
+          server.id === nextServer.id ? nextServer : server,
+        ),
+      };
+    });
+    setMcpServerDialog(null);
+  };
+  const saveVirtualProfileDialog = () => {
+    if (!virtualProfileDialog) return;
+
+    const nextProfile = cloneGatewayVirtualProfileForm(virtualProfileDialog.profile);
+    onChange((current) => {
+      if (!current) return current;
+
+      if (virtualProfileDialog.mode === "add") {
+        return {
+          ...current,
+          virtualModelProfiles: [...current.virtualModelProfiles, nextProfile],
+        };
+      }
+
+      return {
+        ...current,
+        virtualModelProfiles: current.virtualModelProfiles.map((profile) =>
+          profile.id === nextProfile.id ? nextProfile : profile,
+        ),
+      };
+    });
+    setVirtualProfileDialog(null);
+  };
+  const gatewayTabs: Array<{
+    value: GatewaySettingsTab;
+    label: string;
+    icon: React.ReactNode;
+  }> = [
+    { value: "providers", label: strings.providers, icon: <Cpu className="h-4 w-4" /> },
+    { value: "mcp", label: strings.mcpServers, icon: <Server className="h-4 w-4" /> },
+    { value: "tools", label: strings.toolInjection, icon: <Wrench className="h-4 w-4" /> },
+  ];
 
   return (
     <div className="max-w-5xl space-y-6">
@@ -3829,7 +4026,34 @@ function GatewaySettingsPanel({
         </div>
       </section>
 
-      <section className="space-y-3">
+      <div
+        className="inline-flex max-w-full flex-wrap gap-1 rounded-md border border-border bg-muted/10 p-1"
+        role="tablist"
+        aria-label={strings.gateway}
+      >
+        {gatewayTabs.map((tab) => {
+          const active = activeGatewayTab === tab.value;
+          return (
+            <button
+              key={tab.value}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              className={cn(
+                "inline-flex h-9 items-center gap-2 rounded px-3 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground",
+                active && "bg-background text-foreground shadow-xs",
+              )}
+              onClick={() => setActiveGatewayTab(tab.value)}
+            >
+              {tab.icon}
+              <span>{tab.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {activeGatewayTab === "providers" ? (
+        <section className="space-y-3">
         <div className="flex items-center justify-between gap-3">
           <SectionTitle icon={<Cpu className="h-4 w-4" />} title={strings.providers} />
           <Button type="button" variant="outline" size="sm" onClick={openAddProviderDialog}>
@@ -3868,7 +4092,113 @@ function GatewaySettingsPanel({
             </div>
           )}
         </div>
-      </section>
+        </section>
+      ) : null}
+
+      {activeGatewayTab === "mcp" ? (
+        <section className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <SectionTitle icon={<Server className="h-4 w-4" />} title={strings.mcpServers} />
+          <Button type="button" variant="outline" size="sm" onClick={openAddMcpServerDialog}>
+            <Plus className="h-4 w-4" />
+            {strings.addMcpServer}
+          </Button>
+        </div>
+        <div className="space-y-3">
+          {form.mcpServers.length > 0 ? (
+            form.mcpServers.map((server) => (
+              <div key={server.id} className="rounded-md border border-border bg-muted/10 px-3 py-3">
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.8fr)_120px_minmax(0,1.4fr)]">
+                    <GatewayProviderSummaryField label={strings.name} value={server.name || strings.none} />
+                    <GatewayProviderSummaryField label={strings.transport} value={server.transport} />
+                    <GatewayProviderSummaryField
+                      label={server.transport === "websocket" ? strings.url : strings.command}
+                      value={gatewayMcpServerTarget(server) || strings.none}
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    <IconButton title={strings.editMcpServer} onClick={() => openEditMcpServerDialog(server)}>
+                      <Pencil className="h-4 w-4" />
+                    </IconButton>
+                    <IconButton
+                      title={strings.delete}
+                      className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
+                      onClick={() => update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) })}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </IconButton>
+                  </div>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+              {strings.none}
+            </div>
+          )}
+        </div>
+        </section>
+      ) : null}
+
+      {activeGatewayTab === "tools" ? (
+        <section className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <SectionTitle icon={<Wrench className="h-4 w-4" />} title={strings.toolInjection} />
+          <Button type="button" variant="outline" size="sm" onClick={openAddVirtualProfileDialog}>
+            <Plus className="h-4 w-4" />
+            {strings.addVirtualProfile}
+          </Button>
+        </div>
+        <div className="space-y-3">
+          {form.virtualModelProfiles.length > 0 ? (
+            form.virtualModelProfiles.map((profile) => (
+              <div key={profile.id} className="rounded-md border border-border bg-muted/10 px-3 py-3">
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)_minmax(0,1fr)]">
+                    <GatewayProviderSummaryField
+                      label={strings.displayName}
+                      value={profile.displayName || strings.none}
+                    />
+                    <GatewayProviderSummaryField
+                      label={strings.suffixes}
+                      value={profile.suffixes || profile.prefixes || profile.exactAliases || strings.none}
+                    />
+                    <GatewayProviderSummaryField
+                      label={strings.tools}
+                      value={profile.tools.map((tool) => tool.name).filter(Boolean).join(", ") || strings.none}
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    <IconButton
+                      title={strings.editVirtualProfile}
+                      onClick={() => openEditVirtualProfileDialog(profile)}
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </IconButton>
+                    <IconButton
+                      title={strings.delete}
+                      className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
+                      onClick={() =>
+                        update({
+                          virtualModelProfiles: form.virtualModelProfiles.filter((item) => item.id !== profile.id),
+                        })
+                      }
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </IconButton>
+                  </div>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+              {strings.none}
+            </div>
+          )}
+        </div>
+        </section>
+      ) : null}
 
       <Dialog open={providerDialog !== null} onOpenChange={(open) => !open && setProviderDialog(null)}>
         {providerDialog ? (
@@ -3887,6 +4217,63 @@ function GatewaySettingsPanel({
                 {strings.cancel}
               </Button>
               <Button type="button" onClick={saveProviderDialog}>
+                {strings.save}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+
+      <Dialog open={mcpServerDialog !== null} onOpenChange={(open) => !open && setMcpServerDialog(null)}>
+        {mcpServerDialog ? (
+          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>
+                {mcpServerDialog.mode === "add" ? strings.addMcpServer : strings.editMcpServer}
+              </DialogTitle>
+              <DialogDescription className="sr-only">{strings.mcpServerDialogDescription}</DialogDescription>
+            </DialogHeader>
+            <GatewayMcpServerEditor
+              server={mcpServerDialog.server}
+              strings={strings}
+              onChange={updateDialogMcpServer}
+            />
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setMcpServerDialog(null)}>
+                {strings.cancel}
+              </Button>
+              <Button type="button" onClick={saveMcpServerDialog}>
+                {strings.save}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+
+      <Dialog
+        open={virtualProfileDialog !== null}
+        onOpenChange={(open) => !open && setVirtualProfileDialog(null)}
+      >
+        {virtualProfileDialog ? (
+          <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>
+                {virtualProfileDialog.mode === "add"
+                  ? strings.addVirtualProfile
+                  : strings.editVirtualProfile}
+              </DialogTitle>
+              <DialogDescription className="sr-only">{strings.virtualProfileDialogDescription}</DialogDescription>
+            </DialogHeader>
+            <GatewayVirtualProfileEditor
+              profile={virtualProfileDialog.profile}
+              strings={strings}
+              onChange={updateDialogVirtualProfile}
+            />
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setVirtualProfileDialog(null)}>
+                {strings.cancel}
+              </Button>
+              <Button type="button" onClick={saveVirtualProfileDialog}>
                 {strings.save}
               </Button>
             </DialogFooter>
@@ -3956,6 +4343,338 @@ function GatewayProviderEditor({
           onChange={(event) => onChange({ models: event.target.value })}
         />
       </Field>
+    </div>
+  );
+}
+
+const gatewayTextareaClassName =
+  "min-h-24 w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono leading-relaxed shadow-xs outline-none transition-[color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50";
+
+function GatewayMcpServerEditor({
+  server,
+  strings,
+  onChange,
+}: {
+  server: GatewayMcpServerForm;
+  strings: AppStrings;
+  onChange: (patch: Partial<GatewayMcpServerForm>) => void;
+}) {
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label={strings.name}>
+          <Input autoFocus value={server.name} onChange={(event) => onChange({ name: event.target.value })} />
+        </Field>
+        <Field label={strings.transport}>
+          <Select
+            value={server.transport}
+            onValueChange={(value) => onChange({ transport: value === "websocket" ? "websocket" : "stdio" })}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="stdio">stdio</SelectItem>
+              <SelectItem value="websocket">websocket</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+      </div>
+
+      {server.transport === "websocket" ? (
+        <>
+          <Field label={strings.url}>
+            <Input value={server.url} onChange={(event) => onChange({ url: event.target.value })} />
+          </Field>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label={strings.apiKey}>
+              <Input
+                type="password"
+                value={server.apiKey}
+                onChange={(event) => onChange({ apiKey: event.target.value })}
+              />
+            </Field>
+            <Field label={strings.apiKeyEnv}>
+              <Input value={server.apiKeyEnv} onChange={(event) => onChange({ apiKeyEnv: event.target.value })} />
+            </Field>
+          </div>
+          <Field label={strings.headersJson}>
+            <textarea
+              className={gatewayTextareaClassName}
+              spellCheck={false}
+              value={server.headersJson}
+              onChange={(event) => onChange({ headersJson: event.target.value })}
+            />
+          </Field>
+        </>
+      ) : (
+        <>
+          <Field label={strings.command}>
+            <Input value={server.command} onChange={(event) => onChange({ command: event.target.value })} />
+          </Field>
+          <Field label={strings.args}>
+            <Input
+              value={server.args}
+              placeholder="-y, @modelcontextprotocol/server-filesystem, ."
+              onChange={(event) => onChange({ args: event.target.value })}
+            />
+          </Field>
+          <Field label={strings.cwd}>
+            <Input value={server.cwd} onChange={(event) => onChange({ cwd: event.target.value })} />
+          </Field>
+          <Field label={strings.envJson}>
+            <textarea
+              className={gatewayTextareaClassName}
+              spellCheck={false}
+              value={server.envJson}
+              onChange={(event) => onChange({ envJson: event.target.value })}
+            />
+          </Field>
+        </>
+      )}
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label={strings.protocolVersion}>
+          <Input
+            value={server.protocolVersion}
+            onChange={(event) => onChange({ protocolVersion: event.target.value })}
+          />
+        </Field>
+        <Field label={strings.startupTimeoutMs}>
+          <Input
+            inputMode="numeric"
+            value={server.startupTimeoutMs}
+            onChange={(event) => onChange({ startupTimeoutMs: event.target.value })}
+          />
+        </Field>
+        <Field label={strings.requestTimeoutMs}>
+          <Input
+            inputMode="numeric"
+            value={server.requestTimeoutMs}
+            onChange={(event) => onChange({ requestTimeoutMs: event.target.value })}
+          />
+        </Field>
+      </div>
+    </div>
+  );
+}
+
+function GatewayVirtualProfileEditor({
+  profile,
+  strings,
+  onChange,
+}: {
+  profile: GatewayVirtualProfileForm;
+  strings: AppStrings;
+  onChange: (patch: Partial<GatewayVirtualProfileForm>) => void;
+}) {
+  const updateTool = (toolId: string, patch: Partial<GatewayVirtualToolForm>) =>
+    onChange({
+      tools: profile.tools.map((tool) => (tool.id === toolId ? { ...tool, ...patch } : tool)),
+    });
+  const addTool = () =>
+    onChange({
+      tools: [...profile.tools, createGatewayVirtualToolForm()],
+    });
+  const deleteTool = (toolId: string) =>
+    onChange({
+      tools: profile.tools.filter((tool) => tool.id !== toolId),
+    });
+
+  return (
+    <div className="grid gap-5">
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/10 px-3 py-2.5">
+        <div className="text-sm font-medium">{strings.enabled}</div>
+        <Switch checked={profile.enabled} onCheckedChange={(checked) => onChange({ enabled: checked })} />
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label={strings.profileKey}>
+          <Input autoFocus value={profile.key} onChange={(event) => onChange({ key: event.target.value })} />
+        </Field>
+        <Field label={strings.displayName}>
+          <Input
+            value={profile.displayName}
+            onChange={(event) => onChange({ displayName: event.target.value })}
+          />
+        </Field>
+      </div>
+      <Field label={strings.description}>
+        <Input value={profile.description} onChange={(event) => onChange({ description: event.target.value })} />
+      </Field>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label={strings.exactAliases}>
+          <Input value={profile.exactAliases} onChange={(event) => onChange({ exactAliases: event.target.value })} />
+        </Field>
+        <Field label={strings.prefixes}>
+          <Input value={profile.prefixes} onChange={(event) => onChange({ prefixes: event.target.value })} />
+        </Field>
+        <Field label={strings.suffixes}>
+          <Input
+            value={profile.suffixes}
+            placeholder=":vision-search"
+            onChange={(event) => onChange({ suffixes: event.target.value })}
+          />
+        </Field>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label={strings.baseModelMode}>
+          <Select
+            value={profile.baseModelMode}
+            onValueChange={(value) =>
+              onChange({ baseModelMode: normalizeGatewayVirtualBaseModelMode(value) })
+            }
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="strip_suffix">strip_suffix</SelectItem>
+              <SelectItem value="strip_prefix">strip_prefix</SelectItem>
+              <SelectItem value="request">request</SelectItem>
+              <SelectItem value="fixed">fixed</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field label={strings.fixedModel}>
+          <Input value={profile.fixedModel} onChange={(event) => onChange({ fixedModel: event.target.value })} />
+        </Field>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <GatewaySwitchField
+          label={strings.matchMultimodal}
+          checked={profile.matchMultimodal}
+          onCheckedChange={(checked) => onChange({ matchMultimodal: checked })}
+        />
+        <GatewaySwitchField
+          label={strings.matchWebSearch}
+          checked={profile.matchWebSearch}
+          onCheckedChange={(checked) => onChange({ matchWebSearch: checked })}
+        />
+        <GatewaySwitchField
+          label={strings.includeInGatewayModels}
+          checked={profile.includeInGatewayModels}
+          onCheckedChange={(checked) => onChange({ includeInGatewayModels: checked })}
+        />
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label={strings.maxTurns}>
+          <Input
+            inputMode="numeric"
+            value={profile.maxTurns}
+            onChange={(event) => onChange({ maxTurns: event.target.value })}
+          />
+        </Field>
+        <Field label={strings.maxToolCalls}>
+          <Input
+            inputMode="numeric"
+            value={profile.maxToolCalls}
+            onChange={(event) => onChange({ maxToolCalls: event.target.value })}
+          />
+        </Field>
+        <Field label={strings.clientToolsPolicy}>
+          <Select
+            value={profile.clientToolsPolicy}
+            onValueChange={(value) => onChange({ clientToolsPolicy: value === "deny" ? "deny" : "allow" })}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="allow">allow</SelectItem>
+              <SelectItem value="deny">deny</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <SectionTitle icon={<ImageIcon className="h-4 w-4" />} title={strings.tools} />
+          <Button type="button" variant="outline" size="sm" onClick={addTool}>
+            <Plus className="h-4 w-4" />
+            {strings.addTool}
+          </Button>
+        </div>
+        <div className="space-y-3">
+          {profile.tools.map((tool) => (
+            <div key={tool.id} className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_150px_auto]">
+                <Field label={strings.name}>
+                  <Input value={tool.name} onChange={(event) => updateTool(tool.id, { name: event.target.value })} />
+                </Field>
+                <Field label={strings.visibility}>
+                  <Select
+                    value={tool.visibility}
+                    onValueChange={(value) =>
+                      updateTool(tool.id, { visibility: value === "client" ? "client" : "internal" })
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="internal">internal</SelectItem>
+                      <SelectItem value="client">client</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Field>
+                <div className="flex items-end justify-end">
+                  <IconButton
+                    title={strings.delete}
+                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
+                    onClick={() => deleteTool(tool.id)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </IconButton>
+                </div>
+              </div>
+              <div className="mt-3 grid gap-3">
+                <Field label={strings.description}>
+                  <Input
+                    value={tool.description}
+                    onChange={(event) => updateTool(tool.id, { description: event.target.value })}
+                  />
+                </Field>
+                <Field label={strings.inputSchemaJson}>
+                  <textarea
+                    className={gatewayTextareaClassName}
+                    spellCheck={false}
+                    value={tool.inputSchemaJson}
+                    onChange={(event) => updateTool(tool.id, { inputSchemaJson: event.target.value })}
+                  />
+                </Field>
+              </div>
+            </div>
+          ))}
+          {profile.tools.length === 0 ? (
+            <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+              {strings.none}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GatewaySwitchField({
+  label,
+  checked,
+  onCheckedChange,
+}: {
+  label: string;
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="flex min-h-10 items-center justify-between gap-3 rounded-md border border-border bg-muted/10 px-3 py-2">
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <Switch checked={checked} onCheckedChange={onCheckedChange} />
     </div>
   );
 }
@@ -6626,11 +7345,18 @@ function extensionDescription(extension: BuiltinExtensionStatus, strings: AppStr
 
 function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
   const config = file.config || {};
+  const agent = objectValue(config.agent);
   return {
     host: stringValue(config.host, "127.0.0.1"),
     port: numberString(config.port, "14589"),
     providers: arrayValue(config.Providers ?? config.providers).map((item) =>
       gatewayProviderFormFromRaw(objectValue(item)),
+    ),
+    mcpServers: arrayValue(agent.mcpServers).map((item) =>
+      gatewayMcpServerFormFromRaw(objectValue(item)),
+    ),
+    virtualModelProfiles: arrayValue(config.virtualModelProfiles).map((item) =>
+      gatewayVirtualProfileFormFromRaw(objectValue(item)),
     ),
     rawConfig: config,
   };
@@ -6639,6 +7365,7 @@ function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
 function gatewayModelsFromConfig(config: JsonObject): string[] {
   const seen = new Set<string>();
   const models: string[] = [];
+  const baseModels: string[] = [];
   for (const item of arrayValue(config.Providers ?? config.providers)) {
     const provider = objectValue(item);
     const providerName = stringValue(provider.name, "").trim();
@@ -6648,6 +7375,15 @@ function gatewayModelsFromConfig(config: JsonObject): string[] {
         seen.add(option);
         models.push(option);
       }
+      if (option) {
+        baseModels.push(option);
+      }
+    }
+  }
+  for (const model of materializedGatewayVirtualModels(config, baseModels)) {
+    if (model && !seen.has(model)) {
+      seen.add(model);
+      models.push(model);
     }
   }
   return models;
@@ -6720,6 +7456,12 @@ function gatewayConfigFromForm(form: GatewayConfigForm): JsonObject {
   delete config.bodyLimit;
   delete config.providers;
   config.Providers = form.providers.map(gatewayProviderConfigFromForm);
+  const agent = objectValue(config.agent);
+  const storage = objectValue(agent.storage);
+  agent.storage = Object.keys(storage).length > 0 ? storage : { type: "filesystem" };
+  agent.mcpServers = form.mcpServers.map(gatewayMcpServerConfigFromForm);
+  config.agent = agent;
+  config.virtualModelProfiles = form.virtualModelProfiles.map(gatewayVirtualProfileConfigFromForm);
 
   return config;
 }
@@ -6737,12 +7479,327 @@ function gatewayProviderConfigFromForm(provider: GatewayProviderForm): JsonObjec
   return raw;
 }
 
+function gatewayMcpServerFormFromRaw(raw: JsonObject): GatewayMcpServerForm {
+  const transport = stringValue(raw.transport, "stdio") === "websocket" ? "websocket" : "stdio";
+  return {
+    id: newLocalId(),
+    name: stringValue(raw.name, ""),
+    transport,
+    command: stringValue(raw.command, ""),
+    args: stringListText(raw.args),
+    cwd: stringValue(raw.cwd, ""),
+    url: stringValue(raw.url, ""),
+    headersJson: jsonText(objectValue(raw.headers)),
+    envJson: jsonText(objectValue(raw.env)),
+    apiKey: stringValue(raw.apiKey, ""),
+    apiKeyEnv: stringValue(raw.apiKeyEnv, ""),
+    protocolVersion: stringValue(raw.protocolVersion, "2024-11-05"),
+    startupTimeoutMs: numberString(raw.startupTimeoutMs, "10000"),
+    requestTimeoutMs: numberString(raw.requestTimeoutMs, "30000"),
+    raw,
+  };
+}
+
+function createGatewayMcpServerForm(): GatewayMcpServerForm {
+  return {
+    id: newLocalId(),
+    name: "",
+    transport: "stdio",
+    command: "npx",
+    args: "-y, @modelcontextprotocol/server-filesystem, .",
+    cwd: "",
+    url: "",
+    headersJson: "{}",
+    envJson: "{}",
+    apiKey: "",
+    apiKeyEnv: "",
+    protocolVersion: "2024-11-05",
+    startupTimeoutMs: "10000",
+    requestTimeoutMs: "30000",
+    raw: {},
+  };
+}
+
+function cloneGatewayMcpServerForm(server: GatewayMcpServerForm): GatewayMcpServerForm {
+  return {
+    ...server,
+    raw: cloneJsonObject(server.raw),
+  };
+}
+
+function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObject {
+  const raw = cloneJsonObject(server.raw);
+  raw.name = server.name.trim();
+  raw.transport = server.transport;
+  raw.protocolVersion = server.protocolVersion.trim() || "2024-11-05";
+  raw.startupTimeoutMs = integerValue(server.startupTimeoutMs, 10000);
+  raw.requestTimeoutMs = integerValue(server.requestTimeoutMs, 30000);
+
+  if (server.transport === "websocket") {
+    raw.url = server.url.trim();
+    raw.headers = jsonObjectFromText(server.headersJson, "Headers JSON");
+    raw.apiKey = server.apiKey.trim();
+    raw.apiKeyEnv = server.apiKeyEnv.trim();
+    delete raw.command;
+    delete raw.args;
+    delete raw.env;
+    delete raw.cwd;
+    delete raw.stdioMessageMode;
+    return raw;
+  }
+
+  raw.command = server.command.trim();
+  raw.args = stringListFromText(server.args, "Args");
+  raw.env = jsonObjectFromText(server.envJson, "Env JSON");
+  if (server.cwd.trim()) {
+    raw.cwd = server.cwd.trim();
+  } else {
+    delete raw.cwd;
+  }
+  delete raw.url;
+  delete raw.headers;
+  delete raw.apiKey;
+  delete raw.apiKeyEnv;
+  return raw;
+}
+
+function gatewayMcpServerTarget(server: GatewayMcpServerForm): string {
+  return server.transport === "websocket" ? server.url : [server.command, server.args].filter(Boolean).join(" ");
+}
+
+function gatewayVirtualProfileFormFromRaw(raw: JsonObject): GatewayVirtualProfileForm {
+  const match = objectValue(raw.match);
+  const baseModel = objectValue(raw.baseModel);
+  const execution = objectValue(raw.execution);
+  const materialization = objectValue(raw.materialization);
+  const key = stringValue(raw.key, "");
+  return {
+    id: newLocalId(),
+    profileId: stringValue(raw.id, key),
+    key,
+    displayName: stringValue(raw.displayName, key),
+    description: stringValue(raw.description, ""),
+    enabled: booleanValue(raw.enabled, true),
+    exactAliases: stringListText(match.exactAliases),
+    prefixes: stringListText(match.prefixes),
+    suffixes: stringListText(match.suffixes),
+    baseModelMode: normalizeGatewayVirtualBaseModelMode(stringValue(baseModel.mode, "request")),
+    fixedModel: stringValue(baseModel.fixedModel, ""),
+    matchMultimodal: booleanValue(execution.matchMultimodal ?? execution.match_multimodal, false),
+    matchWebSearch: booleanValue(
+      execution.matchWebSearch ?? execution.match_web_search ?? execution.matchWebsearch,
+      false,
+    ),
+    maxTurns: numberString(execution.maxTurns, "6"),
+    maxToolCalls: numberString(execution.maxToolCalls, "8"),
+    clientToolsPolicy: stringValue(execution.clientToolsPolicy, "allow") === "deny" ? "deny" : "allow",
+    includeInGatewayModels: booleanValue(materialization.includeInGatewayModels, true),
+    tools: arrayValue(raw.tools).map((item) => gatewayVirtualToolFormFromRaw(objectValue(item))),
+    raw,
+  };
+}
+
+function createGatewayVirtualProfileForm(): GatewayVirtualProfileForm {
+  return {
+    id: newLocalId(),
+    profileId: "vision-search",
+    key: "vision-search",
+    displayName: "Vision + Web Search",
+    description: "Inject image/file references and web search through internal MCP tools.",
+    enabled: true,
+    exactAliases: "",
+    prefixes: "",
+    suffixes: ":vision-search",
+    baseModelMode: "strip_suffix",
+    fixedModel: "",
+    matchMultimodal: true,
+    matchWebSearch: true,
+    maxTurns: "6",
+    maxToolCalls: "8",
+    clientToolsPolicy: "allow",
+    includeInGatewayModels: true,
+    tools: [createGatewayVirtualToolForm("understand_image"), createGatewayVirtualToolForm("web_search")],
+    raw: {},
+  };
+}
+
+function cloneGatewayVirtualProfileForm(profile: GatewayVirtualProfileForm): GatewayVirtualProfileForm {
+  return {
+    ...profile,
+    tools: profile.tools.map(cloneGatewayVirtualToolForm),
+    raw: cloneJsonObject(profile.raw),
+  };
+}
+
+function gatewayVirtualProfileConfigFromForm(profile: GatewayVirtualProfileForm): JsonObject {
+  const raw = cloneJsonObject(profile.raw);
+  const key = profile.key.trim() || profile.profileId.trim() || "vision-search";
+  raw.id = key;
+  raw.key = key;
+  raw.displayName = profile.displayName.trim() || key;
+  raw.description = profile.description.trim();
+  raw.enabled = profile.enabled;
+  raw.match = {
+    exactAliases: stringListFromText(profile.exactAliases, "Exact Aliases"),
+    prefixes: stringListFromText(profile.prefixes, "Prefixes"),
+    suffixes: stringListFromText(profile.suffixes, "Suffixes"),
+  };
+  const baseModel = objectValue(raw.baseModel);
+  baseModel.mode = profile.baseModelMode;
+  if (profile.fixedModel.trim()) {
+    baseModel.fixedModel = profile.fixedModel.trim();
+  } else {
+    delete baseModel.fixedModel;
+  }
+  raw.baseModel = baseModel;
+  const execution = objectValue(raw.execution);
+  execution.mode = "tool_loop";
+  execution.maxTurns = integerValue(profile.maxTurns, 6);
+  execution.maxToolCalls = integerValue(profile.maxToolCalls, 8);
+  execution.clientToolsPolicy = profile.clientToolsPolicy;
+  execution.matchMultimodal = profile.matchMultimodal;
+  execution.matchWebSearch = profile.matchWebSearch;
+  raw.execution = execution;
+  const materialization = objectValue(raw.materialization);
+  materialization.enabled = true;
+  materialization.includeInGatewayModels = profile.includeInGatewayModels;
+  raw.materialization = materialization;
+  raw.tools = profile.tools.map(gatewayVirtualToolConfigFromForm).filter((tool) => stringValue(tool.name, ""));
+  return raw;
+}
+
+function gatewayVirtualToolFormFromRaw(raw: JsonObject): GatewayVirtualToolForm {
+  return {
+    id: newLocalId(),
+    name: stringValue(raw.name, ""),
+    description: stringValue(raw.description, ""),
+    visibility: stringValue(raw.visibility, "internal") === "client" ? "client" : "internal",
+    inputSchemaJson: jsonText(objectValue(raw.inputSchema ?? raw.input_schema ?? raw.parameters)),
+    raw,
+  };
+}
+
+function createGatewayVirtualToolForm(name = ""): GatewayVirtualToolForm {
+  const inputSchema =
+    name === "understand_image"
+      ? {
+          type: "object",
+          properties: {
+            image: { type: "string" },
+            question: { type: "string" },
+          },
+          required: ["image"],
+        }
+      : name === "web_search"
+        ? {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+            },
+            required: ["query"],
+          }
+        : { type: "object", additionalProperties: true };
+  return {
+    id: newLocalId(),
+    name,
+    description:
+      name === "understand_image"
+        ? "Analyze an image or file referenced by media_ref."
+        : name === "web_search"
+          ? "Search the web."
+          : "",
+    visibility: "internal",
+    inputSchemaJson: jsonText(inputSchema),
+    raw: {},
+  };
+}
+
+function cloneGatewayVirtualToolForm(tool: GatewayVirtualToolForm): GatewayVirtualToolForm {
+  return {
+    ...tool,
+    raw: cloneJsonObject(tool.raw),
+  };
+}
+
+function gatewayVirtualToolConfigFromForm(tool: GatewayVirtualToolForm): JsonObject {
+  const raw = cloneJsonObject(tool.raw);
+  raw.name = tool.name.trim();
+  raw.description = tool.description.trim();
+  raw.visibility = tool.visibility;
+  raw.inputSchema = jsonObjectFromText(tool.inputSchemaJson, "Input Schema JSON");
+  delete raw.input_schema;
+  delete raw.parameters;
+  return raw;
+}
+
+function normalizeGatewayVirtualBaseModelMode(value: string): GatewayVirtualBaseModelMode {
+  if (value === "fixed" || value === "strip_prefix" || value === "strip_suffix") {
+    return value;
+  }
+  return "request";
+}
+
+function materializedGatewayVirtualModels(config: JsonObject, baseModels: string[]): string[] {
+  const result: string[] = [];
+  for (const item of arrayValue(config.virtualModelProfiles)) {
+    const profile = objectValue(item);
+    if (!booleanValue(profile.enabled, true)) {
+      continue;
+    }
+    const materialization = objectValue(profile.materialization);
+    if (
+      !booleanValue(materialization.enabled, true) ||
+      !booleanValue(materialization.includeInGatewayModels, true)
+    ) {
+      continue;
+    }
+    const match = objectValue(profile.match);
+    const prefixes = stringListFromUnknown(match.prefixes);
+    const suffixes = stringListFromUnknown(match.suffixes);
+    for (const baseModel of baseModels) {
+      const slashIndex = baseModel.indexOf("/");
+      if (slashIndex < 0) {
+        continue;
+      }
+      const provider = baseModel.slice(0, slashIndex);
+      const model = baseModel.slice(slashIndex + 1);
+      for (const prefix of prefixes) {
+        result.push(`${provider}/${prefix}${model}`);
+      }
+      for (const suffix of suffixes) {
+        result.push(`${provider}/${model}${suffix}`);
+      }
+    }
+    const baseModel = objectValue(profile.baseModel);
+    const fixedModel = stringValue(baseModel.fixedModel, "").trim();
+    if (!fixedModel) {
+      continue;
+    }
+    for (const alias of stringListFromUnknown(match.exactAliases)) {
+      result.push(alias.includes("/") ? alias : gatewayModelOption(fixedModel.split("/")[0] || "", alias));
+    }
+  }
+  return result;
+}
+
 function objectValue(value: unknown): JsonObject {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
 }
 
 function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return fallback;
 }
 
 function stringValue(value: unknown, fallback: string): string {
@@ -6766,6 +7823,59 @@ function commaList(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function stringListText(value: unknown): string {
+  return stringListFromUnknown(value).join(", ");
+}
+
+function stringListFromUnknown(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => stringValue(item, "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return commaList(value);
+  }
+  return [];
+}
+
+function stringListFromText(value: string, label: string): string[] {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+  if (trimmed.startsWith("[")) {
+    const parsed = parseJsonText(trimmed, label);
+    if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+      throw new Error(`${label} must be a JSON string array.`);
+    }
+    return parsed.map((item) => item.trim()).filter(Boolean);
+  }
+  return commaList(value);
+}
+
+function jsonText(value: unknown): string {
+  return JSON.stringify(objectValue(value), null, 2);
+}
+
+function jsonObjectFromText(value: string, label: string): JsonObject {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return {};
+  }
+  const parsed = parseJsonText(trimmed, label);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object.`);
+  }
+  return parsed as JsonObject;
+}
+
+function parseJsonText(value: string, label: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    throw new Error(`${label} has invalid JSON: ${errorMessage(error)}`);
+  }
 }
 
 function cloneJsonObject(value: JsonObject): JsonObject {

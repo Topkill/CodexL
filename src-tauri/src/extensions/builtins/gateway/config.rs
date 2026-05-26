@@ -139,6 +139,74 @@ pub fn gateway_model_options_from_config(config: &Value) -> Vec<String> {
         }
     }
 
+    for model in gateway_virtual_model_options_from_config(config, &models) {
+        push_unique_model(&mut models, &model);
+    }
+
+    models
+}
+
+fn gateway_virtual_model_options_from_config(
+    config: &Value,
+    base_models: &[String],
+) -> Vec<String> {
+    let mut models = Vec::new();
+    let Some(profiles) = config.get("virtualModelProfiles").and_then(Value::as_array) else {
+        return models;
+    };
+
+    for profile in profiles {
+        if !json_bool(profile.get("enabled"), true) {
+            continue;
+        }
+        let materialization = profile.get("materialization");
+        if !json_bool(materialization.and_then(|value| value.get("enabled")), true)
+            || !json_bool(
+                materialization.and_then(|value| value.get("includeInGatewayModels")),
+                true,
+            )
+        {
+            continue;
+        }
+
+        let match_config = profile.get("match");
+        let prefixes = string_list(match_config.and_then(|value| value.get("prefixes")));
+        let suffixes = string_list(match_config.and_then(|value| value.get("suffixes")));
+        for base_model in base_models {
+            let Some((provider, model)) = base_model.split_once('/') else {
+                continue;
+            };
+            for prefix in &prefixes {
+                push_unique_model(&mut models, &format!("{}/{}{}", provider, prefix, model));
+            }
+            for suffix in &suffixes {
+                push_unique_model(&mut models, &format!("{}/{}{}", provider, model, suffix));
+            }
+        }
+
+        let fixed_model = profile
+            .get("baseModel")
+            .and_then(|value| value.get("fixedModel"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if fixed_model.is_empty() {
+            continue;
+        }
+        let fixed_provider = fixed_model
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .unwrap_or_default();
+        for alias in string_list(match_config.and_then(|value| value.get("exactAliases"))) {
+            let option = if alias.contains('/') {
+                alias
+            } else {
+                gateway_model_option(fixed_provider, &alias)
+            };
+            push_unique_model(&mut models, &option);
+        }
+    }
+
     models
 }
 
@@ -195,6 +263,29 @@ fn comma_list(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+        Some(Value::String(items)) => comma_list(items),
+        _ => Vec::new(),
+    }
+}
+
+fn json_bool(value: Option<&Value>, fallback: bool) -> bool {
+    match value {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("true") => true,
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("false") => false,
+        _ => fallback,
+    }
 }
 
 fn push_unique_model(models: &mut Vec<String>, model: &str) {
@@ -384,5 +475,48 @@ mod tests {
         assert_eq!(model["supports_image_detail_original"], json!(true));
         assert_eq!(model["supports_search_tool"], json!(true));
         assert_eq!(model["web_search_tool_type"], json!("text_and_image"));
+    }
+
+    #[test]
+    fn gateway_model_options_materialize_virtual_model_profiles() {
+        let config = json!({
+            "Providers": [
+                {
+                    "name": "openai",
+                    "models": ["gpt-4.1"]
+                }
+            ],
+            "virtualModelProfiles": [
+                {
+                    "id": "vision-search",
+                    "key": "vision-search",
+                    "displayName": "Vision + Search",
+                    "enabled": true,
+                    "match": {
+                        "suffixes": [":vision-search"],
+                        "prefixes": ["vision:"],
+                        "exactAliases": ["openai/search-fixed", "search-fixed-short"]
+                    },
+                    "baseModel": {
+                        "fixedModel": "openai/gpt-4.1"
+                    },
+                    "materialization": {
+                        "enabled": true,
+                        "includeInGatewayModels": true
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(
+            gateway_model_options_from_config(&config),
+            vec![
+                "openai/gpt-4.1",
+                "openai/vision:gpt-4.1",
+                "openai/gpt-4.1:vision-search",
+                "openai/search-fixed",
+                "openai/search-fixed-short",
+            ]
+        );
     }
 }
