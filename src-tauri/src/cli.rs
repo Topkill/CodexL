@@ -648,7 +648,7 @@ fn default_registry_url() -> String {
         .ok()
         .map(|value| normalize_registry_url(&value))
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://codexl-codex-app-web.pages.dev".to_string())
+        .unwrap_or_else(|| "https://web.codexl.io".to_string())
 }
 
 fn config_path_display() -> String {

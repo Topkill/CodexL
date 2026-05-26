@@ -259,7 +259,7 @@ const BOT_PLATFORM_SPECS: readonly BotPlatformSpec[] = [
 const BOT_PLATFORM_OPTIONS = BOT_PLATFORM_SPECS.map(({ value, label }) => ({ value, label }));
 const NEXT_AI_GATEWAY_PROVIDER_NAME = "next-ai-gateway";
 const WORKSPACE_PROVIDER_NONE_VALUE = "__workspace_provider_none__";
-const DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL = "https://codexl-codex-app-web.pages.dev";
+const DEFAULT_CODEX_WEB_ASSET_REGISTRY_URL = "https://web.codexl.io";
 const DEFAULT_CODEX_WEB_ASSET_VERSION = "latest";
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 

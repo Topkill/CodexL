@@ -104,13 +104,13 @@ fn codex_model_catalog_item(model: &str, priority: usize) -> Value {
         "web_search_tool_type": "text_and_image",
         "truncation_policy": { "mode": "tokens", "limit": 10000 },
         "supports_parallel_tool_calls": true,
-        "supports_image_detail_original": false,
+        "supports_image_detail_original": true,
         "context_window": 128000,
         "max_context_window": 128000,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
-        "supports_search_tool": false
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": true
     })
 }
 
@@ -370,4 +370,19 @@ fn default_gateway_config() -> Value {
             "enabled": false
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_gateway_model_catalog_advertises_image_and_search_capabilities() {
+        let model = codex_model_catalog_item("Provider/model", 0);
+
+        assert_eq!(model["input_modalities"], json!(["text", "image"]));
+        assert_eq!(model["supports_image_detail_original"], json!(true));
+        assert_eq!(model["supports_search_tool"], json!(true));
+        assert_eq!(model["web_search_tool_type"], json!("text_and_image"));
+    }
 }

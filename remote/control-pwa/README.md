@@ -83,7 +83,7 @@ Then configure the desktop app or its launch environment with the hosted base
 URL. The version defaults to `latest`:
 
 ```sh
-CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL=https://codexl-codex-app-web.pages.dev
+CODEXL_REMOTE_WEB_ASSET_REGISTRY_URL=https://web.codexl.io
 CODEXL_REMOTE_WEB_ASSET_VERSION=latest
 ```
 
