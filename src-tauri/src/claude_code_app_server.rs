@@ -6577,12 +6577,13 @@ where
                         .active_processes
                         .remove(&(work.thread_id.clone(), work.turn_id.clone()));
                 }
+                let agent_item_streamed = !emitted_text.is_empty();
                 return ClaudeRunResult {
                     text: emitted_text,
                     error: Some(format!("failed to read Claude Code stdout: {}", err)),
                     duration_ms: elapsed_millis(started),
                     tool_items: Vec::new(),
-                    agent_item_streamed: !emitted_text.is_empty(),
+                    agent_item_streamed,
                 };
             }
         }
@@ -6620,6 +6621,7 @@ where
         );
     }
 
+    let agent_item_streamed = !emitted_text.is_empty();
     let duration_ms = elapsed_millis(started);
     match status {
         Ok(status) => {
@@ -6642,7 +6644,7 @@ where
                     error: None,
                     duration_ms,
                     tool_items: Vec::new(),
-                    agent_item_streamed: !emitted_text.is_empty(),
+                    agent_item_streamed,
                 }
             } else {
                 ClaudeRunResult {
@@ -6657,7 +6659,7 @@ where
                     )),
                     duration_ms,
                     tool_items: Vec::new(),
-                    agent_item_streamed: !emitted_text.is_empty(),
+                    agent_item_streamed,
                 }
             }
         }
@@ -6676,7 +6678,7 @@ where
                 error: Some(format!("failed to wait for Claude Code: {}", err)),
                 duration_ms,
                 tool_items: Vec::new(),
-                agent_item_streamed: !emitted_text.is_empty(),
+                agent_item_streamed,
             }
         }
     }
