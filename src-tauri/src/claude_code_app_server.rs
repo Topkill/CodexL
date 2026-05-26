@@ -482,9 +482,81 @@ fn claude_message_log_summary(message: &Value) -> Value {
                 json!(claude_permission_server_name(message)),
             );
         }
+        Some("system") => {
+            if let Some(map) = message.as_object() {
+                summary.insert(
+                    "keys".to_string(),
+                    json!(map.keys().cloned().collect::<Vec<_>>()),
+                );
+            }
+            for key in ["subtype", "session_id", "model", "cwd"] {
+                if let Some(value) = message.get(key).and_then(Value::as_str) {
+                    summary.insert(key.to_string(), json!(value));
+                }
+            }
+            if let Some(preview) =
+                first_non_empty_string_at(message, &["/message", "/content", "/error"])
+            {
+                summary.insert(
+                    "preview".to_string(),
+                    json!(log_text_preview(&preview, 300)),
+                );
+            }
+            if let Some(tools) = message.get("tools").and_then(Value::as_array) {
+                summary.insert("toolCount".to_string(), json!(tools.len()));
+                summary.insert(
+                    "toolNames".to_string(),
+                    json!(tools
+                        .iter()
+                        .filter_map(|tool| first_non_empty_string_at(
+                            tool,
+                            &["/name", "/tool_name"]
+                        ))
+                        .take(50)
+                        .collect::<Vec<_>>()),
+                );
+            }
+            let mcp_servers = message
+                .get("mcp_servers")
+                .or_else(|| message.get("mcpServers"));
+            if let Some(mcp_servers) = mcp_servers {
+                summary.insert(
+                    "mcpServers".to_string(),
+                    claude_system_mcp_servers_log_summary(mcp_servers),
+                );
+            }
+        }
         _ => {}
     }
     Value::Object(summary)
+}
+
+fn claude_system_mcp_servers_log_summary(value: &Value) -> Value {
+    match value {
+        Value::Array(servers) => json!(servers
+            .iter()
+            .map(|server| {
+                json!({
+                    "name": first_non_empty_string_at(server, &["/name", "/server_name", "/serverName"]),
+                    "status": first_non_empty_string_at(server, &["/status", "/state"]),
+                    "error": first_non_empty_string_at(server, &["/error", "/message"])
+                        .map(|value| log_text_preview(&value, 300)),
+                })
+            })
+            .collect::<Vec<_>>()),
+        Value::Object(servers) => json!(servers
+            .iter()
+            .map(|(name, server)| {
+                json!({
+                    "name": name,
+                    "status": first_non_empty_string_at(server, &["/status", "/state"]),
+                    "error": first_non_empty_string_at(server, &["/error", "/message"])
+                        .map(|value| log_text_preview(&value, 300)),
+                })
+            })
+            .collect::<Vec<_>>()),
+        _ => log_request_params_summary(value),
+    }
 }
 
 fn claude_content_type_summary(content: &Value) -> Value {
@@ -532,6 +604,7 @@ pub fn run_mcp_metadata_relay(args: Vec<OsString>) -> Result<i32, String> {
             "args": &options.args,
         }),
     );
+    maybe_launch_computer_use_service(&options);
     let mut command = Command::new(&options.command);
     command
         .args(&options.args)
@@ -550,10 +623,7 @@ pub fn run_mcp_metadata_relay(args: Vec<OsString>) -> Result<i32, String> {
         .take()
         .ok_or_else(|| "failed to capture MCP metadata relay child stdout".to_string())?;
     let stdout_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(child_stdout);
-        let mut stdout = std::io::stdout();
-        let _ = std::io::copy(&mut reader, &mut stdout);
-        let _ = stdout.flush();
+        forward_mcp_child_stdout(child_stdout);
     });
 
     let mut stdin = BufReader::new(std::io::stdin());
@@ -590,6 +660,100 @@ pub fn run_mcp_metadata_relay(args: Vec<OsString>) -> Result<i32, String> {
     Ok(status
         .code()
         .unwrap_or(if status.success() { 0 } else { 1 }))
+}
+
+fn forward_mcp_child_stdout<R>(child_stdout: R)
+where
+    R: Read,
+{
+    let mut reader = BufReader::new(child_stdout);
+    let mut stdout = std::io::stdout();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if stdout
+                    .write_all(&line)
+                    .and_then(|_| stdout.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_launch_computer_use_service(options: &McpMetadataRelayOptions) {
+    maybe_launch_computer_use_service_path(
+        &options.server_name,
+        &options.thread_id,
+        &options.turn_id,
+        &options.command,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_launch_computer_use_service_for_command(
+    server_name: &str,
+    work: &TurnWork,
+    command: &str,
+) {
+    maybe_launch_computer_use_service_path(server_name, &work.thread_id, &work.turn_id, command);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn maybe_launch_computer_use_service_for_command(
+    _server_name: &str,
+    _work: &TurnWork,
+    _command: &str,
+) {
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_launch_computer_use_service_path(
+    server_name: &str,
+    thread_id: &str,
+    turn_id: &str,
+    command: &str,
+) {
+    let Some(app_path) = computer_use_service_app_from_client_command(command) else {
+        return;
+    };
+    let result = Command::new("open").arg(&app_path).status();
+    claude_code_log_event(
+        "computer_use_service_launch",
+        json!({
+            "serverName": server_name,
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "appPath": app_path.to_string_lossy(),
+            "success": result.as_ref().map(|status| status.success()).unwrap_or(false),
+            "status": result
+                .as_ref()
+                .ok()
+                .map(|status| status.to_string()),
+            "error": result.err().map(|err| err.to_string()),
+        }),
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn maybe_launch_computer_use_service(_options: &McpMetadataRelayOptions) {}
+
+#[cfg(target_os = "macos")]
+fn computer_use_service_app_from_client_command(command: &str) -> Option<PathBuf> {
+    Path::new(command)
+        .ancestors()
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("Codex Computer Use.app")
+        })
+        .map(Path::to_path_buf)
+        .filter(|path| path.is_dir())
 }
 
 fn parse_mcp_metadata_relay_options(
@@ -2111,19 +2275,19 @@ fn standalone_mcp_server_status_list() -> Vec<Value> {
         .collect()
 }
 
-fn claude_code_capability_args(work: &TurnWork) -> Vec<String> {
+fn claude_code_capability_args(work: &TurnWork, launch_services: bool) -> Vec<String> {
     if is_claude_title_generation_prompt(&work.prompt) {
         return Vec::new();
     }
     let mut args = Vec::new();
-    if let Some(mcp_config) = claude_code_mcp_config_json(work) {
+    if let Some(mcp_config) = claude_code_mcp_config_json(work, launch_services) {
         args.push("--mcp-config".to_string());
         args.push(mcp_config);
     }
     args
 }
 
-fn claude_code_mcp_config_json(work: &TurnWork) -> Option<String> {
+fn claude_code_mcp_config_json(work: &TurnWork, launch_services: bool) -> Option<String> {
     let mut mcp_servers = serde_json::Map::new();
     for server in standalone_mcp_server_status_list() {
         if server.get("enabled").and_then(Value::as_bool) == Some(false) {
@@ -2157,7 +2321,9 @@ fn claude_code_mcp_config_json(work: &TurnWork) -> Option<String> {
             config.insert("env".to_string(), env.clone());
         }
         let claude_name = claude_code_mcp_server_name(name, &mcp_servers);
-        if claude_code_mcp_server_requires_metadata_relay(name, command) {
+        if claude_code_mcp_server_is_computer_use(name, command) {
+            configure_computer_use_mcp_server(&mut config, work, &claude_name, launch_services);
+        } else if claude_code_mcp_server_requires_metadata_relay(name, command) {
             wrap_mcp_server_with_metadata_relay(&mut config, work, &claude_name);
         }
         mcp_servers.insert(claude_name, Value::Object(config));
@@ -2169,7 +2335,7 @@ fn claude_code_mcp_config_json(work: &TurnWork) -> Option<String> {
 }
 
 fn claude_code_mcp_config_log_summary(work: &TurnWork) -> Value {
-    let Some(config) = claude_code_mcp_config_json(work) else {
+    let Some(config) = claude_code_mcp_config_json(work, false) else {
         return json!({
             "injected": false,
             "servers": [],
@@ -2207,9 +2373,27 @@ fn claude_code_mcp_config_log_summary(work: &TurnWork) -> Value {
     })
 }
 
-fn claude_code_mcp_server_requires_metadata_relay(name: &str, command: &str) -> bool {
+fn claude_code_mcp_server_is_computer_use(name: &str, command: &str) -> bool {
     let lower_name = name.trim().to_ascii_lowercase();
     lower_name == "computer-use" || command.contains("SkyComputerUseClient")
+}
+
+fn claude_code_mcp_server_requires_metadata_relay(_name: &str, _command: &str) -> bool {
+    false
+}
+
+fn configure_computer_use_mcp_server(
+    config: &mut serde_json::Map<String, Value>,
+    work: &TurnWork,
+    server_name: &str,
+    launch_service: bool,
+) {
+    add_claude_code_mcp_turn_env(config, work);
+    if launch_service {
+        if let Some(command) = config.get("command").and_then(Value::as_str) {
+            maybe_launch_computer_use_service_for_command(server_name, work, command);
+        }
+    }
 }
 
 fn wrap_mcp_server_with_metadata_relay(
@@ -2261,6 +2445,10 @@ fn wrap_mcp_server_with_metadata_relay(
         "args".to_string(),
         Value::Array(args.into_iter().map(Value::String).collect()),
     );
+    add_claude_code_mcp_turn_env(config, work);
+}
+
+fn add_claude_code_mcp_turn_env(config: &mut serde_json::Map<String, Value>, work: &TurnWork) {
     let mut env = config
         .get("env")
         .and_then(Value::as_object)
@@ -5233,31 +5421,38 @@ fn claude_control_response_for_permission(
     request_id: &str,
     approval: &Value,
 ) -> Value {
+    let mut permission_response = serde_json::Map::new();
     if codex_permission_response_allows(approval) {
-        let mut response = serde_json::Map::new();
-        response.insert("behavior".to_string(), json!("allow"));
+        permission_response.insert("behavior".to_string(), json!("allow"));
         if let Some(input) = claude_permission_request_input(message) {
-            response.insert("updatedInput".to_string(), input.clone());
+            permission_response.insert("updatedInput".to_string(), input.clone());
         }
-        json!({
-            "type": "control_response",
-            "request_id": request_id,
-            "response": Value::Object(response),
-        })
     } else {
-        claude_control_response_denied(request_id, "Denied in Codex App")
+        permission_response.insert("behavior".to_string(), json!("deny"));
+        permission_response.insert("message".to_string(), json!("Denied in Codex App"));
     }
+    claude_control_response_success(request_id, Value::Object(permission_response))
+}
+
+fn claude_control_response_success(request_id: &str, response: Value) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": response,
+        },
+    })
 }
 
 fn claude_control_response_denied(request_id: &str, message: &str) -> Value {
-    json!({
-        "type": "control_response",
-        "request_id": request_id,
-        "response": {
+    claude_control_response_success(
+        request_id,
+        json!({
             "behavior": "deny",
             "message": message,
-        },
-    })
+        }),
+    )
 }
 
 fn codex_permission_response_allows(response: &Value) -> bool {
@@ -7100,7 +7295,7 @@ fn claude_command(work: &TurnWork) -> Command {
             .arg("--permission-prompt-tool")
             .arg(permission_prompt_tool);
     }
-    for arg in claude_code_capability_args(work) {
+    for arg in claude_code_capability_args(work, true) {
         command.arg(arg);
     }
     for arg in env_args(EXTRA_ARGS_ENV, &[]) {
@@ -7632,7 +7827,7 @@ fn claude_command_display(work: &TurnWork) -> String {
         parts.push("--permission-prompt-tool".to_string());
         parts.push(permission_prompt_tool);
     }
-    parts.extend(claude_code_capability_args(work));
+    parts.extend(claude_code_capability_args(work, false));
     parts.extend(env_args(EXTRA_ARGS_ENV, &[]));
     parts
         .into_iter()
@@ -8582,6 +8777,28 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn computer_use_service_app_is_derived_from_client_command() {
+        let root = test_dir("computer-use-service-path");
+        let client = root
+            .join("Codex Computer Use.app")
+            .join("Contents")
+            .join("SharedSupport")
+            .join("SkyComputerUseClient.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("SkyComputerUseClient");
+        std::fs::create_dir_all(client.parent().expect("client parent"))
+            .expect("create client dir");
+
+        let app = computer_use_service_app_from_client_command(&client.to_string_lossy())
+            .expect("service app path");
+
+        assert_eq!(app, root.join("Codex Computer Use.app"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn interrupt_turn_falls_back_to_active_thread_turn() {
         let mut state = ClaudeAppServerState {
@@ -8917,7 +9134,7 @@ args = ["server.js", "--stdio"]
         let command = claude_command_display(&work);
         assert!(!command.contains("--plugin-dir"), "{command}");
         assert!(command.contains("--mcp-config"), "{command}");
-        let mcp_config = claude_code_mcp_config_json(&work).expect("mcp config json");
+        let mcp_config = claude_code_mcp_config_json(&work, false).expect("mcp config json");
         let mcp_config: Value = serde_json::from_str(&mcp_config).expect("parse mcp config");
         let servers = mcp_config
             .get("mcpServers")
@@ -8927,19 +9144,28 @@ args = ["server.js", "--stdio"]
             .get("codex-computer-use")
             .expect("computer use server");
         assert_eq!(
-            computer_use.get("command").and_then(Value::as_str),
-            std::env::current_exe()
-                .ok()
-                .and_then(|path| path.to_str().map(str::to_string))
-                .as_deref()
+            computer_use
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|command| command.ends_with("Computer Use.app/Contents/MacOS/ComputerUse")),
+            Some(true)
         );
-        assert!(computer_use
-            .get("args")
-            .and_then(Value::as_array)
-            .is_some_and(|args| args.iter().any(|arg| {
-                arg.as_str()
-                    == Some(crate::cli_middleware::CLAUDE_CODE_MCP_METADATA_RELAY_RUN_MODE_ARG)
-            })));
+        assert_eq!(
+            computer_use.pointer("/args/0").and_then(Value::as_str),
+            Some("mcp")
+        );
+        assert_eq!(
+            computer_use.pointer("/env/CODEX_SESSION_ID"),
+            Some(&json!("11111111-1111-4111-8111-111111111111"))
+        );
+        assert_eq!(
+            computer_use.pointer("/env/CODEX_TURN_ID"),
+            Some(&json!("turn"))
+        );
+        assert_eq!(
+            computer_use.pointer("/env/CODEX_THREAD_ID"),
+            Some(&json!("thread"))
+        );
         assert!(servers.get("computer-use").is_none());
         let title_command = claude_command_display(&TurnWork {
             thread_id: "title-thread".to_string(),
@@ -9905,17 +10131,25 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             Some("control_response")
         );
         assert_eq!(
-            response.get("request_id").and_then(Value::as_str),
+            response
+                .pointer("/response/request_id")
+                .and_then(Value::as_str),
             Some("perm-1")
         );
         assert_eq!(
             response
-                .pointer("/response/behavior")
+                .pointer("/response/subtype")
+                .and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            response
+                .pointer("/response/response/behavior")
                 .and_then(Value::as_str),
             Some("allow")
         );
         assert_eq!(
-            response.pointer("/response/updatedInput/display"),
+            response.pointer("/response/response/updatedInput/display"),
             Some(&json!(0))
         );
     }

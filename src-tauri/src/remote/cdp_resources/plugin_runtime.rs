@@ -992,7 +992,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "settings-context-10";
+  const RUNTIME_BUILD = "settings-context-11";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -1740,7 +1740,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     };
   }
 
-  function settingsDebugLog(message, detail = {}, level = "info") {
+  function settingsDebugLog(message, detail = {}, level = "info", options = {}) {
     const now = Date.now();
     const key = `${level}:${message}`;
     runtime.settingsDebugSeen ||= Object.create(null);
@@ -1758,6 +1758,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     };
     runtime.settingsDiagnostics.push(entry);
     runtime.settingsDiagnostics.splice(0, Math.max(0, runtime.settingsDiagnostics.length - 50));
+    if (options.emit === false) {
+      return;
+    }
     try {
       const method = level === "warn" ? "warn" : level === "error" ? "error" : "info";
       console[method]("[codexl-settings]", message, detail);
@@ -2197,7 +2200,8 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           hasHeading: hasSettingsHeading(document),
           routeLooksLikeSettings,
         },
-        "warn"
+        "info",
+        { emit: false }
       );
       return null;
     }
@@ -2247,7 +2251,8 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
           documentSignatureScore: settingsMenuSignatureScore(documentSettingsLabels),
           routeLooksLikeSettings,
         },
-        "warn"
+        "info",
+        { emit: false }
       );
     }
     return candidates[0] || null;
@@ -2511,7 +2516,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       settingsDebugLog("CodexL settings nav item already present", {
         item: elementDebugSummary(item),
         nav: elementDebugSummary(nav),
-      });
+      }, "info", { emit: false });
       return item;
     }
     const items = settingsNavItemElements(nav);
@@ -2800,7 +2805,8 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       settingsDebugLog(
         "CodexL settings nav not found",
         getSettingsDiagnostics({ shell, nav }),
-        "warn"
+        "info",
+        { emit: false }
       );
       removeCodexLSettingsInjection();
       return;
@@ -2812,7 +2818,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       labels: Array.from(settingsLabelSet(nav)),
       nav: elementDebugSummary(nav),
       shell: elementDebugSummary(shell),
-    });
+    }, "info", { emit: false });
     updateSettingsUi();
   }
 
