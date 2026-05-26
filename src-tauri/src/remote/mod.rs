@@ -2290,11 +2290,13 @@ impl CliAppBridge {
 
     fn spawn_stdout_reader(self: Arc<Self>, stdout: tokio::process::ChildStdout) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => self.handle_stdout_line(line).await,
-                    Ok(None) => break,
+                line.clear();
+                match reader.read_until(b'\n', &mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => self.handle_stdout_line(&line).await,
                     Err(err) => {
                         eprintln!("Codex CLI app-server stdout failed: {}", err);
                         break;
@@ -2306,8 +2308,8 @@ impl CliAppBridge {
         });
     }
 
-    async fn handle_stdout_line(&self, line: String) {
-        let value = match serde_json::from_str::<Value>(line.trim_end()) {
+    async fn handle_stdout_line(&self, line: &[u8]) {
+        let value = match serde_json::from_slice::<Value>(trim_cli_app_server_stdout_line(line)) {
             Ok(value) => value,
             Err(err) => {
                 eprintln!("Codex CLI app-server emitted invalid JSON: {}", err);
@@ -3522,6 +3524,12 @@ fn json_id_to_string(value: Option<&Value>) -> Option<String> {
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn trim_cli_app_server_stdout_line(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r\n")
+        .or_else(|| line.strip_suffix(b"\n"))
+        .unwrap_or(line)
 }
 
 fn default_cli_initialize_result() -> Value {
@@ -7080,6 +7088,18 @@ mod tests {
         assert_eq!(
             cookie_value("codexl_remote_token_extra=secret", REMOTE_AUTH_COOKIE_NAME),
             None
+        );
+    }
+
+    #[test]
+    fn cli_app_server_stdout_lines_are_trimmed_as_bytes() {
+        assert_eq!(
+            trim_cli_app_server_stdout_line(b"{\"id\":\"one\"}\r\n"),
+            b"{\"id\":\"one\"}"
+        );
+        assert_eq!(
+            trim_cli_app_server_stdout_line(b"{\"id\":\"two\"}\n"),
+            b"{\"id\":\"two\"}"
         );
     }
 
