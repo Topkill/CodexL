@@ -10,7 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::claude_code_app_server;
 use crate::extensions::builtins::bot_bridge;
-use crate::{config::AppConfig, remote};
+use crate::{
+    config::{AppConfig, CodexProfileConfigFormat},
+    remote,
+};
 use serde_json::{json, Map, Value};
 
 const DISABLE_ENV: &str = "CODEXL_DISABLE_CLI_MIDDLEWARE";
@@ -20,6 +23,7 @@ pub const CODEX_PROFILE_ENV: &str = "CODEXL_CODEX_PROFILE";
 pub const CODEX_MODEL_PROVIDER_ENV: &str = "CODEXL_CODEX_MODEL_PROVIDER";
 pub const CODEX_WORKSPACE_NAME_ENV: &str = "CODEXL_CODEX_WORKSPACE_NAME";
 pub const CODEX_CORE_MODE_ENV: &str = "CODEXL_CODEX_CORE_MODE";
+const CODEX_PROFILE_CONFIG_FORMAT_ENV: &str = "CODEXL_CODEX_PROFILE_CONFIG_FORMAT";
 const LEGACY_CODEX_INSTANCE_NAME_ENV: &str = "CODEXL_CODEX_INSTANCE_NAME";
 const CODEX_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
@@ -109,6 +113,8 @@ pub fn prepare(
     let export_stdio_path = stdio_path(stdio_name);
     let default_stdio_path = stdio_path(None);
     let real_cli_path = resolve_real_cli_path(codex_app_executable, &executable_path)?;
+    let profile_config_format =
+        crate::config::codex_profile_config_format_for_cli(&real_cli_path.to_string_lossy());
     let host_executable = std::env::current_exe().map_err(|e| e.to_string())?;
     write_middleware(&executable_path, &host_executable)?;
     let log_path = default_log_path();
@@ -128,6 +134,7 @@ pub fn prepare(
         profile.as_deref(),
         model_provider.as_deref(),
         core_mode.as_deref(),
+        profile_config_format,
     )?;
     if default_stdio_path != export_stdio_path {
         write_stdio_export(
@@ -141,6 +148,7 @@ pub fn prepare(
             profile.as_deref(),
             model_provider.as_deref(),
             core_mode.as_deref(),
+            profile_config_format,
         )?;
     }
     Ok(MiddlewareEnv {
@@ -482,6 +490,7 @@ fn write_stdio_export(
     profile: Option<&str>,
     model_provider: Option<&str>,
     core_mode: Option<&str>,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -497,6 +506,7 @@ fn write_stdio_export(
         profile,
         model_provider,
         core_mode,
+        profile_config_format,
     );
     let should_write = std::fs::read_to_string(path)
         .map(|existing| existing != content)
@@ -566,7 +576,16 @@ where
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let real_args = real_cli_args(profile.as_deref(), model_provider.as_deref(), args);
+    let profile_config_format = crate::config::codex_profile_config_format_from_env()
+        .unwrap_or_else(|| {
+            crate::config::codex_profile_config_format_for_cli(&real_cli.to_string_lossy())
+        });
+    let real_args = real_cli_args(
+        profile.as_deref(),
+        model_provider.as_deref(),
+        profile_config_format,
+        args,
+    );
     log_invocation(
         &real_cli,
         profile.as_deref(),
@@ -667,12 +686,21 @@ fn claude_code_app_server_args() -> Vec<OsString> {
 fn real_cli_args(
     profile: Option<&str>,
     model_provider: Option<&str>,
+    profile_config_format: CodexProfileConfigFormat,
     args: Vec<OsString>,
 ) -> Vec<OsString> {
     let mut real_args = Vec::new();
     if let Some(profile) = profile {
-        real_args.push(OsString::from("-c"));
-        real_args.push(OsString::from(cli_config_string("profile", profile)));
+        match profile_config_format {
+            CodexProfileConfigFormat::SeparateProfileFiles => {
+                real_args.push(OsString::from("--profile"));
+                real_args.push(OsString::from(profile));
+            }
+            CodexProfileConfigFormat::LegacyProfilesTable => {
+                real_args.push(OsString::from("-c"));
+                real_args.push(OsString::from(cli_config_string("profile", profile)));
+            }
+        }
     }
     if let Some(model_provider) = model_provider {
         real_args.push(OsString::from("-c"));
@@ -2349,6 +2377,7 @@ fn stdio_export_script(
     profile: Option<&str>,
     model_provider: Option<&str>,
     core_mode: Option<&str>,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> String {
     let mut script = String::from("@echo off\r\n");
     push_cmd_env(
@@ -2373,6 +2402,11 @@ fn stdio_export_script(
     if let Some(core_mode) = core_mode {
         push_cmd_env(&mut script, CODEX_CORE_MODE_ENV, core_mode);
     }
+    push_cmd_env(
+        &mut script,
+        CODEX_PROFILE_CONFIG_FORMAT_ENV,
+        profile_config_format.env_value(),
+    );
     script.push_str(&format!(
         "\"{}\" {} %*\r\nexit /b %ERRORLEVEL%\r\n",
         host_executable.to_string_lossy(),
@@ -2513,6 +2547,27 @@ printf ':stdin=%s\n' "$first_line"
     }
 
     #[test]
+    fn separate_profile_files_use_profile_flag_for_real_cli() {
+        let args = real_cli_args(
+            Some("test-profile"),
+            Some("test-provider"),
+            CodexProfileConfigFormat::SeparateProfileFiles,
+            vec![OsString::from("app-server")],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--profile"),
+                OsString::from("test-profile"),
+                OsString::from("-c"),
+                OsString::from("model_provider=\"test-provider\""),
+                OsString::from("app-server"),
+            ]
+        );
+    }
+
+    #[test]
     fn detects_app_server_fetch_messages_for_middleware_intercept() {
         let message = app_server_fetch_message_from_line(
             br#"{"type":"fetch","requestId":"voice-1","method":"POST","url":"/transcribe"}"#,
@@ -2563,6 +2618,7 @@ printf ':stdin=%s\n' "$first_line"
             Some("custom-profile"),
             Some("custom-provider"),
             Some("claude-code"),
+            CodexProfileConfigFormat::SeparateProfileFiles,
         );
 
         assert!(script.contains("export CODEX_CLI_PATH='/tmp/codexl-codex-cli-middleware'\n"));
@@ -2575,6 +2631,9 @@ printf ':stdin=%s\n' "$first_line"
         assert!(script.contains("export CODEXL_CODEX_PROFILE='custom-profile'\n"));
         assert!(script.contains("export CODEXL_CODEX_MODEL_PROVIDER='custom-provider'\n"));
         assert!(script.contains("export CODEXL_CODEX_CORE_MODE='claude-code'\n"));
+        assert!(
+            script.contains("export CODEXL_CODEX_PROFILE_CONFIG_FORMAT='separate_profile_files'\n")
+        );
         assert!(script.contains("exec '/tmp/CodexL Host' --codexl-cli-stdio \"$@\"\n"));
     }
 
@@ -3132,6 +3191,7 @@ fn stdio_export_script(
     profile: Option<&str>,
     model_provider: Option<&str>,
     core_mode: Option<&str>,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> String {
     let mut script = String::from("#!/bin/sh\n");
     push_shell_export(
@@ -3156,6 +3216,11 @@ fn stdio_export_script(
     if let Some(core_mode) = core_mode {
         push_shell_export(&mut script, CODEX_CORE_MODE_ENV, core_mode);
     }
+    push_shell_export(
+        &mut script,
+        CODEX_PROFILE_CONFIG_FORMAT_ENV,
+        profile_config_format.env_value(),
+    );
     script.push_str(&format!(
         "exec {} {} \"$@\"\n",
         shell_quote(host_executable),

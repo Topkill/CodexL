@@ -156,6 +156,16 @@ pub async fn launch_codex_instance(
     let mut permission_config = requested_config.clone();
     let executable = resolve_codex_executable(&mut permission_config)?;
     requested_config.codex_path = executable.clone();
+    let cli_executable = launcher::resolve_codex_cli_executable(None, &executable);
+    let profile_config_format = config::codex_profile_config_format_for_cli(&cli_executable);
+    if request.codex_home.is_none() {
+        if let Some(profile) = requested_config.provider_profile(&requested_config.active_provider)
+        {
+            requested_config.codex_home =
+                config::ensure_provider_codex_home_with_format(&profile, profile_config_format)?;
+            requested_config.normalize();
+        }
+    }
     macos::request_automation_permission(&executable)?;
 
     let mut instances = state.instances.lock().await;
@@ -288,7 +298,6 @@ fn apply_launch_request(config: &mut AppConfig, request: &LaunchRequest) -> Resu
         let profile = config
             .provider_profile(profile_name)
             .ok_or_else(|| format!("Provider profile not found: {}", profile_name))?;
-        config.codex_home = config::ensure_provider_codex_home(&profile)?;
         config.active_provider = profile.name;
     }
     if let Some(codex_home) = request.codex_home.as_ref() {

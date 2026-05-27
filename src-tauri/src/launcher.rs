@@ -764,6 +764,9 @@ fn command_looks_like_codex_app_server(command: &str) -> bool {
 fn command_matches_profile(command: &str, profile_name: &str) -> bool {
     command.contains(&format!("profile=\"{}\"", profile_name))
         || command.contains(&format!("profile='{}'", profile_name))
+        || command.contains(&format!("--profile {}", profile_name))
+        || command.contains(&format!("--profile \"{}\"", profile_name))
+        || command.contains(&format!("--profile '{}'", profile_name))
         || command
             .split_whitespace()
             .any(|token| token == format!("profile={}", profile_name))

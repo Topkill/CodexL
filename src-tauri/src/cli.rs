@@ -521,12 +521,17 @@ fn run_codex_command(args: &[String]) -> Result<i32, String> {
         .provider_profile(&profile_name)
         .ok_or_else(|| format!("workspace not found: {}", profile_name))?;
     config.active_provider = profile.name.clone();
-    config.codex_home = config::ensure_provider_codex_home(&profile)?;
-    config.normalize();
 
     let executable = resolve_codex_cli_executable(codex_path.as_deref(), &config)?;
+    let profile_config_format = config::codex_profile_config_format_for_cli(&executable);
+    config.codex_home =
+        config::ensure_provider_codex_home_with_format(&profile, profile_config_format)?;
+    config.normalize();
+
+    let mut real_args = codex_profile_args_for_config(&config, profile_config_format);
+    real_args.extend(forwarded);
     let status = Command::new(&executable)
-        .args(&forwarded)
+        .args(&real_args)
         .env("CODEX_HOME", config.codex_home.clone())
         .status()
         .map_err(|e| format!("failed to run Codex CLI {}: {}", executable, e))?;
@@ -541,6 +546,43 @@ fn resolve_codex_cli_executable(
         explicit_path,
         &config.codex_path,
     ))
+}
+
+fn codex_profile_args_for_config(
+    config: &AppConfig,
+    profile_config_format: config::CodexProfileConfigFormat,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(profile) = config.active_cli_profile() {
+        match profile_config_format {
+            config::CodexProfileConfigFormat::SeparateProfileFiles => {
+                args.push("--profile".to_string());
+                args.push(profile);
+            }
+            config::CodexProfileConfigFormat::LegacyProfilesTable => {
+                args.push("-c".to_string());
+                args.push(cli_config_string("profile", &profile));
+            }
+        }
+    }
+    if let Some(model_provider) = config.active_cli_model_provider() {
+        args.push("-c".to_string());
+        args.push(cli_config_string("model_provider", &model_provider));
+    }
+    args
+}
+
+fn cli_config_string(key: &str, value: &str) -> String {
+    format!("{}=\"{}\"", key, toml_string_escape(value))
+}
+
+fn toml_string_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn parse_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), String> {
