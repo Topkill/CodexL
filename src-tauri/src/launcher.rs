@@ -10,6 +10,8 @@ use std::process::{Child, Command, Stdio};
 const DEFAULT_MAC_APP_NAMES: &[&str] = &["Codex.app", "OpenAI Codex.app"];
 const DEFAULT_WINDOWS_APP_DIRS: &[&str] = &["Codex", "OpenAI Codex"];
 const DEFAULT_WINDOWS_EXE_NAMES: &[&str] = &["Codex.exe", "OpenAI Codex.exe"];
+#[cfg(windows)]
+const DEFAULT_WINDOWS_PACKAGE_PREFIXES: &[&str] = &["OpenAI.Codex_"];
 
 #[derive(Debug)]
 pub struct CodexLaunch {
@@ -524,18 +526,90 @@ fn find_mac_app() -> Option<String> {
 fn find_windows_app() -> Option<String> {
     for key in ["CODEXL_CODEX_PATH", "CODEX_APP_PATH"] {
         if let Some(path) = env_path(key) {
-            if path.is_file() {
+            if let Some(path) = normalize_windows_codex_app_candidate(path) {
                 return Some(path.to_string_lossy().to_string());
             }
         }
     }
 
+    for candidate in windows_where_codex_candidates() {
+        if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
     for candidate in windows_app_candidates() {
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
+        if let Some(path) = normalize_windows_codex_app_candidate(candidate) {
+            return Some(path.to_string_lossy().to_string());
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn normalize_windows_codex_app_candidate(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+
+    if let Some(parent) = path.parent() {
+        let parent_name = parent.file_name()?.to_string_lossy().to_ascii_lowercase();
+        if parent_name == "resources" {
+            if let Some(app_dir) = parent.parent() {
+                for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
+                    let app_exe = app_dir.join(exe_name);
+                    if app_exe.is_file() {
+                        return Some(app_exe);
+                    }
+                }
+            }
+        }
+    }
+
+    let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    DEFAULT_WINDOWS_EXE_NAMES
+        .iter()
+        .any(|name| file_name == name.to_ascii_lowercase())
+        .then_some(path)
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_codex_app_candidate(path: PathBuf) -> Option<PathBuf> {
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn windows_where_codex_candidates() -> Vec<PathBuf> {
+    ["Codex", "codex"]
+        .iter()
+        .flat_map(|name| where_command_candidates(name))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn windows_where_codex_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn where_command_candidates(name: &str) -> Vec<PathBuf> {
+    let Ok(output) = Command::new("where.exe")
+        .arg(name)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn windows_app_candidates() -> Vec<PathBuf> {
@@ -571,7 +645,43 @@ fn windows_app_candidates() -> Vec<PathBuf> {
             }
         }
     }
+    candidates.extend(windows_appx_package_candidates());
     candidates
+}
+
+#[cfg(windows)]
+fn windows_appx_package_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(program_files) = env_path("ProgramFiles") else {
+        return candidates;
+    };
+    let windows_apps = program_files.join("WindowsApps");
+    let Ok(entries) = std::fs::read_dir(windows_apps) else {
+        return candidates;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !DEFAULT_WINDOWS_PACKAGE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        for exe_name in DEFAULT_WINDOWS_EXE_NAMES {
+            candidates.push(path.join("app").join(exe_name));
+        }
+    }
+
+    candidates.sort();
+    candidates.reverse();
+    candidates
+}
+
+#[cfg(not(windows))]
+fn windows_appx_package_candidates() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
