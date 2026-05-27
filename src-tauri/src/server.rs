@@ -1,5 +1,6 @@
 use crate::config::{self, AppConfig};
 use crate::extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
+use crate::gateway_usage;
 use crate::platforms::macos;
 use crate::remote::cdp_resources;
 use crate::{launcher, ports, remote, AppState};
@@ -113,13 +114,23 @@ struct StatusResponse {
 
 pub async fn serve(state: AppState) -> Result<(), String> {
     let config = state.config.lock().await.clone();
-    let listener = TcpListener::bind((config.http_host.as_str(), config.http_port))
-        .await
-        .map_err(|e| format!("failed to bind HTTP server: {}", e))?;
+    let (listener, actual_port) = bind_http_listener(&config.http_host, config.http_port).await?;
+    if actual_port != config.http_port {
+        eprintln!(
+            "CodexL HTTP port {} is unavailable; using {} instead",
+            config.http_port, actual_port
+        );
+        let mut runtime_config = state.config.lock().await;
+        if runtime_config.http_host == config.http_host
+            && runtime_config.http_port == config.http_port
+        {
+            runtime_config.http_port = actual_port;
+        }
+    }
     let local_addr = listener
         .local_addr()
         .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| format!("{}:{}", config.http_host, config.http_port));
+        .unwrap_or_else(|_| format!("{}:{}", config.http_host, actual_port));
 
     eprintln!("CodexL HTTP server listening on http://{}", local_addr);
 
@@ -144,6 +155,38 @@ pub async fn serve(state: AppState) -> Result<(), String> {
     }
 }
 
+async fn bind_http_listener(host: &str, preferred_port: u16) -> Result<(TcpListener, u16), String> {
+    if preferred_port == 0 {
+        let listener = TcpListener::bind((host, 0))
+            .await
+            .map_err(|e| format!("failed to bind HTTP server: {}", e))?;
+        let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+        return Ok((listener, port));
+    }
+
+    let mut first_error = None;
+    for offset in 0..100u16 {
+        let Some(port) = preferred_port.checked_add(offset) else {
+            break;
+        };
+        match TcpListener::bind((host, port)).await {
+            Ok(listener) => return Ok((listener, port)),
+            Err(err) => {
+                if offset == 0 {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "failed to bind HTTP server: {}",
+        first_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no available port found".to_string())
+    ))
+}
+
 pub async fn launch_codex_instance(
     state: &AppState,
     request: LaunchRequest,
@@ -156,6 +199,16 @@ pub async fn launch_codex_instance(
     let mut permission_config = requested_config.clone();
     let executable = resolve_codex_executable(&mut permission_config)?;
     requested_config.codex_path = executable.clone();
+    let cli_executable = launcher::resolve_codex_cli_executable(None, &executable);
+    let profile_config_format = config::codex_profile_config_format_for_cli(&cli_executable);
+    if request.codex_home.is_none() {
+        if let Some(profile) = requested_config.provider_profile(&requested_config.active_provider)
+        {
+            requested_config.codex_home =
+                config::ensure_provider_codex_home_with_format(&profile, profile_config_format)?;
+            requested_config.normalize();
+        }
+    }
     macos::request_automation_permission(&executable)?;
 
     let mut instances = state.instances.lock().await;
@@ -288,8 +341,7 @@ fn apply_launch_request(config: &mut AppConfig, request: &LaunchRequest) -> Resu
         let profile = config
             .provider_profile(profile_name)
             .ok_or_else(|| format!("Provider profile not found: {}", profile_name))?;
-        config.codex_home = config::ensure_provider_codex_home(&profile)?;
-        config.active_provider = profile.name;
+        config.active_provider = config::provider_profile_key(&profile);
     }
     if let Some(codex_home) = request.codex_home.as_ref() {
         config.codex_home = codex_home.clone();
@@ -460,6 +512,9 @@ async fn route_request(
             Ok(json_response(StatusCode::OK, json!(status)))
         }
         (&Method::GET, "/health") => Ok(json_response(StatusCode::OK, json!({ "ok": true }))),
+        (&Method::POST, "/gateway/usage") | (&Method::POST, "/gateway/usage/report") => {
+            receive_gateway_usage_report(request).await
+        }
         (&Method::POST, "/launch") => {
             let launch_request = read_launch_request(request).await?;
             let info = launch_codex_instance(&state, launch_request).await?;
@@ -495,6 +550,34 @@ async fn route_request(
             json!({ "error": "not found" }),
         )),
     }
+}
+
+async fn receive_gateway_usage_report(
+    request: &mut Request<Incoming>,
+) -> Result<Response<HttpBody>, String> {
+    let body = request
+        .body_mut()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?
+        .to_bytes();
+    if body.len() > 5 * 1024 * 1024 {
+        return Ok(json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({ "error": "gateway usage payload is too large" }),
+        ));
+    }
+
+    let payload = serde_json::from_slice::<Value>(&body).map_err(|e| e.to_string())?;
+    let result = gateway_usage::record_usage_report(payload).await?;
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "inserted": result.inserted,
+            "eventId": result.event_id,
+        }),
+    ))
 }
 
 async fn probe_codex_plugin_bridge(
@@ -1038,6 +1121,9 @@ async fn running_launch_infos(state: &AppState) -> Result<Vec<LaunchInfo>, Strin
         for (profile_name, instance) in instances.iter_mut() {
             match running_child_pid(&mut instance.child)? {
                 Some(pid) => infos.push(launch_info_from_instance(&instance.info, Some(pid))),
+                None if cdp_endpoint_is_alive(&instance.info).await => {
+                    infos.push(launch_info_from_instance(&instance.info, instance.info.pid))
+                }
                 None => stopped_profiles.push(profile_name.clone()),
             }
         }
@@ -1100,6 +1186,19 @@ fn running_child_pid(child: &mut Child) -> Result<Option<u32>, String> {
         Ok(Some(_status)) => Ok(None),
         Err(err) => Err(err.to_string()),
     }
+}
+
+async fn cdp_endpoint_is_alive(info: &LaunchInfo) -> bool {
+    let url = format!("http://{}:{}/json/list", info.cdp_host, info.cdp_port);
+    let Ok(result) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), reqwest::get(url)).await
+    else {
+        return false;
+    };
+    let Ok(response) = result else {
+        return false;
+    };
+    response.status().is_success()
 }
 
 fn launch_info_from_instance(info: &LaunchInfo, pid: Option<u32>) -> LaunchInfo {
@@ -1270,4 +1369,25 @@ fn add_cors(mut response: Response<HttpBody>) -> Response<HttpBody> {
     );
     headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, "*".parse().unwrap());
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener as StdTcpListener;
+
+    #[tokio::test]
+    async fn bind_http_listener_uses_next_port_when_preferred_is_busy() {
+        let occupied = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
+        let preferred_port = occupied.local_addr().expect("occupied addr").port();
+
+        let (listener, actual_port) = bind_http_listener("127.0.0.1", preferred_port)
+            .await
+            .expect("bind fallback listener");
+
+        assert_ne!(actual_port, preferred_port);
+        assert!(actual_port > preferred_port);
+        drop(listener);
+        drop(occupied);
+    }
 }

@@ -165,10 +165,10 @@ fn workspace_show(args: &[String]) -> Result<i32, String> {
 fn workspace_use(args: &[String]) -> Result<i32, String> {
     let name = positional_name(args, "workspace use <name>")?;
     let mut config = AppConfig::load();
-    if config.provider_profile(&name).is_none() {
-        return Err(format!("workspace not found: {}", name));
-    }
-    config.active_provider = name.clone();
+    let profile = config
+        .provider_profile(&name)
+        .ok_or_else(|| format!("workspace not found: {}", name))?;
+    config.active_provider = config::provider_profile_key(&profile);
     config.normalize();
     config.save()?;
     println!("active workspace: {}", name);
@@ -227,9 +227,6 @@ fn workspace_create(args: &[String]) -> Result<i32, String> {
     }
 
     let mut config = AppConfig::load();
-    if config.provider_profile(&name).is_some() {
-        return Err(format!("workspace already exists: {}", name));
-    }
     let profile = config::create_workspace_profile(WorkspaceRequest {
         workspace_name: name,
         proxy_url,
@@ -238,7 +235,7 @@ fn workspace_create(args: &[String]) -> Result<i32, String> {
         remote_web_asset_version: version,
         bot: config::BotProfileConfig::default(),
     })?;
-    let profile_name = profile.name.clone();
+    let profile_name = config::provider_profile_key(&profile);
     config.add_provider_profile(profile);
     config.save()?;
     let saved_profile = config
@@ -325,7 +322,7 @@ fn workspace_set_remote_frontend(args: &[String]) -> Result<i32, String> {
             profile.remote_web_asset_version = "latest".to_string();
         }
     }
-    let profile_name = profile.name.clone();
+    let profile_name = config::provider_profile_key(&profile);
     config.update_provider_profile(&name, profile)?;
     config.save()?;
     let saved_profile = config
@@ -520,13 +517,18 @@ fn run_codex_command(args: &[String]) -> Result<i32, String> {
     let profile = config
         .provider_profile(&profile_name)
         .ok_or_else(|| format!("workspace not found: {}", profile_name))?;
-    config.active_provider = profile.name.clone();
-    config.codex_home = config::ensure_provider_codex_home(&profile)?;
-    config.normalize();
+    config.active_provider = config::provider_profile_key(&profile);
 
     let executable = resolve_codex_cli_executable(codex_path.as_deref(), &config)?;
+    let profile_config_format = config::codex_profile_config_format_for_cli(&executable);
+    config.codex_home =
+        config::ensure_provider_codex_home_with_format(&profile, profile_config_format)?;
+    config.normalize();
+
+    let mut real_args = codex_profile_args_for_config(&config, profile_config_format);
+    real_args.extend(forwarded);
     let status = Command::new(&executable)
-        .args(&forwarded)
+        .args(&real_args)
         .env("CODEX_HOME", config.codex_home.clone())
         .status()
         .map_err(|e| format!("failed to run Codex CLI {}: {}", executable, e))?;
@@ -541,6 +543,43 @@ fn resolve_codex_cli_executable(
         explicit_path,
         &config.codex_path,
     ))
+}
+
+fn codex_profile_args_for_config(
+    config: &AppConfig,
+    profile_config_format: config::CodexProfileConfigFormat,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(profile) = config.active_cli_profile() {
+        match profile_config_format {
+            config::CodexProfileConfigFormat::SeparateProfileFiles => {
+                args.push("--profile".to_string());
+                args.push(profile);
+            }
+            config::CodexProfileConfigFormat::LegacyProfilesTable => {
+                args.push("-c".to_string());
+                args.push(cli_config_string("profile", &profile));
+            }
+        }
+    }
+    if let Some(model_provider) = config.active_cli_model_provider() {
+        args.push("-c".to_string());
+        args.push(cli_config_string("model_provider", &model_provider));
+    }
+    args
+}
+
+fn cli_config_string(key: &str, value: &str) -> String {
+    format!("{}=\"{}\"", key, toml_string_escape(value))
+}
+
+fn toml_string_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn parse_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), String> {

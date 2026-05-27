@@ -270,6 +270,10 @@ pub async fn start_remote_control(
         .as_ref()
         .map(|profile| profile.id.clone())
         .unwrap_or_else(|| profile_name.clone());
+    let workspace_name = profile
+        .as_ref()
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| profile_name.clone());
     let workspace_path = profile
         .as_ref()
         .map(|profile| generated_codex_home(profile).to_string_lossy().to_string())
@@ -370,7 +374,7 @@ pub async fn start_remote_control(
         remote_frontend_mode,
         device_uuid: app_config.device_uuid.clone(),
         workspace_id,
-        workspace_name: profile_name.clone(),
+        workspace_name,
         workspace_path,
         cloud_auth: cloud_auth.clone(),
         web_asset_base_url,
@@ -2291,8 +2295,11 @@ async fn start_cli_app_server_bridge(
     let profile = requested_config
         .provider_profile(profile_name)
         .ok_or_else(|| format!("Provider profile not found: {}", profile_name))?;
-    requested_config.codex_home = config::ensure_provider_codex_home(&profile)?;
-    requested_config.active_provider = profile.name.clone();
+    requested_config.active_provider = config::provider_profile_key(&profile);
+    let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
+    let profile_config_format = config::codex_profile_config_format_for_cli(&executable);
+    requested_config.codex_home =
+        config::ensure_provider_codex_home_with_format(&profile, profile_config_format)?;
     requested_config.normalize();
 
     let active_provider_profile =
@@ -2317,7 +2324,6 @@ async fn start_cli_app_server_bridge(
             false,
         )?;
     }
-    let executable = launcher::resolve_codex_cli_executable(None, &requested_config.codex_path);
     let active_cli_profile = requested_config.active_cli_profile();
     let active_cli_model_provider = requested_config.active_cli_model_provider();
     let app_server_backend = active_provider_profile
@@ -2336,6 +2342,7 @@ async fn start_cli_app_server_bridge(
         requested_config.active_provider.clone(),
         active_cli_profile,
         active_cli_model_provider,
+        profile_config_format,
         app_server_backend,
         proxy_url,
         transcribe_api,
@@ -2401,6 +2408,7 @@ impl CliAppBridge {
         workspace_name: String,
         cli_profile: Option<String>,
         cli_model_provider: Option<String>,
+        profile_config_format: config::CodexProfileConfigFormat,
         backend: CliAppServerBackend,
         proxy_url: String,
         transcribe_api: TranscribeApiConfig,
@@ -2409,7 +2417,14 @@ impl CliAppBridge {
             CliAppServerBackend::CodexCli => {
                 let mut command = TokioCommand::new(&executable);
                 if let Some(profile) = cli_profile.as_deref() {
-                    command.arg("-c").arg(cli_config_string("profile", profile));
+                    match profile_config_format {
+                        config::CodexProfileConfigFormat::SeparateProfileFiles => {
+                            command.arg("--profile").arg(profile);
+                        }
+                        config::CodexProfileConfigFormat::LegacyProfilesTable => {
+                            command.arg("-c").arg(cli_config_string("profile", profile));
+                        }
+                    }
                 }
                 if let Some(model_provider) = cli_model_provider.as_deref() {
                     command

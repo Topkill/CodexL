@@ -3,6 +3,7 @@ mod cli;
 mod cli_middleware;
 mod config;
 mod extensions;
+mod gateway_usage;
 mod launcher;
 mod platforms;
 mod ports;
@@ -10,9 +11,10 @@ pub(crate) mod remote;
 mod server;
 
 use config::{
-    AppConfig, BotProfileConfig, DefaultProviderProfile, ExistingProviderRequest,
-    NewProviderRequest, NextAiGatewayProviderRequest, UpdateNextAiGatewayProviderRequest,
-    UpdateProviderRequest, UpdateWorkspaceRequest, WorkspaceRequest, DEFAULT_PROVIDER_PROFILE_NAME,
+    AppConfig, BotProfileConfig, CodexProfileConfigFormat, DefaultProviderProfile,
+    ExistingProviderRequest, NewProviderRequest, NextAiGatewayProviderRequest,
+    UpdateNextAiGatewayProviderRequest, UpdateProviderRequest, UpdateWorkspaceRequest,
+    WorkspaceRequest, DEFAULT_PROVIDER_PROFILE_NAME,
 };
 use extensions::builtins::bot_bridge;
 use extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
@@ -51,6 +53,15 @@ impl AppState {
             config: Arc::new(Mutex::new(config)),
         }
     }
+}
+
+async fn profile_config_format_for_state(state: &AppState) -> CodexProfileConfigFormat {
+    let codex_path = {
+        let config = state.config.lock().await;
+        config.codex_path.clone()
+    };
+    let executable = launcher::resolve_codex_cli_executable(None, &codex_path);
+    config::codex_profile_config_format_for_cli(&executable)
 }
 
 #[tauri::command]
@@ -299,6 +310,54 @@ async fn update_gateway_config(
 }
 
 #[tauri::command]
+async fn get_gateway_tools(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    ensure_next_ai_gateway_enabled(state.inner()).await?;
+    gateway_service::ensure_running(state.inner()).await?;
+
+    let url = gateway_config::gateway_agent_tools_url()?;
+    let api_key = gateway_config::codex_provider_api_key()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let mut request = client.get(&url);
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("failed to fetch Gateway MCP tools: {}", err))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Gateway MCP tools request failed: {}{}",
+            status,
+            if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", body.trim())
+            }
+        ));
+    }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|err| format!("failed to parse Gateway MCP tools: {}", err))
+}
+
+#[tauri::command]
+async fn get_gateway_usage_summary(
+    days: Option<u32>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    hours: Option<u32>,
+) -> Result<gateway_usage::GatewayUsageSummary, String> {
+    gateway_usage::load_usage_summary(days, start_date, end_date, hours).await
+}
+
+#[tauri::command]
 fn get_default_providers() -> Result<Vec<DefaultProviderProfile>, String> {
     config::read_default_provider_profiles()
 }
@@ -308,7 +367,9 @@ async fn add_existing_provider(
     provider: ExistingProviderRequest,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
-    let profile = config::add_existing_provider_profile(provider)?;
+    let profile_config_format = profile_config_format_for_state(state.inner()).await;
+    let profile =
+        config::add_existing_provider_profile_with_format(provider, profile_config_format)?;
     let mut config = state.config.lock().await;
     config.add_provider_profile(profile);
     config.save()?;
@@ -332,7 +393,8 @@ async fn create_provider(
     provider: NewProviderRequest,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
-    let profile = config::create_default_provider(provider)?;
+    let profile_config_format = profile_config_format_for_state(state.inner()).await;
+    let profile = config::create_default_provider_with_format(provider, profile_config_format)?;
     let mut config = state.config.lock().await;
     if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
         config.update_provider_profile(DEFAULT_PROVIDER_PROFILE_NAME, profile)?;
@@ -350,7 +412,9 @@ async fn create_next_ai_gateway_provider(
 ) -> Result<AppConfig, String> {
     ensure_next_ai_gateway_enabled(state.inner()).await?;
     gateway_service::ensure_running(state.inner()).await?;
-    let profile = config::create_next_ai_gateway_provider(provider)?;
+    let profile_config_format = profile_config_format_for_state(state.inner()).await;
+    let profile =
+        config::create_next_ai_gateway_provider_with_format(provider, profile_config_format)?;
     let mut config = state.config.lock().await;
     config.add_provider_profile(profile);
     config.save()?;
@@ -390,24 +454,28 @@ async fn update_provider(
     provider: UpdateProviderRequest,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppConfig, String> {
+    let profile_config_format = profile_config_format_for_state(state.inner()).await;
     if provider.original_name == DEFAULT_PROVIDER_PROFILE_NAME {
         let bot = provider.bot.clone();
         let proxy_url = provider.proxy_url.trim().to_string();
         let remote_frontend_mode = provider.remote_frontend_mode.clone();
         let remote_web_asset_registry_url = provider.remote_web_asset_registry_url.clone();
         let remote_web_asset_version = provider.remote_web_asset_version.clone();
-        config::update_default_provider_selection(ExistingProviderRequest {
-            workspace_name: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
-            profile_name: provider.profile_name,
-            base_url: provider.base_url,
-            api_key: provider.api_key,
-            model: provider.model,
-            proxy_url: proxy_url.clone(),
-            remote_frontend_mode: String::new(),
-            remote_web_asset_registry_url: String::new(),
-            remote_web_asset_version: String::new(),
-            bot: BotProfileConfig::default(),
-        })?;
+        config::update_default_provider_selection_with_format(
+            ExistingProviderRequest {
+                workspace_name: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
+                profile_name: provider.profile_name,
+                base_url: provider.base_url,
+                api_key: provider.api_key,
+                model: provider.model,
+                proxy_url: proxy_url.clone(),
+                remote_frontend_mode: String::new(),
+                remote_web_asset_registry_url: String::new(),
+                remote_web_asset_version: String::new(),
+                bot: BotProfileConfig::default(),
+            },
+            profile_config_format,
+        )?;
         let mut config = state.config.lock().await;
         if let Some(profile) = config
             .provider_profiles
@@ -430,7 +498,8 @@ async fn update_provider(
     }
 
     let original_name = provider.original_name.clone();
-    let profile = config::update_existing_provider_profile(provider)?;
+    let profile =
+        config::update_existing_provider_profile_with_format(provider, profile_config_format)?;
     let mut config = state.config.lock().await;
     config.update_provider_profile(&original_name, profile)?;
     config.save()?;
@@ -458,7 +527,11 @@ async fn update_next_ai_gateway_provider(
     ensure_next_ai_gateway_enabled(state.inner()).await?;
     gateway_service::ensure_running(state.inner()).await?;
     let original_name = provider.original_name.clone();
-    let profile = config::update_next_ai_gateway_provider_profile(provider)?;
+    let profile_config_format = profile_config_format_for_state(state.inner()).await;
+    let profile = config::update_next_ai_gateway_provider_profile_with_format(
+        provider,
+        profile_config_format,
+    )?;
     let mut config = state.config.lock().await;
     config.update_provider_profile(&original_name, profile)?;
     config.save()?;
@@ -568,7 +641,7 @@ async fn configure_bot_integration(
     let Some(profile) = config
         .provider_profiles
         .iter_mut()
-        .find(|profile| profile.name == profile_name)
+        .find(|profile| profile.id == profile_name || profile.name == profile_name)
     else {
         return Err(format!("Provider profile not found: {}", profile_name));
     };
@@ -682,7 +755,7 @@ async fn update_profile_bot_status(
     let Some(profile) = config
         .provider_profiles
         .iter_mut()
-        .find(|profile| profile.name == profile_name)
+        .find(|profile| profile.id == profile_name || profile.name == profile_name)
     else {
         return Err(format!("Provider profile not found: {}", profile_name));
     };
@@ -828,6 +901,8 @@ pub fn run() {
             set_remote_launch_options,
             get_gateway_config,
             update_gateway_config,
+            get_gateway_tools,
+            get_gateway_usage_summary,
             get_default_providers,
             add_existing_provider,
             create_workspace,

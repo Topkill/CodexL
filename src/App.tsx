@@ -5,6 +5,16 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { useTranslation } from "react-i18next";
 import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip as RechartsTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
   Activity,
   AlertCircle,
   ChevronDown,
@@ -24,8 +34,10 @@ import {
   LayoutDashboard,
   LockKeyhole,
   LogOut,
+  Maximize2,
   MessageCircle,
   Mic,
+  Minimize2,
   Monitor,
   Moon,
   Palette,
@@ -557,7 +569,7 @@ type UpdateWorkspaceProvider = WorkspaceProvider & {
 
 type ProviderMode = "none" | "existing" | "new" | "gateway";
 type DialogMode = "add" | "edit";
-type AppSettingsSection = "general" | "transcribe" | "extensions" | "bot" | "gateway" | "updates";
+type AppSettingsSection = "general" | "transcribe" | "extensions" | "bot" | "gateway" | "usage" | "updates";
 type AppUpdateStatus = "idle" | "checking" | "available" | "current" | "downloading" | "ready" | "error";
 type AppUpdateState = {
   status: AppUpdateStatus;
@@ -579,6 +591,114 @@ type GatewayConfigFile = {
   path: string;
   config: JsonObject;
 };
+type GatewayUsageTotals = {
+  requestCount: number;
+  successCount: number;
+  errorCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  lastReceivedAtUnix: number | null;
+};
+type GatewayUsageDaily = {
+  day: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+};
+type GatewayUsageBreakdown = {
+  label: string;
+  provider: string;
+  providerName: string;
+  model: string;
+  requestCount: number;
+  successCount: number;
+  errorCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+};
+type GatewayUsageSessionBreakdown = {
+  sessionId: string;
+  label: string;
+  projectPath: string;
+  projectLabel: string;
+  requestCount: number;
+  successCount: number;
+  errorCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  firstReceivedAtUnix: number | null;
+  lastReceivedAtUnix: number | null;
+};
+type GatewayUsageProjectBreakdown = {
+  projectPath: string;
+  label: string;
+  sessionCount: number;
+  requestCount: number;
+  successCount: number;
+  errorCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  firstReceivedAtUnix: number | null;
+  lastReceivedAtUnix: number | null;
+};
+type GatewayUsageRequestEvent = {
+  eventId: string;
+  requestId: string;
+  emittedAt: string;
+  receivedAtUnix: number;
+  clientSessionId: string;
+  clientSessionLabel: string;
+  clientProjectPath: string;
+  clientProjectLabel: string;
+  route: string;
+  provider: string;
+  providerName: string;
+  model: string;
+  status: string;
+  statusCode: number | null;
+  latencyMs: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+};
+type GatewayUsageSummary = {
+  databasePath: string;
+  windowDays: number;
+  windowHours: number;
+  startDate: string;
+  endDate: string;
+  generatedAtUnix: number;
+  totals: GatewayUsageTotals;
+  daily: GatewayUsageDaily[];
+  byProvider: GatewayUsageBreakdown[];
+  byModel: GatewayUsageBreakdown[];
+  bySession: GatewayUsageSessionBreakdown[];
+  byProject: GatewayUsageProjectBreakdown[];
+  requests: GatewayUsageRequestEvent[];
+};
+type GatewayUsageBreakdownMode = "model" | "session" | "project";
+type GatewayUsageDateRange = {
+  startDate: string;
+  endDate: string;
+  hours?: number;
+};
 type GatewayProviderForm = {
   id: string;
   name: string;
@@ -589,10 +709,13 @@ type GatewayProviderForm = {
   raw: JsonObject;
 };
 type GatewayMcpServerTransport = "stdio" | "websocket";
+type GatewayMcpServerStdioMessageMode = "newline-json" | "content-length";
 type GatewayMcpServerForm = {
   id: string;
   name: string;
+  enabled: boolean;
   transport: GatewayMcpServerTransport;
+  stdioMessageMode: GatewayMcpServerStdioMessageMode;
   command: string;
   args: string;
   cwd: string;
@@ -605,6 +728,14 @@ type GatewayMcpServerForm = {
   startupTimeoutMs: string;
   requestTimeoutMs: string;
   raw: JsonObject;
+};
+type GatewayAvailableTool = {
+  name: string;
+  description: string;
+  inputSchema?: JsonObject;
+};
+type GatewayToolsResponse = {
+  tools?: unknown[];
 };
 type GatewayVirtualToolVisibility = "internal" | "client";
 type GatewayVirtualBaseModelMode = "request" | "fixed" | "strip_prefix" | "strip_suffix";
@@ -640,6 +771,7 @@ type GatewayVirtualProfileForm = {
 type GatewayConfigForm = {
   host: string;
   port: string;
+  usageCaptureEnabled: boolean;
   providers: GatewayProviderForm[];
   mcpServers: GatewayMcpServerForm[];
   virtualModelProfiles: GatewayVirtualProfileForm[];
@@ -811,6 +943,48 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     clearCloudIdentity: t("remote.clearCloudIdentity"),
     gateway: t("gateway.title"),
     gatewaySettingsDescription: t("gateway.description"),
+    gatewayUsage: t("gateway.usage"),
+    gatewayUsageSettingsDescription: t("gateway.usageSettingsDescription"),
+    gatewayUsageCapture: t("gateway.usageCapture"),
+    gatewayUsageCaptureDescription: t("gateway.usageCaptureDescription"),
+    gatewayUsageDashboard: t("gateway.usageDashboard"),
+    gatewayUsageDateRange: t("gateway.usageDateRange"),
+    gatewayUsageEnterFullscreen: t("gateway.usageEnterFullscreen"),
+    gatewayUsageExitFullscreen: t("gateway.usageExitFullscreen"),
+    gatewayUsageLast24Hours: t("gateway.usageLast24Hours"),
+    gatewayUsageLast7Days: t("gateway.usageLast7Days"),
+    gatewayUsageLast30Days: t("gateway.usageLast30Days"),
+    gatewayUsageLast90Days: t("gateway.usageLast90Days"),
+    gatewayUsageStartDate: t("gateway.usageStartDate"),
+    gatewayUsageEndDate: t("gateway.usageEndDate"),
+    gatewayUsageRequests: t("gateway.usageRequests"),
+    gatewayUsageSuccessRate: t("gateway.usageSuccessRate"),
+    gatewayUsageTokens: t("gateway.usageTokens"),
+    gatewayUsageTotal: t("gateway.usageTotal"),
+    gatewayUsageCache: t("gateway.usageCache"),
+    gatewayUsageCacheRate: t("gateway.usageCacheRate"),
+    gatewayUsageCacheRead: t("gateway.usageCacheRead"),
+    gatewayUsageCacheWrite: t("gateway.usageCacheWrite"),
+    gatewayUsageTime: t("gateway.usageTime"),
+    gatewayUsageLatency: t("gateway.usageLatency"),
+    gatewayUsageDaily: t("gateway.usageDaily"),
+    gatewayUsageByProvider: t("gateway.usageByProvider"),
+    gatewayUsageByModel: t("gateway.usageByModel"),
+    gatewayUsageBySession: t("gateway.usageBySession"),
+    gatewayUsageByProject: t("gateway.usageByProject"),
+    gatewayUsageGroupBy: t("gateway.usageGroupBy"),
+    gatewayUsageRequestList: t("gateway.usageRequestList"),
+    gatewayUsageSession: t("gateway.usageSession"),
+    gatewayUsageProject: t("gateway.usageProject"),
+    gatewayUsageUnknownSession: t("gateway.usageUnknownSession"),
+    gatewayUsageUnknownProject: t("gateway.usageUnknownProject"),
+    gatewayUsageFirstSeen: t("gateway.usageFirstSeen"),
+    gatewayUsageLastSeen: t("gateway.usageLastSeen"),
+    gatewayUsageNoData: t("gateway.usageNoData"),
+    gatewayUsageDatabase: t("gateway.usageDatabase"),
+    gatewayUsageInput: t("gateway.usageInput"),
+    gatewayUsageOutput: t("gateway.usageOutput"),
+    gatewayUsageRefresh: t("gateway.usageRefresh"),
     botSettingsDescription: t("bot.settingsDescription"),
     addBot: t("bot.addBot"),
     associatedWorkspace: t("bot.associatedWorkspace"),
@@ -853,6 +1027,16 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     nextAiGatewayProvider: t("instanceDialog.nextAiGatewayProvider"),
     thirdPartyProvider: t("instanceDialog.thirdPartyProvider"),
     newProvider: t("instanceDialog.newProvider"),
+    providerSource: t("instanceDialog.providerSource"),
+    providerSourceNone: t("instanceDialog.providerSourceNone"),
+    providerSourceNoneDescription: t("instanceDialog.providerSourceNoneDescription"),
+    providerSourceDefault: t("instanceDialog.providerSourceDefault"),
+    providerSourceDefaultDescription: t("instanceDialog.providerSourceDefaultDescription"),
+    providerSourceGateway: t("instanceDialog.providerSourceGateway"),
+    providerSourceGatewayDescription: t("instanceDialog.providerSourceGatewayDescription"),
+    providerSourceDefaultUnavailable: t("instanceDialog.providerSourceDefaultUnavailable"),
+    providerSourceGatewayDefaultUnavailable: t("instanceDialog.providerSourceGatewayDefaultUnavailable"),
+    providerlessWorkspace: t("instanceDialog.providerlessWorkspace"),
     provider: t("instanceDialog.provider"),
     selectProvider: t("instanceDialog.selectProvider"),
     selectModel: t("instanceDialog.selectModel"),
@@ -959,7 +1143,12 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     addMcpServer: t("gateway.addMcpServer"),
     editMcpServer: t("gateway.editMcpServer"),
     mcpServerDialogDescription: t("gateway.mcpServerDialogDescription"),
+    availableMcpTools: t("gateway.availableMcpTools"),
+    gatewayToolsLoading: t("gateway.gatewayToolsLoading"),
+    noGatewayTools: t("gateway.noGatewayTools"),
+    unavailableTool: t("gateway.unavailableTool"),
     transport: t("gateway.transport"),
+    stdioMessageMode: t("gateway.stdioMessageMode"),
     command: t("gateway.command"),
     args: t("gateway.args"),
     cwd: t("gateway.cwd"),
@@ -977,6 +1166,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     virtualProfileDialogDescription: t("gateway.virtualProfileDialogDescription"),
     profileKey: t("gateway.profileKey"),
     description: t("gateway.descriptionField"),
+    disabled: t("gateway.disabled"),
     enabled: t("gateway.enabled"),
     exactAliases: t("gateway.exactAliases"),
     prefixes: t("gateway.prefixes"),
@@ -1084,6 +1274,7 @@ function App() {
   const [providerMode, setProviderMode] = useState<ProviderMode>("existing");
   const [dialogMode, setDialogMode] = useState<DialogMode>("add");
   const [editingProfileName, setEditingProfileName] = useState<string | null>(null);
+  const [editingProfileKey, setEditingProfileKey] = useState<string | null>(null);
   const [form, setForm] = useState<ProviderForm>(emptyForm);
   const [codexAppPath, setCodexAppPath] = useState("");
   const [gatewayModels, setGatewayModels] = useState<string[]>([]);
@@ -1470,6 +1661,7 @@ function App() {
   const openAddProviderDialog = useCallback(async () => {
     setDialogMode("add");
     setEditingProfileName(null);
+    setEditingProfileKey(null);
     setSettingsError("");
     setSaveDisabled(false);
     const [providers, models, detectedCodexAppPath] = await Promise.all([
@@ -1477,7 +1669,7 @@ function App() {
       gatewayProfileEnabled ? loadGatewayModels() : Promise.resolve([]),
       detectCodexAppPath(),
     ]);
-    const nextMode: ProviderMode = providers.length > 0 ? "existing" : "new";
+    const nextMode: ProviderMode = providers.length > 0 ? "existing" : "none";
     setForm({
       ...emptyForm,
       ...defaultRemoteFrontendFormFields(detectedCodexAppPath),
@@ -1503,6 +1695,7 @@ function App() {
     async (profile: ProviderProfile) => {
       setDialogMode("edit");
       setEditingProfileName(profile.name);
+      setEditingProfileKey(profile.name === "Default" ? profile.name : profileKey(profile));
       setSettingsError("");
       setSaveDisabled(false);
       setForm(emptyForm);
@@ -1606,6 +1799,7 @@ function App() {
     setSettingsOpen(false);
     setSettingsError("");
     setEditingProfileName(null);
+    setEditingProfileKey(null);
     setDialogMode("add");
     setSaveDisabled(false);
   }, []);
@@ -1688,8 +1882,10 @@ function App() {
       setSettingsError("");
       let nextConfig: AppConfig;
       let savedProfileName = "";
+      let savedProfileKey = "";
       let savedBot: BotProfileConfig | null = null;
       const extensionsEnabled = botExtensionsEnabled(config.extensions);
+      const originalProfileKey = editingProfileKey || editingProfileName || "";
 
       if (providerMode === "none" || form.remoteFrontendMode === "claude-code") {
         const provider = readWorkspaceProviderForm(
@@ -1706,8 +1902,8 @@ function App() {
           await prepareBotPluginIfNeeded(provider.bot);
         }
 
-        if (dialogMode === "edit" && editingProfileName) {
-          const update: UpdateWorkspaceProvider = { ...provider, original_name: editingProfileName };
+        if (dialogMode === "edit" && originalProfileKey) {
+          const update: UpdateWorkspaceProvider = { ...provider, original_name: originalProfileKey };
           nextConfig = await invoke<AppConfig>("update_workspace", { provider: update });
         } else {
           nextConfig = await invoke<AppConfig>("create_workspace", { provider });
@@ -1730,8 +1926,8 @@ function App() {
         }
         await prepareNextAiGatewayPlugin();
 
-        if (dialogMode === "edit" && editingProfileName) {
-          const update: UpdateNextAiGatewayProvider = { ...provider, original_name: editingProfileName };
+        if (dialogMode === "edit" && originalProfileKey) {
+          const update: UpdateNextAiGatewayProvider = { ...provider, original_name: originalProfileKey };
           nextConfig = await invoke<AppConfig>("update_next_ai_gateway_provider", { provider: update });
         } else {
           nextConfig = await invoke<AppConfig>("create_next_ai_gateway_provider", { provider });
@@ -1753,8 +1949,8 @@ function App() {
           await prepareBotPluginIfNeeded(provider.bot);
         }
 
-        if (dialogMode === "edit" && editingProfileName) {
-          const update: UpdateProvider = { ...provider, original_name: editingProfileName };
+        if (dialogMode === "edit" && originalProfileKey) {
+          const update: UpdateProvider = { ...provider, original_name: originalProfileKey };
           nextConfig = await invoke<AppConfig>("update_provider", { provider: update });
         } else {
           nextConfig = await invoke<AppConfig>("add_existing_provider", { provider });
@@ -1780,23 +1976,30 @@ function App() {
         nextConfig = await invoke<AppConfig>("create_provider", { provider });
       }
 
-      const savedProfile = nextConfig.provider_profiles.find((profile) => profile.name === savedProfileName);
+      savedProfileKey = nextConfig.active_provider || originalProfileKey;
+      const savedProfile =
+        nextConfig.provider_profiles.find((profile) => profileKey(profile) === savedProfileKey) ||
+        nextConfig.provider_profiles.find((profile) => profile.name === savedProfileName);
+      savedProfileKey = savedProfile ? profileKey(savedProfile) : savedProfileKey;
       savedBot = savedProfile?.bot ?? savedBot;
-      if (extensionsEnabled && savedProfileName && isStaticAuthBot(savedBot)) {
+      if (extensionsEnabled && savedProfileKey && isStaticAuthBot(savedBot)) {
         nextConfig = await invoke<AppConfig>("configure_bot_integration", {
-          profileName: savedProfileName,
+          profileName: savedProfileKey,
         });
-        savedBot = nextConfig.provider_profiles.find((profile) => profile.name === savedProfileName)?.bot ?? savedBot;
+        savedBot =
+          nextConfig.provider_profiles.find((profile) => profileKey(profile) === savedProfileKey)
+            ?.bot ?? savedBot;
       }
 
       setConfig(nextConfig);
       setSettingsOpen(false);
       setEditingProfileName(null);
+      setEditingProfileKey(null);
       setDialogMode("add");
       setForm(emptyForm);
       await refreshStatus();
-      if (extensionsEnabled && savedProfileName && shouldStartQrLogin(savedBot)) {
-        await openWeixinBotLogin(savedProfileName);
+      if (extensionsEnabled && savedProfileKey && shouldStartQrLogin(savedBot)) {
+        await openWeixinBotLogin(savedProfileKey);
       }
     } catch (error) {
       showSettingsError(error);
@@ -1804,6 +2007,7 @@ function App() {
   }, [
     config,
     dialogMode,
+    editingProfileKey,
     editingProfileName,
     form,
     openWeixinBotLogin,
@@ -1871,6 +2075,7 @@ function App() {
 
   const launchProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
+      const key = profileKey(profile);
       const usesCliMode = remoteFrontendModeUsesCli(profile.remote_frontend_mode);
       const startRemote = options.startRemote === true || usesCliMode;
       const startCloud = startRemote && options.startCloud === true;
@@ -1879,7 +2084,7 @@ function App() {
       try {
         if (usesCliMode) {
           await invoke<RemoteControlInfo>("start_remote_control", {
-            profileName: profile.name,
+            profileName: key,
             remotePassword: null,
             useCloudRelay: startCloud,
             requireE2ee,
@@ -1888,7 +2093,7 @@ function App() {
             current
               ? {
                   ...current,
-                  active_provider: profile.name,
+                  active_provider: key,
                 }
               : current,
           );
@@ -1899,13 +2104,13 @@ function App() {
         const info = await invoke<LaunchInfo>("launch_codex", {
           cdpPort: config?.cdp_port || null,
           codexPath: config?.codex_path || null,
-          profileName: profile.name,
+          profileName: key,
         });
 
         setInstanceStatuses((current) => {
           const next = new Map(current);
-          const existing = next.get(profile.name);
-          next.set(profile.name, {
+          const existing = next.get(key);
+          next.set(key, {
             ...info,
             remote_control: existing?.remote_control || null,
           });
@@ -1915,7 +2120,7 @@ function App() {
           current
             ? {
                 ...current,
-                active_provider: profile.name,
+                active_provider: key,
                 codex_home: info.codex_home,
               }
             : current,
@@ -1923,7 +2128,7 @@ function App() {
 
         if (startRemote) {
           await invoke<RemoteControlInfo>("start_remote_control", {
-            profileName: profile.name,
+            profileName: key,
             remotePassword: null,
             useCloudRelay: startCloud,
             requireE2ee,
@@ -1946,7 +2151,7 @@ function App() {
   const stopCodex = useCallback(
     async (profile: ProviderProfile) => {
       try {
-        await invoke("stop_codex", { profileName: profile.name });
+        await invoke("stop_codex", { profileName: profileKey(profile) });
         await refreshStatus();
       } catch (error) {
         showSettingsError(error);
@@ -1957,7 +2162,7 @@ function App() {
 
   const toggleProfile = useCallback(
     async (profile: ProviderProfile, options: Partial<RemoteLaunchOptions> = {}) => {
-      const status = instanceStatuses.get(profile.name);
+      const status = instanceStatuses.get(profileKey(profile));
       const isRunning = Boolean(status?.running || status?.remote_control?.running);
       if (isRunning) {
         await stopCodex(profile);
@@ -1970,7 +2175,7 @@ function App() {
 
   const setRemoteLaunchOptions = useCallback(
     async (profileName: string, options: Partial<RemoteLaunchOptions>) => {
-      const profile = config?.provider_profiles.find((item) => item.name === profileName);
+      const profile = config?.provider_profiles.find((item) => profileKey(item) === profileName || item.name === profileName);
       if (!profile) {
         return;
       }
@@ -2020,7 +2225,7 @@ function App() {
 
     try {
       const nextConfig = await invoke<AppConfig>("delete_provider", {
-        name: pendingDeleteProfile.name,
+        name: profileKey(pendingDeleteProfile),
         removeCodexHome,
       });
       setConfig(nextConfig);
@@ -2226,11 +2431,12 @@ function App() {
         {filteredProfiles.length > 0 ? (
           <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             {filteredProfiles.map((profile) => {
-              const status = instanceStatuses.get(profile.name) || null;
+              const key = profileKey(profile);
+              const status = instanceStatuses.get(key) || instanceStatuses.get(profile.name) || null;
               const usesCliMode = remoteFrontendModeUsesCli(profile.remote_frontend_mode);
               return (
                 <ProfileCard
-                  key={profile.name}
+                  key={key}
                   profile={profile}
                   status={status}
                   remoteLaunchOptions={{
@@ -2542,7 +2748,7 @@ function ProfileCard({
   const remoteFrontendMode = normalizeRemoteFrontendMode(profile.remote_frontend_mode);
   const providerLine =
     isProviderlessWorkspace(profile)
-      ? strings.none
+      ? strings.providerlessWorkspace
       : profile.provider_name && profile.provider_name !== codexProfileName
       ? `${codexProfileName} / ${profile.provider_name}`
       : codexProfileName || profile.provider_name;
@@ -2648,7 +2854,7 @@ function ProfileCard({
           options={remoteLaunchOptions}
           onToggleProfile={() => onToggleProfile(profile, remoteLaunchOptions)}
           onOptionsChange={(options) => {
-            onRemoteLaunchOptionsChange(profile.name, options).catch(onError);
+            onRemoteLaunchOptionsChange(profileKey(profile), options).catch(onError);
           }}
           onError={onError}
         />
@@ -2907,8 +3113,17 @@ function AppSettingsDialog({
   const [extensionError, setExtensionError] = useState("");
   const [gatewayForm, setGatewayForm] = useState<GatewayConfigForm | null>(null);
   const [gatewayError, setGatewayError] = useState("");
+  const [usageSummary, setUsageSummary] = useState<GatewayUsageSummary | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageError, setUsageError] = useState("");
+  const [usageDateRange, setUsageDateRange] = useState<GatewayUsageDateRange>(() =>
+    gatewayUsageDateRangeForHours(24),
+  );
+  const [usageFullscreen, setUsageFullscreen] = useState(false);
   const botEnabled = draftExtensions.enabled && draftExtensions.bot_gateway_enabled;
   const gatewayEnabled = draftExtensions.enabled && draftExtensions.next_ai_gateway_enabled;
+  const gatewayUsageEnabled = gatewayEnabled && Boolean(gatewayForm?.usageCaptureEnabled);
+  const usageFullscreenActive = activeSection === "usage" && usageFullscreen;
 
   const loadBuiltinExtensions = useCallback(async () => {
     try {
@@ -2961,22 +3176,58 @@ function AppSettingsDialog({
   }, []);
 
   useEffect(() => {
-    if (activeSection === "gateway" && gatewayEnabled) {
+    if (gatewayEnabled && gatewayForm === null) {
       loadGatewayConfig().catch(console.error);
     }
-  }, [activeSection, gatewayEnabled, loadGatewayConfig]);
+  }, [gatewayEnabled, gatewayForm, loadGatewayConfig]);
 
   useEffect(() => {
-    if (activeSection === "gateway" && !gatewayEnabled) {
+    if ((activeSection === "gateway" || activeSection === "usage") && !gatewayEnabled) {
       setActiveSection("extensions");
     }
   }, [activeSection, gatewayEnabled]);
+
+  useEffect(() => {
+    if (activeSection === "usage" && gatewayForm && !gatewayForm.usageCaptureEnabled) {
+      setActiveSection("gateway");
+    }
+  }, [activeSection, gatewayForm]);
+
+  useEffect(() => {
+    if (activeSection !== "usage" && usageFullscreen) {
+      setUsageFullscreen(false);
+    }
+  }, [activeSection, usageFullscreen]);
 
   useEffect(() => {
     if (activeSection === "bot" && !botEnabled) {
       setActiveSection("extensions");
     }
   }, [activeSection, botEnabled]);
+
+  const loadGatewayUsage = useCallback(async () => {
+    setUsageLoading(true);
+    setUsageError("");
+    try {
+      const summary = await invoke<GatewayUsageSummary>("get_gateway_usage_summary", {
+        days: usageDateRange.hours ? undefined : 30,
+        hours: usageDateRange.hours,
+        startDate: usageDateRange.hours ? undefined : usageDateRange.startDate,
+        endDate: usageDateRange.hours ? undefined : usageDateRange.endDate,
+      });
+      setUsageSummary(summary);
+    } catch (error) {
+      setUsageError(errorMessage(error));
+    } finally {
+      setUsageLoading(false);
+    }
+  }, [usageDateRange]);
+
+  useEffect(() => {
+    if (activeSection === "usage" && gatewayUsageEnabled) {
+      loadGatewayUsage().catch(console.error);
+    }
+  }, [activeSection, gatewayUsageEnabled, loadGatewayUsage]);
 
   const showToast = (status: ToastState["status"], message: string) => {
     const id = Date.now();
@@ -3080,6 +3331,8 @@ function AppSettingsDialog({
         ? strings.bot
       : activeSection === "gateway"
         ? strings.gateway
+      : activeSection === "usage"
+        ? strings.gatewayUsage
         : activeSection === "updates"
           ? strings.updates
           : strings.appSettingsTitle;
@@ -3092,6 +3345,8 @@ function AppSettingsDialog({
         ? strings.botSettingsDescription
       : activeSection === "gateway"
         ? strings.gatewaySettingsDescription
+      : activeSection === "usage"
+        ? strings.gatewayUsageSettingsDescription
         : activeSection === "updates"
           ? strings.updatesDescription
           : strings.appSettingsDescription;
@@ -3106,16 +3361,22 @@ function AppSettingsDialog({
       }}
     >
       <DialogContent
-        className="h-[80vh] w-[80vw] max-w-none grid-cols-[220px_1fr] gap-0 overflow-hidden p-0"
+        className={cn(
+          "max-w-none gap-0 overflow-hidden p-0",
+          usageFullscreenActive
+            ? "h-[100dvh] w-[100dvw] grid-cols-[1fr] rounded-none border-0"
+            : "h-[calc(100dvh-24px)] w-[calc(100dvw-24px)] grid-cols-[56px_minmax(0,1fr)] sm:h-[88dvh] sm:w-[92dvw] sm:grid-cols-[180px_minmax(0,1fr)] lg:h-[80vh] lg:w-[80vw] lg:grid-cols-[220px_minmax(0,1fr)]",
+        )}
       >
+        {!usageFullscreenActive ? (
         <aside className="flex min-h-0 flex-col border-r border-border bg-muted/20">
-          <div className="border-b border-border px-5 py-4">
-            <div className="flex items-center gap-2 text-base font-semibold">
+          <div className="border-b border-border px-2 py-4 sm:px-4 lg:px-5">
+            <div className="flex items-center justify-center gap-2 text-base font-semibold sm:justify-start">
               <Settings className="h-4 w-4" />
-              {strings.appSettingsTitle}
+              <span className="hidden min-w-0 truncate sm:inline">{strings.appSettingsTitle}</span>
             </div>
           </div>
-          <nav className="flex-1 space-y-1 p-3">
+          <nav className="flex-1 space-y-1 p-2 sm:p-3">
             <SettingsNavButton
               active={activeSection === "general"}
               icon={<Settings className="h-4 w-4" />}
@@ -3156,11 +3417,20 @@ function AppSettingsDialog({
                 onClick={() => setActiveSection("gateway")}
               />
             ) : null}
+            {gatewayUsageEnabled ? (
+              <SettingsNavButton
+                active={activeSection === "usage"}
+                icon={<LayoutDashboard className="h-4 w-4" />}
+                label={strings.gatewayUsage}
+                onClick={() => setActiveSection("usage")}
+              />
+            ) : null}
           </nav>
         </aside>
+        ) : null}
 
-        <section className="flex min-h-0 flex-col">
-          <DialogHeader className="flex-row items-center justify-between gap-4 border-b border-border px-6 py-4 pr-16">
+        <section className="flex min-h-0 min-w-0 flex-col">
+          <DialogHeader className="flex-row items-start justify-between gap-3 border-b border-border px-3 py-3 pr-14 sm:items-center sm:px-6 sm:py-4 sm:pr-16">
             <div className="min-w-0">
               <DialogTitle className="text-base">{sectionTitle}</DialogTitle>
               <DialogDescription>{sectionDescription}</DialogDescription>
@@ -3186,7 +3456,12 @@ function AppSettingsDialog({
             ) : null}
           </DialogHeader>
 
-          <div className="flex-1 overflow-auto px-6 py-6">
+          <div
+            className={cn(
+              "flex-1 overflow-auto px-3 py-4 sm:px-6 sm:py-6",
+              usageFullscreenActive && "sm:px-8",
+            )}
+          >
             {activeSection === "general" ? (
               <div className="max-w-2xl space-y-7">
                 <div className="grid grid-cols-[180px_1fr] items-start gap-6">
@@ -3335,6 +3610,22 @@ function AppSettingsDialog({
                 onReload={() => loadGatewayConfig().catch(console.error)}
                 onChange={setGatewayForm}
               />
+            ) : activeSection === "usage" ? (
+              <div className={cn("max-w-5xl", usageFullscreenActive && "max-w-none")}>
+                <GatewayUsageDashboard
+                  summary={usageSummary}
+                  loading={usageLoading}
+                  error={usageError || gatewayError}
+                  strings={strings}
+                  dateRange={usageDateRange}
+                  onDateRangeChange={setUsageDateRange}
+                  onPresetHours={(hours) => setUsageDateRange(gatewayUsageDateRangeForHours(hours))}
+                  onPresetRange={(days) => setUsageDateRange(gatewayUsageDateRangeForDays(days))}
+                  fullscreen={usageFullscreenActive}
+                  onToggleFullscreen={() => setUsageFullscreen((current) => !current)}
+                  onRefresh={() => loadGatewayUsage().catch(console.error)}
+                />
+              </div>
             ) : (
               <AppUpdatePanel
                 strings={strings}
@@ -3345,6 +3636,7 @@ function AppSettingsDialog({
             )}
           </div>
 
+          {!usageFullscreenActive ? (
           <DialogFooter className="border-t border-border px-6 py-4">
             <Button
               type="button"
@@ -3355,6 +3647,7 @@ function AppSettingsDialog({
               {strings.save}
             </Button>
           </DialogFooter>
+          ) : null}
         </section>
         {toast ? <SettingsToast toast={toast} /> : null}
         {botEditor ? (
@@ -3410,15 +3703,16 @@ function SettingsNavButton({
     <button
       type="button"
       className={cn(
-        "flex h-10 w-full items-center gap-2 rounded-md px-3 text-left text-sm font-medium",
+        "flex h-10 w-full items-center justify-center gap-2 rounded-md px-2 text-left text-sm font-medium sm:justify-start sm:px-3",
         active
           ? "bg-secondary text-secondary-foreground"
           : "text-muted-foreground hover:bg-muted hover:text-foreground",
       )}
+      title={label}
       onClick={onClick}
     >
       {icon}
-      {label}
+      <span className="hidden min-w-0 truncate sm:inline">{label}</span>
     </button>
   );
 }
@@ -3850,6 +4144,32 @@ function GatewaySettingsPanel({
   const [virtualProfileDialog, setVirtualProfileDialog] =
     useState<GatewayVirtualProfileDialogState | null>(null);
   const [activeGatewayTab, setActiveGatewayTab] = useState<GatewaySettingsTab>("providers");
+  const [availableTools, setAvailableTools] = useState<GatewayAvailableTool[]>([]);
+  const [availableToolsLoading, setAvailableToolsLoading] = useState(false);
+  const [availableToolsError, setAvailableToolsError] = useState("");
+  const [availableToolsLoaded, setAvailableToolsLoaded] = useState(false);
+
+  const loadGatewayTools = useCallback(async () => {
+    setAvailableToolsLoading(true);
+    setAvailableToolsError("");
+    try {
+      const response = await invoke<GatewayToolsResponse>("get_gateway_tools");
+      setAvailableTools(gatewayAvailableToolsFromResponse(response));
+      setAvailableToolsLoaded(true);
+    } catch (error) {
+      setAvailableToolsError(errorMessage(error));
+      setAvailableTools([]);
+      setAvailableToolsLoaded(true);
+    } finally {
+      setAvailableToolsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeGatewayTab === "tools" && !availableToolsLoaded && !availableToolsLoading) {
+      loadGatewayTools().catch(console.error);
+    }
+  }, [activeGatewayTab, availableToolsLoaded, availableToolsLoading, loadGatewayTools]);
 
   if (!form) {
     return (
@@ -3911,7 +4231,7 @@ function GatewaySettingsPanel({
   const openAddVirtualProfileDialog = () =>
     setVirtualProfileDialog({
       mode: "add",
-      profile: createGatewayVirtualProfileForm(),
+      profile: createGatewayVirtualProfileForm(availableTools),
     });
   const openEditVirtualProfileDialog = (profile: GatewayVirtualProfileForm) =>
     setVirtualProfileDialog({
@@ -3971,6 +4291,7 @@ function GatewaySettingsPanel({
         ),
       };
     });
+    setAvailableToolsLoaded(false);
     setMcpServerDialog(null);
   };
   const saveVirtualProfileDialog = () => {
@@ -4023,6 +4344,23 @@ function GatewaySettingsPanel({
           <Field label={strings.port}>
             <Input value={form.port} inputMode="numeric" onChange={(event) => update({ port: event.target.value })} />
           </Field>
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <SectionTitle icon={<Activity className="h-4 w-4" />} title={strings.gatewayUsageCapture} />
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-md border border-border bg-muted/10 px-3 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium">{strings.gatewayUsageCapture}</div>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              {strings.gatewayUsageCaptureDescription}
+            </p>
+          </div>
+          <Switch
+            checked={form.usageCaptureEnabled}
+            aria-label={strings.gatewayUsageCapture}
+            onCheckedChange={(checked) => update({ usageCaptureEnabled: checked === true })}
+          />
         </div>
       </section>
 
@@ -4109,8 +4447,12 @@ function GatewaySettingsPanel({
             form.mcpServers.map((server) => (
               <div key={server.id} className="rounded-md border border-border bg-muted/10 px-3 py-3">
                 <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.8fr)_120px_minmax(0,1.4fr)]">
+                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.8fr)_88px_120px_minmax(0,1.4fr)]">
                     <GatewayProviderSummaryField label={strings.name} value={server.name || strings.none} />
+                    <GatewayProviderSummaryField
+                      label={strings.enabled}
+                      value={server.enabled ? strings.enabled : strings.disabled}
+                    />
                     <GatewayProviderSummaryField label={strings.transport} value={server.transport} />
                     <GatewayProviderSummaryField
                       label={server.transport === "websocket" ? strings.url : strings.command}
@@ -4118,13 +4460,28 @@ function GatewaySettingsPanel({
                     />
                   </div>
                   <div className="flex items-center justify-end gap-2">
+                    <Switch
+                      checked={server.enabled}
+                      aria-label={`${strings.enabled}: ${server.name || strings.mcpServers}`}
+                      onCheckedChange={(checked) => {
+                        setAvailableToolsLoaded(false);
+                        update({
+                          mcpServers: form.mcpServers.map((item) =>
+                            item.id === server.id ? { ...item, enabled: checked === true } : item,
+                          ),
+                        });
+                      }}
+                    />
                     <IconButton title={strings.editMcpServer} onClick={() => openEditMcpServerDialog(server)}>
                       <Pencil className="h-4 w-4" />
                     </IconButton>
                     <IconButton
                       title={strings.delete}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                      onClick={() => update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) })}
+                      onClick={() => {
+                        setAvailableToolsLoaded(false);
+                        update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) });
+                      }}
                     >
                       <Trash2 className="h-4 w-4" />
                     </IconButton>
@@ -4266,8 +4623,12 @@ function GatewaySettingsPanel({
             </DialogHeader>
             <GatewayVirtualProfileEditor
               profile={virtualProfileDialog.profile}
+              availableTools={availableTools}
+              availableToolsLoading={availableToolsLoading}
+              availableToolsError={availableToolsError}
               strings={strings}
               onChange={updateDialogVirtualProfile}
+              onRefreshTools={loadGatewayTools}
             />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setVirtualProfileDialog(null)}>
@@ -4281,6 +4642,583 @@ function GatewaySettingsPanel({
         ) : null}
       </Dialog>
     </div>
+  );
+}
+
+function GatewayUsageDashboard({
+  summary,
+  loading,
+  error,
+  strings,
+  dateRange,
+  onDateRangeChange,
+  onPresetHours,
+  onPresetRange,
+  fullscreen,
+  onToggleFullscreen,
+  onRefresh,
+}: {
+  summary: GatewayUsageSummary | null;
+  loading: boolean;
+  error: string;
+  strings: AppStrings;
+  dateRange: GatewayUsageDateRange;
+  onDateRangeChange: React.Dispatch<React.SetStateAction<GatewayUsageDateRange>>;
+  onPresetHours: (hours: number) => void;
+  onPresetRange: (days: number) => void;
+  fullscreen: boolean;
+  onToggleFullscreen: () => void;
+  onRefresh: () => void;
+}) {
+  const totals = summary?.totals;
+  const requestCount = totals?.requestCount ?? 0;
+  const successRate = requestCount > 0 ? (totals?.successCount ?? 0) / requestCount : 0;
+  const cacheTokens = gatewayUsageCacheTokens(totals);
+  const cacheRate = gatewayUsageCacheRate(totals);
+  const hasUsage = requestCount > 0;
+  const [breakdownMode, setBreakdownMode] = useState<GatewayUsageBreakdownMode>("model");
+
+  return (
+    <section className="space-y-4">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <SectionTitle icon={<Activity className="h-4 w-4" />} title={strings.gatewayUsageDashboard} />
+        <div className="grid w-full gap-2 sm:grid-cols-[auto_minmax(0,1fr)_auto] xl:w-auto xl:flex xl:flex-wrap xl:items-center xl:justify-end">
+          <div
+            className="grid grid-cols-[repeat(auto-fit,minmax(58px,1fr))] gap-1 rounded-md border border-border bg-muted/10 p-1 sm:inline-flex"
+            aria-label={strings.gatewayUsageDateRange}
+          >
+            <button
+              type="button"
+              className={cn(
+                "h-8 rounded px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground",
+                usageDateRangeMatchesHours(dateRange, 24) && "bg-background text-foreground shadow-xs",
+              )}
+              onClick={() => onPresetHours(24)}
+            >
+              {strings.gatewayUsageLast24Hours}
+            </button>
+            {[7, 30, 90].map((days) => (
+              <button
+                key={days}
+                type="button"
+                className={cn(
+                  "h-8 rounded px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground",
+                  usageDateRangeMatchesDays(dateRange, days) && "bg-background text-foreground shadow-xs",
+                )}
+                onClick={() => onPresetRange(days)}
+              >
+                {days === 7
+                  ? strings.gatewayUsageLast7Days
+                  : days === 30
+                    ? strings.gatewayUsageLast30Days
+                    : strings.gatewayUsageLast90Days}
+              </button>
+            ))}
+          </div>
+          <div className="grid min-w-0 grid-cols-2 gap-2">
+            <Input
+              type="date"
+              className="h-9 min-w-0"
+              value={dateRange.startDate}
+              aria-label={strings.gatewayUsageStartDate}
+              onChange={(event) =>
+                onDateRangeChange((current) => ({
+                  ...current,
+                  hours: undefined,
+                  startDate: event.target.value,
+                }))
+              }
+            />
+            <Input
+              type="date"
+              className="h-9 min-w-0"
+              value={dateRange.endDate}
+              aria-label={strings.gatewayUsageEndDate}
+              onChange={(event) =>
+                onDateRangeChange((current) => ({
+                  ...current,
+                  hours: undefined,
+                  endDate: event.target.value,
+                }))
+              }
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:flex">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="min-w-0"
+              title={strings.gatewayUsageRefresh}
+              onClick={onRefresh}
+              disabled={loading}
+            >
+              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+              <span className="hidden lg:inline">{strings.gatewayUsageRefresh}</span>
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="min-w-0"
+              title={fullscreen ? strings.gatewayUsageExitFullscreen : strings.gatewayUsageEnterFullscreen}
+              onClick={onToggleFullscreen}
+            >
+              {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              <span className="hidden lg:inline">
+                {fullscreen ? strings.gatewayUsageExitFullscreen : strings.gatewayUsageEnterFullscreen}
+              </span>
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {error ? (
+        <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2.5 text-sm leading-relaxed text-red-300">
+          {error}
+        </p>
+      ) : null}
+
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(min(168px,100%),1fr))] gap-3">
+        <GatewayUsageMetric
+          label={strings.gatewayUsageRequests}
+          value={formatCompactNumber(requestCount)}
+          detail={summary ? `${formatPercent(successRate)} / ${gatewayUsageWindowLabel(summary)}` : ""}
+        />
+        <GatewayUsageMetric
+          label={strings.gatewayUsageInput}
+          value={formatTokenCount(totals?.inputTokens ?? 0)}
+          detail={`${strings.gatewayUsageTotal} ${formatTokenCount(totals?.totalTokens ?? 0)}`}
+        />
+        <GatewayUsageMetric
+          label={strings.gatewayUsageOutput}
+          value={formatTokenCount(totals?.outputTokens ?? 0)}
+          detail={formatUnixDateTime(totals?.lastReceivedAtUnix)}
+        />
+        <GatewayUsageMetric
+          label={strings.gatewayUsageCache}
+          value={formatTokenCount(cacheTokens)}
+          detail={`${strings.gatewayUsageCacheRead} ${formatTokenCount(totals?.cacheReadTokens ?? 0)} / ${strings.gatewayUsageCacheWrite} ${formatTokenCount(totals?.cacheWriteTokens ?? 0)}`}
+        />
+        <GatewayUsageMetric
+          label={strings.gatewayUsageCacheRate}
+          value={formatPercent(cacheRate)}
+          detail={`${strings.gatewayUsageCacheRead} ${formatTokenCount(totals?.cacheReadTokens ?? 0)} / ${strings.gatewayUsageInput} ${formatTokenCount(gatewayUsageCacheRateBase(totals))}`}
+        />
+      </div>
+
+      {!hasUsage && !loading ? (
+        <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+          {strings.gatewayUsageNoData}
+        </div>
+      ) : null}
+
+      {hasUsage || loading ? (
+        <div className="space-y-4">
+          <GatewayUsageDailyChart daily={summary?.daily || []} strings={strings} />
+
+          <GatewayUsageBreakdownModePicker
+            mode={breakdownMode}
+            onModeChange={setBreakdownMode}
+            strings={strings}
+          />
+
+          {breakdownMode === "model" ? (
+            <GatewayUsageModelComparison items={summary?.byModel || []} strings={strings} />
+          ) : breakdownMode === "session" ? (
+            <GatewayUsageSessionAnalysis items={summary?.bySession || []} strings={strings} />
+          ) : (
+            <GatewayUsageProjectAnalysis items={summary?.byProject || []} strings={strings} />
+          )}
+
+          <GatewayUsageRequestTable items={summary?.requests || []} strings={strings} />
+        </div>
+      ) : null}
+
+      {summary?.databasePath ? (
+        <p className="truncate text-xs text-muted-foreground">
+          {strings.gatewayUsageDatabase}: {summary.databasePath}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+function GatewayUsageMetric({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <div className="min-w-0 rounded-md border border-border bg-muted/10 p-3">
+      <div className="text-xs font-medium text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate text-xl font-semibold tabular-nums sm:text-2xl">{value}</div>
+      {detail ? <div className="mt-1 truncate text-xs text-muted-foreground">{detail}</div> : null}
+    </div>
+  );
+}
+
+function GatewayUsageDailyChart({ daily, strings }: { daily: GatewayUsageDaily[]; strings: AppStrings }) {
+  const chartData = daily.map((item) => ({
+    day: item.day.slice(5),
+    input: item.inputTokens,
+    output: item.outputTokens,
+    cache: gatewayUsageCacheTokens(item),
+    total: item.totalTokens,
+  }));
+
+  return (
+    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h3 className="text-sm font-semibold">{strings.gatewayUsageDaily}</h3>
+        <span className="text-xs text-muted-foreground">{strings.gatewayUsageTokens}</span>
+      </div>
+      {chartData.length > 0 ? (
+        <div className="h-[200px] sm:h-[260px]">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={chartData} margin={{ top: 8, right: 18, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke="rgba(148, 163, 184, 0.18)" vertical={false} />
+              <XAxis
+                dataKey="day"
+                tickLine={false}
+                axisLine={false}
+                tick={{ fill: "currentColor", fontSize: 12 }}
+              />
+              <YAxis
+                width={56}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fill: "currentColor", fontSize: 12 }}
+                tickFormatter={(value) => formatTokenCount(Number(value))}
+              />
+              <RechartsTooltip
+                formatter={(value, name) => [
+                  formatTokenCount(Number(value)),
+                  gatewayUsageSeriesLabel(String(name), strings),
+                ]}
+                labelFormatter={(label) => String(label)}
+                contentStyle={{
+                  background: "hsl(var(--card))",
+                  border: "1px solid hsl(var(--border))",
+                  borderRadius: 6,
+                  color: "hsl(var(--card-foreground))",
+                }}
+              />
+              <Legend formatter={(value) => gatewayUsageSeriesLabel(String(value), strings)} />
+              <Line type="monotone" dataKey="input" stroke="#38bdf8" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="output" stroke="#34d399" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="cache" stroke="#f59e0b" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="total" stroke="hsl(var(--primary))" strokeWidth={2.5} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <p className="py-6 text-center text-sm text-muted-foreground">{strings.gatewayUsageNoData}</p>
+      )}
+    </section>
+  );
+}
+
+function GatewayUsageBreakdownModePicker({
+  mode,
+  onModeChange,
+  strings,
+}: {
+  mode: GatewayUsageBreakdownMode;
+  onModeChange: (mode: GatewayUsageBreakdownMode) => void;
+  strings: AppStrings;
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-muted/10 px-3 py-2 sm:px-4">
+      <span className="text-sm font-semibold">{strings.gatewayUsageGroupBy}</span>
+      <Select value={mode} onValueChange={(value) => onModeChange(value as GatewayUsageBreakdownMode)}>
+        <SelectTrigger className="h-9 w-[180px]">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="model">{strings.gatewayUsageByModel}</SelectItem>
+          <SelectItem value="session">{strings.gatewayUsageBySession}</SelectItem>
+          <SelectItem value="project">{strings.gatewayUsageByProject}</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function GatewayUsageModelComparison({ items, strings }: { items: GatewayUsageBreakdown[]; strings: AppStrings }) {
+  const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
+
+  return (
+    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+      <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageByModel}</h3>
+      {items.length > 0 ? (
+        <div className="space-y-3">
+          {items.map((item) => {
+            const total = Math.max(0, item.totalTokens);
+            const barWidth = `${Math.max(3, Math.round((total / maxTokens) * 100))}%`;
+            const inputWidth = total > 0 ? `${(item.inputTokens / total) * 100}%` : "0%";
+            const outputWidth = total > 0 ? `${(item.outputTokens / total) * 100}%` : "0%";
+            const cacheWidth = total > 0 ? `${(gatewayUsageCacheTokens(item) / total) * 100}%` : "0%";
+
+            return (
+              <div key={`${item.provider}-${item.providerName}-${item.model || item.label}`} className="space-y-1.5">
+                <div className="grid min-w-0 gap-1 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">
+                      {item.label || item.model || item.providerName || item.provider || strings.none}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {formatCompactNumber(item.requestCount)} {strings.gatewayUsageRequests}
+                    </div>
+                  </div>
+                  <div className="text-sm tabular-nums sm:shrink-0 sm:text-right">{formatTokenCount(item.totalTokens)}</div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={item.label}>
+                  <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
+                    {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
+                    {item.outputTokens > 0 ? (
+                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
+                    ) : null}
+                    {gatewayUsageCacheTokens(item) > 0 ? (
+                      <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
+                    ) : null}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                  <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
+                  <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
+                  <span>{strings.gatewayUsageCache} {formatTokenCount(gatewayUsageCacheTokens(item))}</span>
+                  <span>{strings.gatewayUsageCacheRate} {formatPercent(gatewayUsageCacheRate(item))}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="py-6 text-center text-sm text-muted-foreground">{strings.gatewayUsageNoData}</p>
+      )}
+    </section>
+  );
+}
+
+function GatewayUsageSessionAnalysis({
+  items,
+  strings,
+}: {
+  items: GatewayUsageSessionBreakdown[];
+  strings: AppStrings;
+}) {
+  const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
+
+  return (
+    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+      <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageBySession}</h3>
+      {items.length > 0 ? (
+        <div className="space-y-3">
+          {items.map((item) => {
+            const total = Math.max(0, item.totalTokens);
+            const barWidth = `${Math.max(3, Math.round((total / maxTokens) * 100))}%`;
+            const inputWidth = total > 0 ? `${(item.inputTokens / total) * 100}%` : "0%";
+            const outputWidth = total > 0 ? `${(item.outputTokens / total) * 100}%` : "0%";
+            const cacheWidth = total > 0 ? `${(gatewayUsageCacheTokens(item) / total) * 100}%` : "0%";
+            const sessionLabel = item.label || gatewayUsageSessionLabel(item.sessionId, strings);
+            const projectLabel = item.projectLabel || strings.gatewayUsageUnknownProject;
+
+            return (
+              <div key={item.sessionId || item.label} className="space-y-1.5">
+                <div className="grid min-w-0 gap-1 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium" title={sessionLabel}>
+                      {compactGatewayUsageLabel(sessionLabel)}
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                      <span>
+                        {formatCompactNumber(item.requestCount)} {strings.gatewayUsageRequests}
+                      </span>
+                      <span className="truncate" title={item.projectPath || projectLabel}>
+                        {projectLabel}
+                      </span>
+                      <span>
+                        {strings.gatewayUsageLastSeen} {formatUnixDateTime(item.lastReceivedAtUnix)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="space-y-0.5 text-sm tabular-nums sm:shrink-0 sm:text-right">
+                    <div>{formatTokenCount(item.totalTokens)}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {strings.gatewayUsageCacheRate} {formatPercent(gatewayUsageCacheRate(item))}
+                    </div>
+                  </div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={sessionLabel}>
+                  <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
+                    {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
+                    {item.outputTokens > 0 ? (
+                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
+                    ) : null}
+                    {gatewayUsageCacheTokens(item) > 0 ? (
+                      <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
+                    ) : null}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                  <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
+                  <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
+                  <span>{strings.gatewayUsageCache} {formatTokenCount(gatewayUsageCacheTokens(item))}</span>
+                  <span>{strings.gatewayUsageFirstSeen} {formatUnixDateTime(item.firstReceivedAtUnix)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="py-6 text-center text-sm text-muted-foreground">{strings.gatewayUsageNoData}</p>
+      )}
+    </section>
+  );
+}
+
+function GatewayUsageProjectAnalysis({
+  items,
+  strings,
+}: {
+  items: GatewayUsageProjectBreakdown[];
+  strings: AppStrings;
+}) {
+  const maxTokens = Math.max(...items.map((item) => item.totalTokens), 1);
+
+  return (
+    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+      <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageByProject}</h3>
+      {items.length > 0 ? (
+        <div className="space-y-3">
+          {items.map((item) => {
+            const total = Math.max(0, item.totalTokens);
+            const barWidth = `${Math.max(3, Math.round((total / maxTokens) * 100))}%`;
+            const inputWidth = total > 0 ? `${(item.inputTokens / total) * 100}%` : "0%";
+            const outputWidth = total > 0 ? `${(item.outputTokens / total) * 100}%` : "0%";
+            const cacheWidth = total > 0 ? `${(gatewayUsageCacheTokens(item) / total) * 100}%` : "0%";
+            const label = item.label || strings.gatewayUsageUnknownProject;
+
+            return (
+              <div key={item.projectPath || label} className="space-y-1.5">
+                <div className="grid min-w-0 gap-1 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium" title={item.projectPath || label}>
+                      {compactGatewayUsageLabel(label)}
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                      <span>
+                        {formatCompactNumber(item.sessionCount)} {strings.gatewayUsageSession}
+                      </span>
+                      <span>
+                        {formatCompactNumber(item.requestCount)} {strings.gatewayUsageRequests}
+                      </span>
+                      <span>
+                        {strings.gatewayUsageLastSeen} {formatUnixDateTime(item.lastReceivedAtUnix)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="space-y-0.5 text-sm tabular-nums sm:shrink-0 sm:text-right">
+                    <div>{formatTokenCount(item.totalTokens)}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {strings.gatewayUsageCacheRate} {formatPercent(gatewayUsageCacheRate(item))}
+                    </div>
+                  </div>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-muted" aria-label={label}>
+                  <div className="flex h-full min-w-1 overflow-hidden rounded-full" style={{ width: barWidth }}>
+                    {item.inputTokens > 0 ? <div className="h-full bg-sky-400" style={{ width: inputWidth }} /> : null}
+                    {item.outputTokens > 0 ? (
+                      <div className="h-full bg-emerald-400" style={{ width: outputWidth }} />
+                    ) : null}
+                    {gatewayUsageCacheTokens(item) > 0 ? (
+                      <div className="h-full bg-amber-500" style={{ width: cacheWidth }} />
+                    ) : null}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                  <span>{strings.gatewayUsageInput} {formatTokenCount(item.inputTokens)}</span>
+                  <span>{strings.gatewayUsageOutput} {formatTokenCount(item.outputTokens)}</span>
+                  <span>{strings.gatewayUsageCache} {formatTokenCount(gatewayUsageCacheTokens(item))}</span>
+                  <span>{strings.gatewayUsageFirstSeen} {formatUnixDateTime(item.firstReceivedAtUnix)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="py-6 text-center text-sm text-muted-foreground">{strings.gatewayUsageNoData}</p>
+      )}
+    </section>
+  );
+}
+
+function GatewayUsageRequestTable({ items, strings }: { items: GatewayUsageRequestEvent[]; strings: AppStrings }) {
+  return (
+    <section className="rounded-md border border-border bg-muted/10 p-3 sm:p-4">
+      <h3 className="mb-3 text-sm font-semibold">{strings.gatewayUsageRequestList}</h3>
+      {items.length > 0 ? (
+        <div className="overflow-x-auto rounded border border-border/70">
+          <div className="min-w-[960px]">
+            <div className="grid grid-cols-[116px_160px_minmax(180px,1fr)_86px_70px_70px_70px_70px_66px] bg-muted/20 px-2 py-2 text-xs font-medium text-muted-foreground sm:px-3">
+              <span>{strings.gatewayUsageTime}</span>
+              <span>{strings.gatewayUsageSession}</span>
+              <span>{strings.model}</span>
+              <span>{strings.status}</span>
+              <span className="text-right">{strings.gatewayUsageInput}</span>
+              <span className="text-right">{strings.gatewayUsageOutput}</span>
+              <span className="text-right">{strings.gatewayUsageCache}</span>
+              <span className="text-right">{strings.gatewayUsageTotal}</span>
+              <span className="text-right">{strings.gatewayUsageLatency}</span>
+            </div>
+            {items.map((event) => {
+              const sessionLabel = event.clientSessionLabel || gatewayUsageSessionLabel(event.clientSessionId, strings);
+              const projectLabel = event.clientProjectLabel || strings.gatewayUsageUnknownProject;
+
+              return (
+                <div
+                  key={event.eventId}
+                  className="grid grid-cols-[116px_160px_minmax(180px,1fr)_86px_70px_70px_70px_70px_66px] items-center border-t border-border/70 px-2 py-2 text-sm sm:px-3"
+                >
+                  <span className="truncate text-xs text-muted-foreground">{formatUnixDateTime(event.receivedAtUnix)}</span>
+                  <div className="min-w-0 text-xs text-muted-foreground" title={sessionLabel}>
+                    <div className="truncate">{compactGatewayUsageLabel(sessionLabel)}</div>
+                    <div className="truncate" title={event.clientProjectPath || projectLabel}>
+                      {projectLabel}
+                    </div>
+                  </div>
+                  <div className="min-w-0">
+                    <div className="truncate font-medium">
+                      {event.model || event.providerName || event.provider || strings.none}
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {event.route || event.requestId || event.eventId}
+                    </div>
+                  </div>
+                  <span>
+                    <Badge className={gatewayUsageStatusClass(event.status)}>{event.status || strings.none}</Badge>
+                  </span>
+                  <span className="text-right tabular-nums text-muted-foreground">
+                    {formatTokenCount(event.inputTokens)}
+                  </span>
+                  <span className="text-right tabular-nums text-muted-foreground">
+                    {formatTokenCount(event.outputTokens)}
+                  </span>
+                  <span className="text-right tabular-nums text-muted-foreground">
+                    {formatTokenCount(gatewayUsageCacheTokens(event))}
+                  </span>
+                  <span className="text-right tabular-nums text-muted-foreground">
+                    {formatTokenCount(event.totalTokens)}
+                  </span>
+                  <span className="text-right text-xs tabular-nums text-muted-foreground">
+                    {event.latencyMs !== null ? formatLatency(event.latencyMs) : "-"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <p className="py-6 text-center text-sm text-muted-foreground">{strings.gatewayUsageNoData}</p>
+      )}
+    </section>
   );
 }
 
@@ -4361,6 +5299,11 @@ function GatewayMcpServerEditor({
 }) {
   return (
     <div className="grid gap-4">
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/10 px-3 py-2.5">
+        <div className="text-sm font-medium">{strings.enabled}</div>
+        <Switch checked={server.enabled} onCheckedChange={(checked) => onChange({ enabled: checked === true })} />
+      </div>
+
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label={strings.name}>
           <Input autoFocus value={server.name} onChange={(event) => onChange({ name: event.target.value })} />
@@ -4402,6 +5345,7 @@ function GatewayMcpServerEditor({
             <textarea
               className={gatewayTextareaClassName}
               spellCheck={false}
+              autoCapitalize="none"
               value={server.headersJson}
               onChange={(event) => onChange({ headersJson: event.target.value })}
             />
@@ -4409,23 +5353,59 @@ function GatewayMcpServerEditor({
         </>
       ) : (
         <>
-          <Field label={strings.command}>
-            <Input value={server.command} onChange={(event) => onChange({ command: event.target.value })} />
-          </Field>
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_180px]">
+            <Field label={strings.command}>
+              <Input
+                value={server.command}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                onChange={(event) => onChange({ command: event.target.value })}
+              />
+            </Field>
+            <Field label={strings.stdioMessageMode}>
+              <Select
+                value={server.stdioMessageMode}
+                onValueChange={(value) =>
+                  onChange({
+                    stdioMessageMode: value === "content-length" ? "content-length" : "newline-json",
+                  })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="newline-json">newline-json</SelectItem>
+                  <SelectItem value="content-length">content-length</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
           <Field label={strings.args}>
             <Input
               value={server.args}
               placeholder="-y, @modelcontextprotocol/server-filesystem, ."
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               onChange={(event) => onChange({ args: event.target.value })}
             />
           </Field>
           <Field label={strings.cwd}>
-            <Input value={server.cwd} onChange={(event) => onChange({ cwd: event.target.value })} />
+            <Input
+              value={server.cwd}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              onChange={(event) => onChange({ cwd: event.target.value })}
+            />
           </Field>
           <Field label={strings.envJson}>
             <textarea
               className={gatewayTextareaClassName}
               spellCheck={false}
+              autoCapitalize="none"
               value={server.envJson}
               onChange={(event) => onChange({ envJson: event.target.value })}
             />
@@ -4461,24 +5441,41 @@ function GatewayMcpServerEditor({
 
 function GatewayVirtualProfileEditor({
   profile,
+  availableTools,
+  availableToolsLoading,
+  availableToolsError,
   strings,
   onChange,
+  onRefreshTools,
 }: {
   profile: GatewayVirtualProfileForm;
+  availableTools: GatewayAvailableTool[];
+  availableToolsLoading: boolean;
+  availableToolsError: string;
   strings: AppStrings;
   onChange: (patch: Partial<GatewayVirtualProfileForm>) => void;
+  onRefreshTools: () => Promise<void>;
 }) {
-  const updateTool = (toolId: string, patch: Partial<GatewayVirtualToolForm>) =>
+  const availableToolByName = useMemo(
+    () => new Map(availableTools.map((tool) => [tool.name, tool])),
+    [availableTools],
+  );
+  const selectedToolByName = useMemo(
+    () => new Map(profile.tools.map((tool) => [tool.name, tool])),
+    [profile.tools],
+  );
+  const unavailableSelectedTools = profile.tools.filter((tool) => tool.name && !availableToolByName.has(tool.name));
+  const setToolSelected = (tool: GatewayAvailableTool, selected: boolean) => {
+    if (selected) {
+      if (selectedToolByName.has(tool.name)) return;
+      onChange({ tools: [...profile.tools, gatewayVirtualToolFormFromAvailableTool(tool)] });
+      return;
+    }
+    onChange({ tools: profile.tools.filter((item) => item.name !== tool.name) });
+  };
+  const updateToolVisibility = (toolName: string, visibility: GatewayVirtualToolVisibility) =>
     onChange({
-      tools: profile.tools.map((tool) => (tool.id === toolId ? { ...tool, ...patch } : tool)),
-    });
-  const addTool = () =>
-    onChange({
-      tools: [...profile.tools, createGatewayVirtualToolForm()],
-    });
-  const deleteTool = (toolId: string) =>
-    onChange({
-      tools: profile.tools.filter((tool) => tool.id !== toolId),
+      tools: profile.tools.map((tool) => (tool.name === toolName ? { ...tool, visibility } : tool)),
     });
 
   return (
@@ -4594,66 +5591,107 @@ function GatewayVirtualProfileEditor({
 
       <div className="space-y-3">
         <div className="flex items-center justify-between gap-3">
-          <SectionTitle icon={<ImageIcon className="h-4 w-4" />} title={strings.tools} />
-          <Button type="button" variant="outline" size="sm" onClick={addTool}>
-            <Plus className="h-4 w-4" />
-            {strings.addTool}
+          <SectionTitle icon={<ImageIcon className="h-4 w-4" />} title={strings.availableMcpTools} />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onRefreshTools().catch(console.error)}
+            disabled={availableToolsLoading}
+          >
+            <RefreshCw className={cn("h-4 w-4", availableToolsLoading && "animate-spin")} />
+            {strings.reload}
           </Button>
         </div>
-        <div className="space-y-3">
-          {profile.tools.map((tool) => (
-            <div key={tool.id} className="rounded-md border border-border bg-muted/10 p-3">
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_150px_auto]">
-                <Field label={strings.name}>
-                  <Input value={tool.name} onChange={(event) => updateTool(tool.id, { name: event.target.value })} />
-                </Field>
-                <Field label={strings.visibility}>
-                  <Select
-                    value={tool.visibility}
-                    onValueChange={(value) =>
-                      updateTool(tool.id, { visibility: value === "client" ? "client" : "internal" })
+        {availableToolsError ? (
+          <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2 text-sm leading-relaxed text-red-300">
+            {availableToolsError}
+          </p>
+        ) : null}
+        {availableToolsLoading ? (
+          <div className="rounded-md border border-border bg-muted/10 px-3 py-3 text-sm text-muted-foreground">
+            {strings.gatewayToolsLoading}
+          </div>
+        ) : null}
+        <div className="space-y-2">
+          {availableTools.map((tool) => {
+            const selectedTool = selectedToolByName.get(tool.name);
+            const selected = Boolean(selectedTool);
+            return (
+              <div
+                key={tool.name}
+                className="grid gap-3 rounded-md border border-border bg-muted/10 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_150px] sm:items-center"
+              >
+                <label className="flex min-w-0 items-start gap-3">
+                  <Checkbox
+                    checked={selected}
+                    onCheckedChange={(checked) => setToolSelected(tool, checked === true)}
+                  />
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium">{tool.name}</span>
+                    {tool.description ? (
+                      <span className="mt-1 line-clamp-2 block text-xs leading-relaxed text-muted-foreground">
+                        {tool.description}
+                      </span>
+                    ) : null}
+                  </span>
+                </label>
+                <Select
+                  value={selectedTool?.visibility || "internal"}
+                  onValueChange={(value) =>
+                    updateToolVisibility(tool.name, value === "client" ? "client" : "internal")
+                  }
+                  disabled={!selected}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="internal">internal</SelectItem>
+                    <SelectItem value="client">client</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            );
+          })}
+          {unavailableSelectedTools.map((tool) => (
+            <div
+              key={tool.id}
+              className="grid gap-3 rounded-md border border-border bg-muted/10 px-3 py-3 opacity-75 sm:grid-cols-[minmax(0,1fr)_150px] sm:items-center"
+            >
+              <label className="flex min-w-0 items-start gap-3">
+                <Checkbox
+                  checked
+                  onCheckedChange={(checked) => {
+                    if (checked !== true) {
+                      onChange({ tools: profile.tools.filter((item) => item.id !== tool.id) });
                     }
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="internal">internal</SelectItem>
-                      <SelectItem value="client">client</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <div className="flex items-end justify-end">
-                  <IconButton
-                    title={strings.delete}
-                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                    onClick={() => deleteTool(tool.id)}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </IconButton>
-                </div>
-              </div>
-              <div className="mt-3 grid gap-3">
-                <Field label={strings.description}>
-                  <Input
-                    value={tool.description}
-                    onChange={(event) => updateTool(tool.id, { description: event.target.value })}
-                  />
-                </Field>
-                <Field label={strings.inputSchemaJson}>
-                  <textarea
-                    className={gatewayTextareaClassName}
-                    spellCheck={false}
-                    value={tool.inputSchemaJson}
-                    onChange={(event) => updateTool(tool.id, { inputSchemaJson: event.target.value })}
-                  />
-                </Field>
-              </div>
+                  }}
+                />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">{tool.name}</span>
+                  <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+                    {strings.unavailableTool}
+                  </span>
+                </span>
+              </label>
+              <Select
+                value={tool.visibility}
+                onValueChange={(value) => updateToolVisibility(tool.name, value === "client" ? "client" : "internal")}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="internal">internal</SelectItem>
+                  <SelectItem value="client">client</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           ))}
-          {profile.tools.length === 0 ? (
+          {availableTools.length === 0 && unavailableSelectedTools.length === 0 && !availableToolsLoading ? (
             <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
-              {strings.none}
+              {strings.noGatewayTools}
             </div>
           ) : null}
         </div>
@@ -4927,6 +5965,39 @@ function SettingsDialog({
   const isEditingDefaultWorkspace = dialogMode === "edit" && editingProfileName === "Default";
   const canChangeProviderMode = dialogMode === "add" || dialogMode === "edit";
   const showProviderModeSelector = canChangeProviderMode && !claudeCodeMode;
+  const providerSourceOptions = [
+    {
+      mode: "none" as const,
+      title: strings.providerSourceNone,
+      description: strings.providerSourceNoneDescription,
+      disabled: false,
+      disabledReason: "",
+    },
+    {
+      mode: "existing" as const,
+      title: strings.providerSourceDefault,
+      description: strings.providerSourceDefaultDescription,
+      disabled: defaultProviders.length === 0,
+      disabledReason: strings.providerSourceDefaultUnavailable,
+    },
+    ...(gatewayEnabled
+      ? [
+          {
+            mode: "gateway" as const,
+            title: strings.providerSourceGateway,
+            description: strings.providerSourceGatewayDescription,
+            disabled: isEditingDefaultWorkspace,
+            disabledReason: strings.providerSourceGatewayDefaultUnavailable,
+          },
+        ]
+      : []),
+  ];
+  const selectedProviderSource =
+    providerSourceOptions.find((option) => option.mode === providerMode) || providerSourceOptions[0];
+  const providerSourceDescription = (option: (typeof providerSourceOptions)[number]) =>
+    option.disabled && option.disabledReason
+      ? `${option.description} ${option.disabledReason}`
+      : option.description;
   const [wifiScan, setWifiScan] = useState<BotHandoffScanState>(emptyHandoffScanState);
   const [bluetoothScan, setBluetoothScan] = useState<BotHandoffScanState>(emptyHandoffScanState);
   const autoHandoffScanRef = useRef(false);
@@ -5057,53 +6128,6 @@ function SettingsDialog({
             {settingsError}
           </p>
         ) : null}
-        {showProviderModeSelector ? (
-          <div className="bg-background border border-border rounded-md grid grid-cols-3 p-0.5">
-            <Button
-              variant={providerMode === "none" ? "secondary" : "ghost"}
-              size="sm"
-              className={cn(
-                "shadow-none",
-                providerMode !== "none" && "text-muted-foreground hover:bg-transparent",
-              )}
-              type="button"
-              onClick={() => onSelectProviderMode("none")}
-            >
-              {strings.none}
-            </Button>
-            <Button
-              variant={providerMode === "existing" ? "secondary" : "ghost"}
-              size="sm"
-              className={cn(
-                "shadow-none",
-                providerMode !== "existing" && "text-muted-foreground hover:bg-transparent",
-              )}
-              type="button"
-              disabled={defaultProviders.length === 0}
-              onClick={() => onSelectProviderMode("existing")}
-            >
-              {strings.fromDefault}
-            </Button>
-            <Button
-              variant={newProviderActive ? "secondary" : "ghost"}
-              size="sm"
-              className={cn(
-                "shadow-none",
-                !newProviderActive && "text-muted-foreground hover:bg-transparent",
-              )}
-              type="button"
-              disabled={dialogMode === "edit" && !isEditingDefaultWorkspace && !gatewayEnabled}
-              onClick={() =>
-                onSelectProviderMode(
-                  isEditingDefaultWorkspace ? "new" : gatewayEnabled ? "gateway" : "new",
-                )
-              }
-            >
-              {strings.newProvider}
-            </Button>
-          </div>
-        ) : null}
-
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="workspaceNameInput">{strings.workspaceName}</Label>
           <Input
@@ -5194,6 +6218,43 @@ function SettingsDialog({
             ) : null}
           </div>
 
+          {showProviderModeSelector ? (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="providerSourceSelect">{strings.providerSource}</Label>
+              <Select
+                value={providerMode}
+                onValueChange={(value) => onSelectProviderMode(value as ProviderMode)}
+              >
+                <SelectTrigger id="providerSourceSelect">
+                  <span className="truncate">{selectedProviderSource?.title}</span>
+                </SelectTrigger>
+                <SelectContent>
+                  {providerSourceOptions.map((option) => (
+                    <SelectItem
+                      key={option.mode}
+                      value={option.mode}
+                      disabled={option.disabled}
+                      textValue={option.title}
+                      className="items-start py-2"
+                    >
+                      <span className="flex flex-col gap-1">
+                        <span className="font-medium">{option.title}</span>
+                        <span className="whitespace-normal text-xs leading-relaxed text-muted-foreground">
+                          {providerSourceDescription(option)}
+                        </span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {selectedProviderSource ? (
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {providerSourceDescription(selectedProviderSource)}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
           {remoteFrontendModeUsesCli(form.remoteFrontendMode) ? (
             <div className="grid gap-3.5 sm:grid-cols-[minmax(0,1fr)_180px]">
               <div className="flex flex-col gap-1.5">
@@ -5273,7 +6334,7 @@ function SettingsDialog({
                 </SelectTrigger>
                 <SelectContent>
                   {canChangeProviderMode ? (
-                    <SelectItem value={WORKSPACE_PROVIDER_NONE_VALUE}>{strings.none}</SelectItem>
+                    <SelectItem value={WORKSPACE_PROVIDER_NONE_VALUE}>{strings.providerSourceNone}</SelectItem>
                   ) : null}
                   {gatewayEnabled && canChangeProviderMode ? (
                     <SelectItem value={WORKSPACE_PROVIDER_GATEWAY_VALUE}>{strings.nextAiGatewayProvider}</SelectItem>
@@ -5344,48 +6405,6 @@ function SettingsDialog({
                 }
               />
             </div>
-            {gatewayEnabled ? (
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="providerTypeSelect">{strings.providerType}</Label>
-                <Select
-                  disabled={!canChangeProviderMode}
-                  value={providerMode === "gateway" ? "gateway" : "third-party"}
-                  onValueChange={(value) => {
-                    if (value === "none") {
-                      onSelectProviderMode("none");
-                      return;
-                    }
-                    onSelectProviderMode(value === "gateway" ? "gateway" : "new");
-                  }}
-                >
-                  <SelectTrigger id="providerTypeSelect">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {canChangeProviderMode ? (
-                      <SelectItem value="none">{strings.none}</SelectItem>
-                    ) : null}
-                    <SelectItem
-                      value="gateway"
-                      disabled={
-                        isEditingDefaultWorkspace ||
-                        (dialogMode === "edit" && providerMode !== "gateway")
-                      }
-                    >
-                      {strings.nextAiGatewayProvider}
-                    </SelectItem>
-                    <SelectItem
-                      value="third-party"
-                      disabled={
-                        (dialogMode === "edit" && providerMode !== "new")
-                      }
-                    >
-                      {strings.thirdPartyProvider}
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : null}
             {providerMode === "gateway" ? (
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="gatewayModelInput">{strings.model}</Label>
@@ -7349,6 +8368,7 @@ function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
   return {
     host: stringValue(config.host, "127.0.0.1"),
     port: numberString(config.port, "14589"),
+    usageCaptureEnabled: gatewayUsageCaptureEnabledFromConfig(config),
     providers: arrayValue(config.Providers ?? config.providers).map((item) =>
       gatewayProviderFormFromRaw(objectValue(item)),
     ),
@@ -7360,6 +8380,11 @@ function gatewayFormFromConfig(file: GatewayConfigFile): GatewayConfigForm {
     ),
     rawConfig: config,
   };
+}
+
+function gatewayUsageCaptureEnabledFromConfig(config: JsonObject): boolean {
+  const codexlUsageCapture = objectValue(config.codexlUsageCapture);
+  return booleanValue(codexlUsageCapture.enabled, false);
 }
 
 function gatewayModelsFromConfig(config: JsonObject): string[] {
@@ -7455,6 +8480,9 @@ function gatewayConfigFromForm(form: GatewayConfigForm): JsonObject {
   config.bodyLimitBytes = 52428800;
   delete config.bodyLimit;
   delete config.providers;
+  const codexlUsageCapture = objectValue(config.codexlUsageCapture);
+  codexlUsageCapture.enabled = form.usageCaptureEnabled;
+  config.codexlUsageCapture = codexlUsageCapture;
   config.Providers = form.providers.map(gatewayProviderConfigFromForm);
   const agent = objectValue(config.agent);
   const storage = objectValue(agent.storage);
@@ -7484,7 +8512,9 @@ function gatewayMcpServerFormFromRaw(raw: JsonObject): GatewayMcpServerForm {
   return {
     id: newLocalId(),
     name: stringValue(raw.name, ""),
+    enabled: booleanValue(raw.enabled, true),
     transport,
+    stdioMessageMode: gatewayMcpServerStdioMessageModeFromRaw(raw.stdioMessageMode, "newline-json"),
     command: stringValue(raw.command, ""),
     args: stringListText(raw.args),
     cwd: stringValue(raw.cwd, ""),
@@ -7504,7 +8534,9 @@ function createGatewayMcpServerForm(): GatewayMcpServerForm {
   return {
     id: newLocalId(),
     name: "",
+    enabled: true,
     transport: "stdio",
+    stdioMessageMode: "newline-json",
     command: "npx",
     args: "-y, @modelcontextprotocol/server-filesystem, .",
     cwd: "",
@@ -7530,6 +8562,7 @@ function cloneGatewayMcpServerForm(server: GatewayMcpServerForm): GatewayMcpServ
 function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObject {
   const raw = cloneJsonObject(server.raw);
   raw.name = server.name.trim();
+  raw.enabled = server.enabled;
   raw.transport = server.transport;
   raw.protocolVersion = server.protocolVersion.trim() || "2024-11-05";
   raw.startupTimeoutMs = integerValue(server.startupTimeoutMs, 10000);
@@ -7549,6 +8582,7 @@ function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObjec
   }
 
   raw.command = server.command.trim();
+  raw.stdioMessageMode = server.stdioMessageMode;
   raw.args = stringListFromText(server.args, "Args");
   raw.env = jsonObjectFromText(server.envJson, "Env JSON");
   if (server.cwd.trim()) {
@@ -7561,6 +8595,20 @@ function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObjec
   delete raw.apiKey;
   delete raw.apiKeyEnv;
   return raw;
+}
+
+function gatewayMcpServerStdioMessageModeFromRaw(
+  value: unknown,
+  fallback: GatewayMcpServerStdioMessageMode,
+): GatewayMcpServerStdioMessageMode {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "content-length" || normalized === "content_length" || normalized === "contentlength") {
+    return "content-length";
+  }
+  if (normalized === "newline-json" || normalized === "newline_json" || normalized === "jsonl") {
+    return "newline-json";
+  }
+  return fallback;
 }
 
 function gatewayMcpServerTarget(server: GatewayMcpServerForm): string {
@@ -7599,17 +8647,17 @@ function gatewayVirtualProfileFormFromRaw(raw: JsonObject): GatewayVirtualProfil
   };
 }
 
-function createGatewayVirtualProfileForm(): GatewayVirtualProfileForm {
+function createGatewayVirtualProfileForm(availableTools: GatewayAvailableTool[] = []): GatewayVirtualProfileForm {
   return {
     id: newLocalId(),
-    profileId: "vision-search",
-    key: "vision-search",
-    displayName: "Vision + Web Search",
-    description: "Inject image/file references and web search through internal MCP tools.",
+    profileId: "mcp-tools",
+    key: "mcp-tools",
+    displayName: "MCP Tools",
+    description: "Inject enabled MCP tools through Gateway virtual models.",
     enabled: true,
     exactAliases: "",
     prefixes: "",
-    suffixes: ":vision-search",
+    suffixes: ":mcp-tools",
     baseModelMode: "strip_suffix",
     fixedModel: "",
     matchMultimodal: true,
@@ -7618,7 +8666,7 @@ function createGatewayVirtualProfileForm(): GatewayVirtualProfileForm {
     maxToolCalls: "8",
     clientToolsPolicy: "allow",
     includeInGatewayModels: true,
-    tools: [createGatewayVirtualToolForm("understand_image"), createGatewayVirtualToolForm("web_search")],
+    tools: availableTools.map(gatewayVirtualToolFormFromAvailableTool),
     raw: {},
   };
 }
@@ -7679,35 +8727,12 @@ function gatewayVirtualToolFormFromRaw(raw: JsonObject): GatewayVirtualToolForm 
   };
 }
 
-function createGatewayVirtualToolForm(name = ""): GatewayVirtualToolForm {
-  const inputSchema =
-    name === "understand_image"
-      ? {
-          type: "object",
-          properties: {
-            image: { type: "string" },
-            question: { type: "string" },
-          },
-          required: ["image"],
-        }
-      : name === "web_search"
-        ? {
-            type: "object",
-            properties: {
-              query: { type: "string" },
-            },
-            required: ["query"],
-          }
-        : { type: "object", additionalProperties: true };
+function gatewayVirtualToolFormFromAvailableTool(tool: GatewayAvailableTool): GatewayVirtualToolForm {
+  const inputSchema = tool.inputSchema && Object.keys(tool.inputSchema).length > 0 ? tool.inputSchema : {};
   return {
     id: newLocalId(),
-    name,
-    description:
-      name === "understand_image"
-        ? "Analyze an image or file referenced by media_ref."
-        : name === "web_search"
-          ? "Search the web."
-          : "",
+    name: tool.name,
+    description: tool.description,
     visibility: "internal",
     inputSchemaJson: jsonText(inputSchema),
     raw: {},
@@ -7726,7 +8751,12 @@ function gatewayVirtualToolConfigFromForm(tool: GatewayVirtualToolForm): JsonObj
   raw.name = tool.name.trim();
   raw.description = tool.description.trim();
   raw.visibility = tool.visibility;
-  raw.inputSchema = jsonObjectFromText(tool.inputSchemaJson, "Input Schema JSON");
+  const inputSchema = jsonObjectFromText(tool.inputSchemaJson, "Input Schema JSON");
+  if (Object.keys(inputSchema).length > 0) {
+    raw.inputSchema = inputSchema;
+  } else {
+    delete raw.inputSchema;
+  }
   delete raw.input_schema;
   delete raw.parameters;
   return raw;
@@ -7780,6 +8810,29 @@ function materializedGatewayVirtualModels(config: JsonObject, baseModels: string
     }
   }
   return result;
+}
+
+function gatewayAvailableToolsFromResponse(response: GatewayToolsResponse): GatewayAvailableTool[] {
+  const tools: GatewayAvailableTool[] = [];
+  const seen = new Set<string>();
+  for (const item of arrayValue(response.tools)) {
+    const tool = gatewayAvailableToolFromRaw(objectValue(item));
+    if (!tool || seen.has(tool.name)) continue;
+    seen.add(tool.name);
+    tools.push(tool);
+  }
+  return tools.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function gatewayAvailableToolFromRaw(raw: JsonObject): GatewayAvailableTool | null {
+  const name = stringValue(raw.name, "").trim();
+  if (!name) return null;
+  const inputSchema = objectValue(raw.inputSchema ?? raw.input_schema ?? raw.parameters);
+  return {
+    name,
+    description: stringValue(raw.description, ""),
+    inputSchema: Object.keys(inputSchema).length > 0 ? inputSchema : undefined,
+  };
 }
 
 function objectValue(value: unknown): JsonObject {
@@ -7928,6 +8981,10 @@ function isProviderlessWorkspace(profile: ProviderProfile) {
   return !profile.provider_name.trim() && !profile.model.trim();
 }
 
+function profileKey(profile: ProviderProfile) {
+  return profile.id.trim() || profile.name;
+}
+
 function selectProviderForProfile(profile: ProviderProfile, providers: DefaultProviderProfile[]) {
   const exactMatch = providers.find((item) => item.name === (profile.codex_profile_name || profile.name));
   const providerMatch = providers.find((item) => item.provider_name === profile.provider_name);
@@ -7940,6 +8997,141 @@ function errorMessage(error: unknown) {
     return error.message;
   }
   return String(error);
+}
+
+function formatCompactNumber(value: number) {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+  return new Intl.NumberFormat(undefined, {
+    notation: Math.abs(value) >= 10000 ? "compact" : "standard",
+    maximumFractionDigits: Math.abs(value) >= 10000 ? 1 : 0,
+  }).format(value);
+}
+
+function formatTokenCount(value: number) {
+  return formatCompactNumber(Math.max(0, value || 0));
+}
+
+function gatewayUsageSeriesLabel(value: string, strings: AppStrings) {
+  if (value === "input") return strings.gatewayUsageInput;
+  if (value === "output") return strings.gatewayUsageOutput;
+  if (value === "cache") return strings.gatewayUsageCache;
+  if (value === "total") return strings.gatewayUsageTotal;
+  return value;
+}
+
+function gatewayUsageCacheTokens(
+  value?: { cacheReadTokens?: number; cacheWriteTokens?: number } | null,
+) {
+  return (value?.cacheReadTokens ?? 0) + (value?.cacheWriteTokens ?? 0);
+}
+
+function gatewayUsageCacheRate(value?: { inputTokens?: number; cacheReadTokens?: number } | null) {
+  const base = gatewayUsageCacheRateBase(value);
+  return base > 0 ? (value?.cacheReadTokens ?? 0) / base : 0;
+}
+
+function gatewayUsageCacheRateBase(value?: { inputTokens?: number; cacheReadTokens?: number } | null) {
+  return (value?.inputTokens ?? 0) + (value?.cacheReadTokens ?? 0);
+}
+
+function gatewayUsageSessionLabel(value: string | null | undefined, strings: AppStrings) {
+  const sessionId = (value || "").trim();
+  return sessionId || strings.gatewayUsageUnknownSession;
+}
+
+function compactGatewayUsageLabel(value: string) {
+  const label = value.trim();
+  if (label.length <= 32) {
+    return label;
+  }
+  return `${label.slice(0, 18)}...${label.slice(-10)}`;
+}
+
+function gatewayUsageWindowLabel(summary: Pick<GatewayUsageSummary, "windowDays" | "windowHours">) {
+  if (summary.windowHours > 0 && (summary.windowHours < 48 || summary.windowHours % 24 !== 0)) {
+    return `${summary.windowHours}h`;
+  }
+  return `${summary.windowDays}d`;
+}
+
+function gatewayUsageDateRangeForHours(hours: number): GatewayUsageDateRange {
+  const end = new Date();
+  const start = new Date(end.getTime() - Math.max(1, hours) * 60 * 60 * 1000);
+  return {
+    startDate: dateInputValue(start),
+    endDate: dateInputValue(end),
+    hours,
+  };
+}
+
+function gatewayUsageDateRangeForDays(days: number): GatewayUsageDateRange {
+  const end = new Date();
+  const start = new Date(end);
+  start.setDate(end.getDate() - Math.max(1, days) + 1);
+  return {
+    startDate: dateInputValue(start),
+    endDate: dateInputValue(end),
+  };
+}
+
+function usageDateRangeMatchesHours(range: GatewayUsageDateRange, hours: number) {
+  return range.hours === hours;
+}
+
+function usageDateRangeMatchesDays(range: GatewayUsageDateRange, days: number) {
+  if (range.hours) {
+    return false;
+  }
+  const preset = gatewayUsageDateRangeForDays(days);
+  return range.startDate === preset.startDate && range.endDate === preset.endDate;
+}
+
+function dateInputValue(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+function formatPercent(value: number) {
+  const percent = Number.isFinite(value) ? value : 0;
+  return new Intl.NumberFormat(undefined, {
+    style: "percent",
+    maximumFractionDigits: 1,
+  }).format(percent);
+}
+
+function formatLatency(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 ms";
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)} s`;
+  }
+  return `${Math.round(value)} ms`;
+}
+
+function formatUnixDateTime(value?: number | null) {
+  if (!value || !Number.isFinite(value)) {
+    return "-";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value * 1000));
+}
+
+function gatewayUsageStatusClass(status: string) {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "success") {
+    return "border-emerald-500/30 bg-emerald-500/10 text-emerald-300";
+  }
+  if (normalized === "timeout" || normalized === "rate-limited") {
+    return "border-amber-500/30 bg-amber-500/10 text-amber-300";
+  }
+  return "border-destructive/30 bg-destructive/10 text-red-300";
 }
 
 function formatBytes(bytes: number) {

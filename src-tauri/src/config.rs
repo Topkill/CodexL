@@ -44,7 +44,26 @@ const BOT_MEDIA_MCP_OPTIONAL_ENV_NAMES: &[&str] = &[
 ];
 const DEFAULT_PROVIDER_CONFIG_FORMAT_PROFILE: &str = "profile";
 const DEFAULT_PROVIDER_CONFIG_FORMAT_TOP_LEVEL: &str = "top_level";
+const CODEX_PROFILE_CONFIG_FORMAT_ENV: &str = "CODEXL_CODEX_PROFILE_CONFIG_FORMAT";
+const CODEX_PROFILE_CONFIG_FORMAT_LEGACY: &str = "legacy";
+const CODEX_PROFILE_CONFIG_FORMAT_SEPARATE: &str = "separate_profile_files";
+const CODEX_PROFILE_CONFIG_FILES_MIN_VERSION: (u64, u64, u64) = (0, 134, 0);
 static UUID_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexProfileConfigFormat {
+    LegacyProfilesTable,
+    SeparateProfileFiles,
+}
+
+impl CodexProfileConfigFormat {
+    pub fn env_value(self) -> &'static str {
+        match self {
+            Self::LegacyProfilesTable => CODEX_PROFILE_CONFIG_FORMAT_LEGACY,
+            Self::SeparateProfileFiles => CODEX_PROFILE_CONFIG_FORMAT_SEPARATE,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -703,14 +722,10 @@ impl AppConfig {
         {
             self.provider_profiles.insert(0, default_provider_profile());
         }
-        if self.active_provider.is_empty()
-            || !self
-                .provider_profiles
-                .iter()
-                .any(|profile| profile.name == self.active_provider)
+        if self.active_provider.is_empty() || self.provider_profile(&self.active_provider).is_none()
         {
             if let Some(profile) = self.provider_profiles.first() {
-                self.active_provider = profile.name.clone();
+                self.active_provider = provider_profile_key(profile);
             }
         }
 
@@ -766,35 +781,38 @@ impl AppConfig {
         }
     }
 
-    pub fn add_provider_profile(&mut self, profile: ProviderProfile) {
+    pub fn add_provider_profile(&mut self, mut profile: ProviderProfile) {
+        ensure_provider_profile_identity(&mut profile);
+        let active_provider = provider_profile_key(&profile);
         self.provider_profiles.push(profile.clone());
         self.provider_profiles =
             dedupe_provider_profiles(std::mem::take(&mut self.provider_profiles));
-        self.active_provider = profile.name;
+        self.active_provider = active_provider;
     }
 
-    pub fn remove_provider_profile(&mut self, name: &str) -> Result<ProviderProfile, String> {
-        if name == DEFAULT_PROVIDER_PROFILE_NAME {
+    pub fn remove_provider_profile(&mut self, selector: &str) -> Result<ProviderProfile, String> {
+        let index = self
+            .provider_profile_index(selector)
+            .ok_or_else(|| format!("Provider profile not found: {}", selector))?;
+        if is_default_provider(&self.provider_profiles[index]) {
             return Err("Cannot delete the Default provider".to_string());
         }
 
-        let index = self
-            .provider_profiles
-            .iter()
-            .position(|item| item.name == name)
-            .ok_or_else(|| format!("Provider profile not found: {}", name))?;
-
         let removed = self.provider_profiles.remove(index);
+        let removed_key = provider_profile_key(&removed);
         if let Some(saved) =
             saved_bot_config_from_profile(&removed, Some(now_unix_seconds().to_string()))
         {
             upsert_saved_bot_config(&mut self.bot_configs, saved, true);
         }
-        if self.active_provider == name {
+        if self.active_provider == selector
+            || self.active_provider == removed_key
+            || self.active_provider == removed.name
+        {
             self.active_provider = self
                 .provider_profiles
                 .first()
-                .map(|p| p.name.clone())
+                .map(provider_profile_key)
                 .unwrap_or_default();
         }
         self.normalize();
@@ -804,10 +822,10 @@ impl AppConfig {
 
     pub fn update_provider_profile(
         &mut self,
-        original_name: &str,
+        original_selector: &str,
         mut profile: ProviderProfile,
     ) -> Result<(), String> {
-        if original_name == DEFAULT_PROVIDER_PROFILE_NAME {
+        if original_selector == DEFAULT_PROVIDER_PROFILE_NAME {
             if let Some(existing) = self
                 .provider_profiles
                 .iter_mut()
@@ -831,24 +849,11 @@ impl AppConfig {
             return Ok(());
         }
 
-        let next_name = profile.name.clone();
-        if next_name != original_name
-            && self
-                .provider_profiles
-                .iter()
-                .any(|item| item.name == next_name)
-        {
-            return Err(format!("Provider profile already exists: {}", next_name));
-        }
-
-        let Some(index) = self
-            .provider_profiles
-            .iter()
-            .position(|item| item.name == original_name)
-        else {
-            return Err(format!("Provider profile not found: {}", original_name));
+        let Some(index) = self.provider_profile_index(original_selector) else {
+            return Err(format!("Provider profile not found: {}", original_selector));
         };
 
+        let original = self.provider_profiles[index].clone();
         profile.start_remote_on_launch = self.provider_profiles[index].start_remote_on_launch;
         profile.start_remote_cloud_on_launch =
             self.provider_profiles[index].start_remote_cloud_on_launch;
@@ -858,9 +863,15 @@ impl AppConfig {
         if profile.id.trim().is_empty() {
             profile.id = self.provider_profiles[index].id.clone();
         }
+        if profile.codex_home.trim().is_empty() {
+            profile.codex_home = self.provider_profiles[index].codex_home.clone();
+        }
+        let was_active = self.active_provider == original_selector
+            || self.active_provider == provider_profile_key(&original)
+            || self.active_provider == original.name;
         self.provider_profiles[index] = profile.clone();
-        if self.active_provider == original_name {
-            self.active_provider = profile.name;
+        if was_active {
+            self.active_provider = provider_profile_key(&profile);
         }
         self.normalize();
         Ok(())
@@ -868,16 +879,13 @@ impl AppConfig {
 
     pub fn set_start_remote_on_launch(
         &mut self,
-        profile_name: &str,
+        profile_selector: &str,
         enabled: bool,
     ) -> Result<(), String> {
-        let Some(profile) = self
-            .provider_profiles
-            .iter_mut()
-            .find(|profile| profile.name == profile_name)
-        else {
-            return Err(format!("Provider profile not found: {}", profile_name));
+        let Some(index) = self.provider_profile_index(profile_selector) else {
+            return Err(format!("Provider profile not found: {}", profile_selector));
         };
+        let profile = &mut self.provider_profiles[index];
 
         profile.start_remote_on_launch = enabled;
         if !enabled {
@@ -890,18 +898,15 @@ impl AppConfig {
 
     pub fn set_remote_launch_options(
         &mut self,
-        profile_name: &str,
+        profile_selector: &str,
         start_remote: bool,
         start_cloud: bool,
         remote_e2ee_password: Option<String>,
     ) -> Result<(), String> {
-        let Some(profile) = self
-            .provider_profiles
-            .iter_mut()
-            .find(|profile| profile.name == profile_name)
-        else {
-            return Err(format!("Provider profile not found: {}", profile_name));
+        let Some(index) = self.provider_profile_index(profile_selector) else {
+            return Err(format!("Provider profile not found: {}", profile_selector));
         };
+        let profile = &mut self.provider_profiles[index];
 
         let next_start_remote = start_remote;
         let next_start_cloud = next_start_remote && start_cloud;
@@ -925,24 +930,32 @@ impl AppConfig {
         self.save()
     }
 
-    pub fn provider_profile(&self, name: &str) -> Option<ProviderProfile> {
+    fn provider_profile_index(&self, selector: &str) -> Option<usize> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
         self.provider_profiles
             .iter()
-            .find(|profile| profile.name == name)
-            .cloned()
+            .position(|profile| profile.id.trim() == selector)
+            .or_else(|| {
+                self.provider_profiles
+                    .iter()
+                    .position(|profile| profile.name == selector)
+            })
+    }
+
+    pub fn provider_profile(&self, selector: &str) -> Option<ProviderProfile> {
+        let index = self.provider_profile_index(selector)?;
+        self.provider_profiles.get(index).cloned()
     }
 
     pub fn upsert_saved_bot_config_from_profile(
         &mut self,
-        profile_name: &str,
+        profile_selector: &str,
     ) -> Result<(), String> {
-        let Some(profile) = self
-            .provider_profiles
-            .iter()
-            .find(|profile| profile.name == profile_name)
-            .cloned()
-        else {
-            return Err(format!("Provider profile not found: {}", profile_name));
+        let Some(profile) = self.provider_profile(profile_selector) else {
+            return Err(format!("Provider profile not found: {}", profile_selector));
         };
         let Some(saved) =
             saved_bot_config_from_profile(&profile, Some(now_unix_seconds().to_string()))
@@ -1054,9 +1067,35 @@ pub fn default_codex_config_path() -> PathBuf {
     PathBuf::from(default_codex_home()).join("config.toml")
 }
 
+pub fn codex_profile_config_format_from_env() -> Option<CodexProfileConfigFormat> {
+    std::env::var(CODEX_PROFILE_CONFIG_FORMAT_ENV)
+        .ok()
+        .and_then(|value| parse_codex_profile_config_format(&value))
+}
+
+pub fn codex_profile_config_format_for_cli(executable: &str) -> CodexProfileConfigFormat {
+    if let Some(format) = codex_profile_config_format_from_env() {
+        return format;
+    }
+
+    codex_cli_version(executable)
+        .map(|version| codex_profile_config_format_for_version(version))
+        .unwrap_or_else(default_codex_profile_config_format)
+}
+
 pub fn generated_codex_home(profile: &ProviderProfile) -> PathBuf {
+    let configured = profile.codex_home.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
+    }
     let slug = slugify(&profile.name);
-    codexl_home_dir().join("codex-homes").join(&slug)
+    let id = profile.id.trim();
+    let directory = if is_uuid_like(id) {
+        format!("{}-{}", slug, short_profile_id(id))
+    } else {
+        slug
+    };
+    codexl_home_dir().join("codex-homes").join(directory)
 }
 
 pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
@@ -1070,6 +1109,13 @@ pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
 }
 
 pub fn ensure_provider_codex_home(profile: &ProviderProfile) -> Result<String, String> {
+    ensure_provider_codex_home_with_format(profile, requested_codex_profile_config_format())
+}
+
+pub fn ensure_provider_codex_home_with_format(
+    profile: &ProviderProfile,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<String, String> {
     let codex_home = if is_default_provider(profile) {
         PathBuf::from(default_codex_home())
     } else {
@@ -1085,7 +1131,9 @@ pub fn ensure_provider_codex_home(profile: &ProviderProfile) -> Result<String, S
             }
         } else if !target_config_path.exists() || provider_profile_uses_next_ai_gateway(profile) {
             let detail = provider_detail_from_default_config(profile);
-            write_codex_home_config(&detail, &codex_home, false)?;
+            write_codex_home_config(&detail, &codex_home, false, profile_config_format)?;
+        } else if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles {
+            migrate_codex_home_profile_config(&codex_home, profile, true)?;
         }
     }
     sync_provider_bot_media_mcp_config(profile, &codex_home, profile.bot.bridge_enabled())?;
@@ -1094,13 +1142,18 @@ pub fn ensure_provider_codex_home(profile: &ProviderProfile) -> Result<String, S
 }
 
 pub fn read_default_provider_profiles() -> Result<Vec<DefaultProviderProfile>, String> {
-    let path = default_codex_config_path();
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    Ok(parse_default_provider_profiles(&content))
+    read_provider_profiles_from_codex_home(&PathBuf::from(default_codex_home()))
 }
 
 pub fn add_existing_provider_profile(
     input: ExistingProviderRequest,
+) -> Result<ProviderProfile, String> {
+    add_existing_provider_profile_with_format(input, requested_codex_profile_config_format())
+}
+
+pub fn add_existing_provider_profile_with_format(
+    input: ExistingProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> Result<ProviderProfile, String> {
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.profile_name)?;
     let bot = input.bot.clone();
@@ -1108,7 +1161,7 @@ pub fn add_existing_provider_profile(
     let remote_frontend_mode = input.remote_frontend_mode.clone();
     let remote_web_asset_registry_url = input.remote_web_asset_registry_url.clone();
     let remote_web_asset_version = input.remote_web_asset_version.clone();
-    let provider = update_existing_default_provider(input)?;
+    let provider = update_existing_default_provider(input, profile_config_format)?;
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
     profile.codex_profile_name = provider_codex_profile_name(&provider);
@@ -1120,13 +1173,21 @@ pub fn add_existing_provider_profile(
         &remote_web_asset_version,
     );
     profile.bot = bot;
-    profile.bot.normalize_for_profile(&profile.name);
-    write_codex_home_config(&provider, &generated_codex_home(&profile), false)?;
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
+    write_codex_home_config(
+        &provider,
+        &generated_codex_home(&profile),
+        false,
+        profile_config_format,
+    )?;
     Ok(profile)
 }
 
 pub fn create_workspace_profile(input: WorkspaceRequest) -> Result<ProviderProfile, String> {
-    let profile = workspace_profile(
+    let mut profile = workspace_profile(
         input.workspace_name,
         input.proxy_url,
         input.remote_frontend_mode,
@@ -1134,6 +1195,10 @@ pub fn create_workspace_profile(input: WorkspaceRequest) -> Result<ProviderProfi
         input.remote_web_asset_version,
         input.bot,
     )?;
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_providerless_codex_home_config(&profile)?;
     Ok(profile)
 }
@@ -1161,7 +1226,7 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
         return Ok(profile);
     }
 
-    let profile = workspace_profile(
+    let mut profile = workspace_profile(
         input.workspace_name,
         input.proxy_url,
         input.remote_frontend_mode,
@@ -1169,6 +1234,13 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
         input.remote_web_asset_version,
         input.bot,
     )?;
+    if is_uuid_like(&input.original_name) {
+        profile.id = input.original_name.clone();
+    }
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_providerless_codex_home_config(&profile)?;
     Ok(profile)
 }
@@ -1176,25 +1248,39 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
 pub fn update_existing_provider_profile(
     input: UpdateProviderRequest,
 ) -> Result<ProviderProfile, String> {
+    update_existing_provider_profile_with_format(input, requested_codex_profile_config_format())
+}
+
+pub fn update_existing_provider_profile_with_format(
+    input: UpdateProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<ProviderProfile, String> {
+    let original_selector = input.original_name.clone();
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.profile_name)?;
     let bot = input.bot.clone();
     let proxy_url = input.proxy_url.trim().to_string();
     let remote_frontend_mode = input.remote_frontend_mode.clone();
     let remote_web_asset_registry_url = input.remote_web_asset_registry_url.clone();
     let remote_web_asset_version = input.remote_web_asset_version.clone();
-    let provider = update_existing_default_provider(ExistingProviderRequest {
-        workspace_name: workspace_name.clone(),
-        profile_name: input.profile_name,
-        base_url: input.base_url,
-        api_key: input.api_key,
-        model: input.model,
-        proxy_url: String::new(),
-        remote_frontend_mode: String::new(),
-        remote_web_asset_registry_url: String::new(),
-        remote_web_asset_version: String::new(),
-        bot: BotProfileConfig::default(),
-    })?;
+    let provider = update_existing_default_provider(
+        ExistingProviderRequest {
+            workspace_name: workspace_name.clone(),
+            profile_name: input.profile_name,
+            base_url: input.base_url,
+            api_key: input.api_key,
+            model: input.model,
+            proxy_url: String::new(),
+            remote_frontend_mode: String::new(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: String::new(),
+            bot: BotProfileConfig::default(),
+        },
+        profile_config_format,
+    )?;
     let mut profile = provider.to_provider_profile();
+    if is_uuid_like(&original_selector) {
+        profile.id = original_selector;
+    }
     profile.name = workspace_name;
     profile.codex_profile_name = provider_codex_profile_name(&provider);
     profile.proxy_url = proxy_url;
@@ -1205,13 +1291,28 @@ pub fn update_existing_provider_profile(
         &remote_web_asset_version,
     );
     profile.bot = bot;
-    profile.bot.normalize_for_profile(&profile.name);
-    write_codex_home_config(&provider, &generated_codex_home(&profile), false)?;
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
+    write_codex_home_config(
+        &provider,
+        &generated_codex_home(&profile),
+        false,
+        profile_config_format,
+    )?;
     Ok(profile)
 }
 
 pub fn update_default_provider_selection(input: ExistingProviderRequest) -> Result<(), String> {
-    let profile = update_existing_default_provider(input)?;
+    update_default_provider_selection_with_format(input, requested_codex_profile_config_format())
+}
+
+pub fn update_default_provider_selection_with_format(
+    input: ExistingProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<(), String> {
+    let profile = update_existing_default_provider(input, profile_config_format)?;
     let path = default_codex_config_path();
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = if uses_top_level_provider_config(&profile) {
@@ -1223,6 +1324,13 @@ pub fn update_default_provider_selection(input: ExistingProviderRequest) -> Resu
 }
 
 pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProfile, String> {
+    create_default_provider_with_format(input, requested_codex_profile_config_format())
+}
+
+pub fn create_default_provider_with_format(
+    input: NewProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<ProviderProfile, String> {
     let workspace_name = if input.workspace_name.trim() == DEFAULT_PROVIDER_PROFILE_NAME {
         DEFAULT_PROVIDER_PROFILE_NAME.to_string()
     } else {
@@ -1248,7 +1356,7 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
         return Err("model is required".to_string());
     }
 
-    write_default_provider_profile(&provider, true)?;
+    write_default_provider_profile(&provider, true, profile_config_format)?;
 
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
@@ -1261,7 +1369,10 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
         &input.remote_web_asset_version,
     );
     profile.bot = input.bot;
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
 
     if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
         let path = default_codex_config_path();
@@ -1269,8 +1380,13 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
         let updated = set_top_level_model_config(&content, &provider.model);
         std::fs::write(path, updated).map_err(|e| e.to_string())?;
     } else {
-        write_provider_codex_home_config(&provider, true)?;
-        write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
+        write_provider_codex_home_config(&provider, true, profile_config_format)?;
+        write_codex_home_config(
+            &provider,
+            &generated_codex_home(&profile),
+            true,
+            profile_config_format,
+        )?;
     }
 
     Ok(profile)
@@ -1279,10 +1395,17 @@ pub fn create_default_provider(input: NewProviderRequest) -> Result<ProviderProf
 pub fn create_next_ai_gateway_provider(
     input: NextAiGatewayProviderRequest,
 ) -> Result<ProviderProfile, String> {
+    create_next_ai_gateway_provider_with_format(input, requested_codex_profile_config_format())
+}
+
+pub fn create_next_ai_gateway_provider_with_format(
+    input: NextAiGatewayProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<ProviderProfile, String> {
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.name)?;
     let provider = next_ai_gateway_provider_profile(&input.name, &input.model)?;
-    write_default_provider_profile(&provider, true)?;
-    write_provider_codex_home_config(&provider, true)?;
+    write_default_provider_profile(&provider, true, profile_config_format)?;
+    write_provider_codex_home_config(&provider, true, profile_config_format)?;
 
     let mut profile = provider.to_provider_profile();
     profile.name = workspace_name;
@@ -1295,20 +1418,42 @@ pub fn create_next_ai_gateway_provider(
         &input.remote_web_asset_version,
     );
     profile.bot = input.bot;
-    profile.bot.normalize_for_profile(&profile.name);
-    write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
+    write_codex_home_config(
+        &provider,
+        &generated_codex_home(&profile),
+        true,
+        profile_config_format,
+    )?;
     Ok(profile)
 }
 
 pub fn update_next_ai_gateway_provider_profile(
     input: UpdateNextAiGatewayProviderRequest,
 ) -> Result<ProviderProfile, String> {
+    update_next_ai_gateway_provider_profile_with_format(
+        input,
+        requested_codex_profile_config_format(),
+    )
+}
+
+pub fn update_next_ai_gateway_provider_profile_with_format(
+    input: UpdateNextAiGatewayProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
+) -> Result<ProviderProfile, String> {
+    let original_selector = input.original_name.clone();
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.name)?;
     let provider = next_ai_gateway_provider_profile(&input.name, &input.model)?;
-    write_default_provider_profile(&provider, true)?;
-    write_provider_codex_home_config(&provider, true)?;
+    write_default_provider_profile(&provider, true, profile_config_format)?;
+    write_provider_codex_home_config(&provider, true, profile_config_format)?;
 
     let mut profile = provider.to_provider_profile();
+    if is_uuid_like(&original_selector) {
+        profile.id = original_selector;
+    }
     profile.name = workspace_name;
     profile.codex_profile_name = provider_codex_profile_name(&provider);
     profile.proxy_url = input.proxy_url.trim().to_string();
@@ -1319,8 +1464,16 @@ pub fn update_next_ai_gateway_provider_profile(
         &input.remote_web_asset_version,
     );
     profile.bot = input.bot;
-    profile.bot.normalize_for_profile(&profile.name);
-    write_codex_home_config(&provider, &generated_codex_home(&profile), true)?;
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
+    write_codex_home_config(
+        &provider,
+        &generated_codex_home(&profile),
+        true,
+        profile_config_format,
+    )?;
     Ok(profile)
 }
 
@@ -1346,6 +1499,7 @@ fn next_ai_gateway_provider_profile(
 
 fn update_existing_default_provider(
     input: ExistingProviderRequest,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> Result<DefaultProviderProfile, String> {
     let mut profile = read_default_provider_profiles()?
         .into_iter()
@@ -1370,8 +1524,8 @@ fn update_existing_default_provider(
         profile.api_key = api_key.to_string();
     }
 
-    write_default_provider_profile(&profile, false)?;
-    write_provider_codex_home_config(&profile, false)?;
+    write_default_provider_profile(&profile, false, profile_config_format)?;
+    write_provider_codex_home_config(&profile, false, profile_config_format)?;
     Ok(profile)
 }
 
@@ -1385,6 +1539,7 @@ fn workspace_profile(
 ) -> Result<ProviderProfile, String> {
     let workspace_name = workspace_name_or_default(&workspace_name, "")?;
     let mut profile = ProviderProfile {
+        id: new_uuid_v4(),
         name: workspace_name,
         codex_profile_name: String::new(),
         provider_name: String::new(),
@@ -1400,7 +1555,10 @@ fn workspace_profile(
         &remote_web_asset_registry_url,
         &remote_web_asset_version,
     );
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     Ok(profile)
 }
 
@@ -1418,6 +1576,7 @@ fn apply_remote_frontend_options(
 fn write_default_provider_profile(
     profile: &DefaultProviderProfile,
     force_defaults: bool,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> Result<(), String> {
     let path = default_codex_config_path();
     if let Some(parent) = path.parent() {
@@ -1425,13 +1584,32 @@ fn write_default_provider_profile(
     }
 
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = upsert_provider_profile_content(&content, profile, force_defaults);
-    std::fs::write(path, updated).map_err(|e| e.to_string())
+    let updated = upsert_provider_profile_content_for_format(
+        &content,
+        profile,
+        force_defaults,
+        profile_config_format,
+    );
+    std::fs::write(&path, updated).map_err(|e| e.to_string())?;
+
+    if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
+        && !uses_top_level_provider_config(profile)
+    {
+        write_separate_profile_file(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            profile,
+            &content,
+            force_defaults,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn write_provider_codex_home_config(
     profile: &DefaultProviderProfile,
     force_defaults: bool,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> Result<(), String> {
     let provider_profile = profile.to_provider_profile();
     if is_default_provider(&provider_profile) {
@@ -1439,13 +1617,14 @@ fn write_provider_codex_home_config(
     }
 
     let codex_home = generated_codex_home(&provider_profile);
-    write_codex_home_config(profile, &codex_home, force_defaults)
+    write_codex_home_config(profile, &codex_home, force_defaults, profile_config_format)
 }
 
 fn write_codex_home_config(
     profile: &DefaultProviderProfile,
     codex_home: &Path,
     force_defaults: bool,
+    profile_config_format: CodexProfileConfigFormat,
 ) -> Result<(), String> {
     std::fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
 
@@ -1456,14 +1635,38 @@ fn write_codex_home_config(
         std::fs::read_to_string(default_codex_config_path()).unwrap_or_default()
     };
 
-    let updated = upsert_provider_profile_content(&content, profile, force_defaults);
+    let updated = upsert_provider_profile_content_for_format(
+        &content,
+        profile,
+        force_defaults,
+        profile_config_format,
+    );
     let updated = if uses_top_level_provider_config(profile) {
         set_top_level_model_provider_config(&updated, &profile.provider_name, &profile.model)
+    } else if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles {
+        clear_top_level_string_config(
+            &clear_top_level_model_config(&updated),
+            "model_catalog_json",
+        )
     } else {
         set_top_level_model_config(&updated, &profile.model)
     };
-    let updated = set_next_ai_gateway_model_catalog_config(&updated, profile)?;
-    std::fs::write(target_config_path, updated).map_err(|e| e.to_string())
+    let updated = if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
+        && !uses_top_level_provider_config(profile)
+    {
+        updated
+    } else {
+        set_next_ai_gateway_model_catalog_config(&updated, profile)?
+    };
+    std::fs::write(&target_config_path, updated).map_err(|e| e.to_string())?;
+
+    if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
+        && !uses_top_level_provider_config(profile)
+    {
+        write_separate_profile_file(codex_home, profile, &content, force_defaults)?;
+    }
+
+    Ok(())
 }
 
 fn write_providerless_codex_home_config(profile: &ProviderProfile) -> Result<(), String> {
@@ -1512,6 +1715,96 @@ fn set_next_ai_gateway_model_catalog_config(
         "model_catalog_json",
         &catalog_path,
     ))
+}
+
+fn write_separate_profile_file(
+    codex_home: &Path,
+    profile: &DefaultProviderProfile,
+    source_config_content: &str,
+    force_defaults: bool,
+) -> Result<(), String> {
+    let profile_config_path = separate_profile_config_path(codex_home, &profile.name);
+    let content = if profile_config_path.exists() {
+        std::fs::read_to_string(&profile_config_path).unwrap_or_default()
+    } else {
+        legacy_profile_table_body(source_config_content, &profile.name).unwrap_or_else(|| {
+            let default_profile_path =
+                separate_profile_config_path(&PathBuf::from(default_codex_home()), &profile.name);
+            std::fs::read_to_string(default_profile_path).unwrap_or_default()
+        })
+    };
+    let updated = upsert_separate_profile_file_content(&content, profile, force_defaults)?;
+    std::fs::write(profile_config_path, ensure_trailing_newline(&updated))
+        .map_err(|e| e.to_string())
+}
+
+fn upsert_separate_profile_file_content(
+    content: &str,
+    profile: &DefaultProviderProfile,
+    force_defaults: bool,
+) -> Result<String, String> {
+    let mut updated =
+        set_top_level_model_provider_config(content, &profile.provider_name, &profile.model);
+    if force_defaults || !top_level_assignment_exists(&updated, "model_reasoning_effort") {
+        updated = set_top_level_string_config(&updated, "model_reasoning_effort", "xhigh");
+    }
+    set_next_ai_gateway_model_catalog_config(&updated, profile)
+}
+
+fn migrate_codex_home_profile_config(
+    codex_home: &Path,
+    profile: &ProviderProfile,
+    create_missing_profile_file: bool,
+) -> Result<(), String> {
+    if is_providerless_workspace(profile)
+        || is_default_provider(profile)
+        || provider_profile_uses_top_level_config(profile)
+    {
+        return Ok(());
+    }
+
+    let profile_name = profile.codex_profile_name.trim();
+    if profile_name.is_empty() || profile_name == DEFAULT_PROVIDER_PROFILE_NAME {
+        return Ok(());
+    }
+
+    let config_path = codex_home.join("config.toml");
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let profile_config_path = separate_profile_config_path(codex_home, profile_name);
+
+    if !profile_config_path.exists() {
+        let profile_content =
+            legacy_profile_table_body(&content, profile_name).unwrap_or_else(|| {
+                if create_missing_profile_file {
+                    format!(
+                        "model = \"{}\"\nmodel_provider = \"{}\"",
+                        toml_escape(&profile.model),
+                        toml_escape(&profile.provider_name)
+                    )
+                } else {
+                    String::new()
+                }
+            });
+        if !profile_content.trim().is_empty() {
+            std::fs::write(
+                &profile_config_path,
+                ensure_trailing_newline(&profile_content),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let updated = remove_legacy_profile_config(&content, profile_name);
+    if updated != content {
+        std::fs::write(config_path, ensure_trailing_newline(&updated))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn separate_profile_config_path(codex_home: &Path, profile_name: &str) -> PathBuf {
+    codex_home.join(format!("{}.config.toml", profile_name.trim()))
 }
 
 fn sync_provider_bot_media_mcp_config(
@@ -1952,6 +2245,72 @@ fn parse_default_provider_profiles(content: &str) -> Vec<DefaultProviderProfile>
     result
 }
 
+fn read_provider_profiles_from_codex_home(
+    codex_home: &Path,
+) -> Result<Vec<DefaultProviderProfile>, String> {
+    let config_path = codex_home.join("config.toml");
+    let content = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    let mut result = parse_default_provider_profiles(&content);
+
+    if let Ok(entries) = std::fs::read_dir(codex_home) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(profile_name) = file_name.strip_suffix(".config.toml") else {
+                continue;
+            };
+            if profile_name.is_empty() {
+                continue;
+            }
+            let Ok(profile_content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(profile) =
+                parse_separate_provider_profile(profile_name, &content, &profile_content)
+            {
+                if let Some(existing) = result.iter_mut().find(|item| item.name == profile.name) {
+                    *existing = profile;
+                } else {
+                    result.push(profile);
+                }
+            }
+        }
+    }
+
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(result)
+}
+
+fn parse_separate_provider_profile(
+    profile_name: &str,
+    base_content: &str,
+    profile_content: &str,
+) -> Option<DefaultProviderProfile> {
+    let (model, provider_name) = parse_top_level_model_config(profile_content);
+    if model.is_empty() || provider_name.is_empty() {
+        return None;
+    }
+    let base_url = provider_table_value(profile_content, &provider_name, "base_url")
+        .or_else(|| provider_table_value(base_content, &provider_name, "base_url"))
+        .unwrap_or_default();
+    let api_key =
+        provider_table_value(profile_content, &provider_name, "experimental_bearer_token")
+            .or_else(|| {
+                provider_table_value(base_content, &provider_name, "experimental_bearer_token")
+            })
+            .unwrap_or_default();
+    Some(DefaultProviderProfile {
+        name: profile_name.to_string(),
+        provider_name,
+        base_url,
+        api_key,
+        model,
+        config_format: DEFAULT_PROVIDER_CONFIG_FORMAT_PROFILE.to_string(),
+    })
+}
+
 fn parse_table_header(line: &str) -> Option<(String, String)> {
     if !line.starts_with('[') || !line.ends_with(']') {
         return None;
@@ -2059,11 +2418,13 @@ fn provider_detail_from_default_config(profile: &ProviderProfile) -> DefaultProv
     } else {
         codex_profile_name
     };
-    let mut detail = parse_default_provider_profiles(&source_content)
+    let mut detail = read_default_provider_profiles()
+        .unwrap_or_else(|_| parse_default_provider_profiles(&source_content))
         .into_iter()
         .find(|item| item.name == codex_profile_name)
         .or_else(|| {
-            parse_default_provider_profiles(&source_content)
+            read_default_provider_profiles()
+                .unwrap_or_else(|_| parse_default_provider_profiles(&source_content))
                 .into_iter()
                 .find(|item| item.provider_name == profile.provider_name)
         })
@@ -2085,6 +2446,22 @@ fn provider_detail_from_default_config(profile: &ProviderProfile) -> DefaultProv
     detail.model = profile.model.clone();
 
     detail
+}
+
+fn upsert_provider_profile_content_for_format(
+    content: &str,
+    profile: &DefaultProviderProfile,
+    force_defaults: bool,
+    profile_config_format: CodexProfileConfigFormat,
+) -> String {
+    if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
+        && !uses_top_level_provider_config(profile)
+    {
+        let content = remove_legacy_profile_config(content, &profile.name);
+        return upsert_provider_definition_content(&content, profile, force_defaults);
+    }
+
+    upsert_provider_profile_content(content, profile, force_defaults)
 }
 
 fn upsert_provider_profile_content(
@@ -2129,6 +2506,34 @@ fn upsert_provider_profile_content(
     }
     updated = upsert_table_assignments(&updated, "profiles", &profile.name, &profile_assignments);
     updated
+}
+
+fn upsert_provider_definition_content(
+    content: &str,
+    profile: &DefaultProviderProfile,
+    force_defaults: bool,
+) -> String {
+    let provider_exists = table_exists(content, "model_providers", &profile.provider_name);
+    let mut provider_assignments = vec![
+        ("name".to_string(), profile.provider_name.clone()),
+        ("base_url".to_string(), profile.base_url.clone()),
+    ];
+    if !profile.api_key.is_empty() {
+        provider_assignments.push((
+            "experimental_bearer_token".to_string(),
+            profile.api_key.clone(),
+        ));
+    }
+    if force_defaults || !provider_exists {
+        provider_assignments.push(("wire_api".to_string(), "responses".to_string()));
+    }
+
+    upsert_table_assignments(
+        content,
+        "model_providers",
+        &profile.provider_name,
+        &provider_assignments,
+    )
 }
 
 fn upsert_top_level_provider_content(
@@ -2253,6 +2658,102 @@ fn table_exists(content: &str, section: &str, name: &str) -> bool {
             .map(|(table_section, table_name)| table_section == section && table_name == name)
             .unwrap_or(false)
     })
+}
+
+fn top_level_assignment_exists(content: &str, key: &str) -> bool {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            return false;
+        }
+        if assignment_key(trimmed).is_some_and(|item| item == key) {
+            return true;
+        }
+    }
+    false
+}
+
+fn remove_legacy_profile_config(content: &str, profile_name: &str) -> String {
+    let without_selector = remove_top_level_profile_selector(content, profile_name);
+    remove_table(&without_selector, "profiles", profile_name)
+}
+
+fn remove_top_level_profile_selector(content: &str, profile_name: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_top_level = true;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if in_top_level && trimmed.starts_with('[') {
+            in_top_level = false;
+        }
+        if in_top_level {
+            if let Some((key, value)) = parse_string_assignment(trimmed) {
+                if key == "profile" && value == profile_name {
+                    continue;
+                }
+            }
+        }
+        output.push(line.to_string());
+    }
+
+    output.join("\n")
+}
+
+fn remove_table(content: &str, section: &str, name: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_target = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_target = parse_table_header(trimmed)
+                .map(|(table_section, table_name)| table_section == section && table_name == name)
+                .unwrap_or(false);
+            if in_target {
+                continue;
+            }
+        }
+        if in_target {
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    output.join("\n").trim_end().to_string()
+}
+
+fn legacy_profile_table_body(content: &str, profile_name: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut in_target = false;
+    let mut found = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_target {
+                break;
+            }
+            in_target = parse_table_header(trimmed)
+                .map(|(table_section, table_name)| {
+                    table_section == "profiles" && table_name == profile_name
+                })
+                .unwrap_or(false);
+            if in_target {
+                found = true;
+            }
+            continue;
+        }
+        if in_target {
+            lines.push(line.to_string());
+        }
+    }
+
+    if found {
+        Some(lines.join("\n").trim_end().to_string())
+    } else {
+        None
+    }
 }
 
 fn set_top_level_string_config(content: &str, key: &str, value: &str) -> String {
@@ -2415,16 +2916,7 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
         if !profile.start_remote_e2ee_on_launch {
             profile.remote_e2ee_password.clear();
         }
-        if !is_uuid_like(&profile.id) {
-            profile.id = if is_uuid_like(&profile.bot.integration_id) {
-                profile.bot.integration_id.trim().to_string()
-            } else {
-                new_uuid_v4()
-            };
-        }
-        if profile.codex_home.is_empty() {
-            profile.codex_home = profile_codex_home(&profile);
-        }
+        ensure_provider_profile_identity(&mut profile);
         profile
             .bot
             .normalize_for_profile_instance(&profile.name, &profile.id);
@@ -2433,10 +2925,11 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
         if profile.name.is_empty() || (!has_provider && !is_providerless) {
             continue;
         }
-        if !deduped
-            .iter()
-            .any(|existing: &ProviderProfile| existing.name == profile.name)
-        {
+        let profile_key = provider_profile_key(&profile);
+        if !deduped.iter().any(|existing: &ProviderProfile| {
+            provider_profile_key(existing) == profile_key
+                || (is_default_provider(existing) && is_default_provider(&profile))
+        }) {
             deduped.push(profile);
         }
     }
@@ -2718,6 +3211,20 @@ fn validate_provider_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_workspace_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is required".to_string());
+    }
+    if name == DEFAULT_PROVIDER_PROFILE_NAME {
+        return Err("Default is reserved".to_string());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("name cannot contain control characters".to_string());
+    }
+    Ok(())
+}
+
 fn workspace_name_or_default(workspace_name: &str, fallback: &str) -> Result<String, String> {
     let name = workspace_name.trim();
     let name = if name.is_empty() {
@@ -2725,8 +3232,32 @@ fn workspace_name_or_default(workspace_name: &str, fallback: &str) -> Result<Str
     } else {
         name
     };
-    validate_provider_name(name)?;
+    validate_workspace_name(name)?;
     Ok(name.to_string())
+}
+
+pub fn provider_profile_key(profile: &ProviderProfile) -> String {
+    let id = profile.id.trim();
+    if is_uuid_like(id) {
+        id.to_string()
+    } else {
+        profile.name.trim().to_string()
+    }
+}
+
+fn ensure_provider_profile_identity(profile: &mut ProviderProfile) {
+    profile.id = profile.id.trim().to_string();
+    if !is_uuid_like(&profile.id) {
+        profile.id = if is_uuid_like(&profile.bot.integration_id) {
+            profile.bot.integration_id.trim().to_string()
+        } else {
+            new_uuid_v4()
+        };
+    }
+    profile.codex_home = normalize_home_path(&profile.codex_home);
+    if profile.codex_home.is_empty() {
+        profile.codex_home = profile_codex_home(profile);
+    }
 }
 
 pub fn normalized_remote_frontend_mode(value: &str) -> String {
@@ -2894,6 +3425,10 @@ fn slugify(value: &str) -> String {
     }
 }
 
+fn short_profile_id(id: &str) -> String {
+    id.chars().filter(|ch| *ch != '-').take(8).collect()
+}
+
 fn toml_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -2953,6 +3488,77 @@ fn env_bool(name: &str, fallback: bool) -> bool {
         .unwrap_or(fallback)
 }
 
+fn requested_codex_profile_config_format() -> CodexProfileConfigFormat {
+    codex_profile_config_format_from_env().unwrap_or_else(default_codex_profile_config_format)
+}
+
+fn default_codex_profile_config_format() -> CodexProfileConfigFormat {
+    if cfg!(test) {
+        CodexProfileConfigFormat::LegacyProfilesTable
+    } else {
+        CodexProfileConfigFormat::SeparateProfileFiles
+    }
+}
+
+fn parse_codex_profile_config_format(value: &str) -> Option<CodexProfileConfigFormat> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "legacy" | "profiles" | "profiles_table" | "profile_table" => {
+            Some(CodexProfileConfigFormat::LegacyProfilesTable)
+        }
+        "separate" | "separate_profile_files" | "profile_files" | "profile_file" | "new" => {
+            Some(CodexProfileConfigFormat::SeparateProfileFiles)
+        }
+        _ => None,
+    }
+}
+
+fn codex_cli_version(executable: &str) -> Option<(u64, u64, u64)> {
+    let output = std::process::Command::new(executable)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    parse_codex_cli_version(&text)
+}
+
+fn codex_profile_config_format_for_version(version: (u64, u64, u64)) -> CodexProfileConfigFormat {
+    if version >= CODEX_PROFILE_CONFIG_FILES_MIN_VERSION {
+        CodexProfileConfigFormat::SeparateProfileFiles
+    } else {
+        CodexProfileConfigFormat::LegacyProfilesTable
+    }
+}
+
+fn parse_codex_cli_version(value: &str) -> Option<(u64, u64, u64)> {
+    for token in
+        value.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+'))
+    {
+        let token = token.trim().trim_start_matches('v');
+        let token = token
+            .split_once('-')
+            .map(|(version, _)| version)
+            .unwrap_or(token);
+        let token = token
+            .split_once('+')
+            .map(|(version, _)| version)
+            .unwrap_or(token);
+        let mut parts = token.split('.');
+        let Some(major) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(minor) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(patch) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        return Some((major, minor, patch));
+    }
+    None
+}
+
 fn now_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2995,6 +3601,26 @@ model_provider = "profile-provider"
         assert!(top_level.contains("model = \"new-model\""));
         assert!(!top_level.contains("model_provider ="));
         assert!(updated.contains("model_provider = \"profile-provider\""));
+    }
+
+    #[test]
+    fn codex_cli_version_selects_profile_config_format() {
+        assert_eq!(
+            parse_codex_cli_version("codex-cli 0.133.2"),
+            Some((0, 133, 2))
+        );
+        assert_eq!(
+            parse_codex_cli_version("codex 0.134.0-beta.1"),
+            Some((0, 134, 0))
+        );
+        assert_eq!(
+            codex_profile_config_format_for_version((0, 133, 2)),
+            CodexProfileConfigFormat::LegacyProfilesTable
+        );
+        assert_eq!(
+            codex_profile_config_format_for_version((0, 134, 0)),
+            CodexProfileConfigFormat::SeparateProfileFiles
+        );
     }
 
     #[test]
@@ -3462,6 +4088,62 @@ model_provider = "old-provider"
     }
 
     #[test]
+    fn workspace_name_accepts_human_readable_text() {
+        let profile = workspace_profile(
+            "客户 Project #1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            BotProfileConfig::default(),
+        )
+        .expect("workspace name should allow spaces and non-ascii text");
+
+        assert_eq!(profile.name, "客户 Project #1");
+    }
+
+    #[test]
+    fn app_config_keeps_duplicate_workspace_names_by_id() {
+        let mut config = AppConfig {
+            active_provider: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
+            provider_profiles: vec![default_provider_profile()],
+            ..AppConfig::default()
+        };
+        let first = workspace_profile(
+            "Same Workspace".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            BotProfileConfig::default(),
+        )
+        .expect("first workspace");
+        let second = workspace_profile(
+            "Same Workspace".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            BotProfileConfig::default(),
+        )
+        .expect("second workspace");
+
+        config.add_provider_profile(first);
+        config.add_provider_profile(second);
+        config.normalize();
+
+        let duplicates = config
+            .provider_profiles
+            .iter()
+            .filter(|profile| profile.name == "Same Workspace")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert_ne!(duplicates[0].id, duplicates[1].id);
+        assert!(config.provider_profile(&duplicates[0].id).is_some());
+        assert!(config.provider_profile(&duplicates[1].id).is_some());
+    }
+
+    #[test]
     fn remote_cloud_auth_requires_user_and_unexpired_token() {
         let mut auth = RemoteCloudAuthConfig {
             user_id: "user-1".to_string(),
@@ -3592,6 +4274,96 @@ model_provider = "nextai"
             std::fs::read_to_string(workspace_config_path).expect("read workspace config");
         assert!(workspace_config.contains("[profiles.nextai]"));
         assert!(workspace_config.contains("model = \"glm-4.6\""));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_codex_home {
+            std::env::set_var("CODEXL_CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEXL_CODEX_HOME");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn separate_profile_files_move_legacy_profile_table() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("separate-profile-files");
+        let old_home = std::env::var("HOME").ok();
+        let old_codex_home = std::env::var("CODEXL_CODEX_HOME").ok();
+
+        std::fs::create_dir_all(root.join(".codex")).expect("create default codex home");
+        std::fs::write(
+            root.join(".codex").join("config.toml"),
+            r#"profile = "bs"
+
+[model_providers.bs]
+name = "bs"
+base_url = "https://api.example/v1"
+experimental_bearer_token = "old-token"
+
+[profiles.bs]
+model = "old-model"
+model_provider = "bs"
+model_reasoning_effort = "high"
+"#,
+        )
+        .expect("write default config");
+
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let profile = add_existing_provider_profile_with_format(
+            ExistingProviderRequest {
+                workspace_name: "workspace-bs".to_string(),
+                profile_name: "bs".to_string(),
+                base_url: None,
+                api_key: None,
+                model: "new-model".to_string(),
+                proxy_url: String::new(),
+                remote_frontend_mode: String::new(),
+                remote_web_asset_registry_url: String::new(),
+                remote_web_asset_version: String::new(),
+                bot: BotProfileConfig::default(),
+            },
+            CodexProfileConfigFormat::SeparateProfileFiles,
+        )
+        .expect("add provider with separate profile files");
+
+        let default_config =
+            std::fs::read_to_string(root.join(".codex").join("config.toml")).expect("read config");
+        assert!(!default_config.contains("profile = \"bs\""));
+        assert!(!default_config.contains("[profiles.bs]"));
+        assert!(default_config.contains("[model_providers.bs]"));
+
+        let default_profile_config =
+            std::fs::read_to_string(root.join(".codex").join("bs.config.toml"))
+                .expect("read profile config");
+        assert!(default_profile_config.contains("model = \"new-model\""));
+        assert!(default_profile_config.contains("model_provider = \"bs\""));
+        assert!(default_profile_config.contains("model_reasoning_effort = \"high\""));
+
+        let workspace_home = generated_codex_home(&profile);
+        let workspace_config =
+            std::fs::read_to_string(workspace_home.join("config.toml")).expect("read workspace");
+        assert!(!workspace_config.contains("[profiles.bs]"));
+        assert!(workspace_config.contains("[model_providers.bs]"));
+        let workspace_profile_config =
+            std::fs::read_to_string(workspace_home.join("bs.config.toml"))
+                .expect("read workspace profile");
+        assert!(workspace_profile_config.contains("model = \"new-model\""));
+        assert!(workspace_profile_config.contains("model_provider = \"bs\""));
+
+        let providers = read_default_provider_profiles().expect("read providers");
+        let provider = providers
+            .iter()
+            .find(|item| item.name == "bs")
+            .expect("provider from profile file");
+        assert_eq!(provider.model, "new-model");
+        assert_eq!(provider.provider_name, "bs");
 
         if let Some(value) = old_home {
             std::env::set_var("HOME", value);
@@ -3950,6 +4722,87 @@ model_provider = "bs"
         assert!(!content.contains("https://source.example/v1"));
         assert!(!content.contains("source-token"));
         assert!(!content.contains("saved-model"));
+
+        if let Some(value) = old_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = old_codex_home {
+            std::env::set_var("CODEXL_CODEX_HOME", value);
+        } else {
+            std::env::remove_var("CODEXL_CODEX_HOME");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_provider_home_migrates_existing_legacy_profile_for_new_cli() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("provider-home-migrate-profile");
+        let old_home = std::env::var("HOME").ok();
+        let old_codex_home = std::env::var("CODEXL_CODEX_HOME").ok();
+
+        std::fs::create_dir_all(root.join(".codex")).expect("create default codex home");
+        std::fs::write(root.join(".codex").join("config.toml"), "").expect("write default config");
+
+        let generated_home = root.join(".codexl").join("codex-homes").join("bs");
+        std::fs::create_dir_all(&generated_home).expect("create generated home");
+        std::fs::write(
+            generated_home.join("config.toml"),
+            r#"profile = "bs"
+model = "existing-top-model"
+
+[model_providers.bs]
+name = "bs"
+base_url = "https://existing.example/v1"
+experimental_bearer_token = "existing-token"
+
+[profiles.bs]
+model = "existing-profile-model"
+model_provider = "bs"
+"#,
+        )
+        .expect("write generated config");
+
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let profile = ProviderProfile {
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            name: "bs".to_string(),
+            codex_profile_name: "bs".to_string(),
+            provider_name: "bs".to_string(),
+            provider_config_format: DEFAULT_PROVIDER_CONFIG_FORMAT_PROFILE.to_string(),
+            base_url: "https://saved.example/v1".to_string(),
+            model: "saved-model".to_string(),
+            proxy_url: String::new(),
+            remote_frontend_mode: REMOTE_FRONTEND_MODE_APP.to_string(),
+            remote_web_asset_registry_url: String::new(),
+            remote_web_asset_version: "latest".to_string(),
+            codex_home: String::new(),
+            start_remote_on_launch: false,
+            start_remote_cloud_on_launch: false,
+            start_remote_e2ee_on_launch: false,
+            remote_e2ee_password: String::new(),
+            bot: BotProfileConfig::default(),
+        };
+        let path = ensure_provider_codex_home_with_format(
+            &profile,
+            CodexProfileConfigFormat::SeparateProfileFiles,
+        )
+        .expect("ensure provider home");
+        let codex_home = PathBuf::from(path);
+        let content = std::fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+        let profile_content =
+            std::fs::read_to_string(codex_home.join("bs.config.toml")).expect("read profile");
+
+        assert!(!content.contains("profile = \"bs\""));
+        assert!(!content.contains("[profiles.bs]"));
+        assert!(content.contains("https://existing.example/v1"));
+        assert!(content.contains("existing-token"));
+        assert!(profile_content.contains("existing-profile-model"));
+        assert!(!profile_content.contains("saved-model"));
 
         if let Some(value) = old_home {
             std::env::set_var("HOME", value);

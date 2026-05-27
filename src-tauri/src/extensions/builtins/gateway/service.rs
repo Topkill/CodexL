@@ -3,6 +3,7 @@ use crate::config::AppConfig;
 use crate::extensions::{self, BuiltinNodeExtension};
 use crate::AppState;
 use serde::Serialize;
+use serde_json::Value;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -71,6 +72,12 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
             .await
             .map_err(|err| err.to_string())??;
     let config_file = gateway_config::read_gateway_config()?;
+    let usage_webhook_url = if gateway_usage_capture_enabled(&config_file.config) {
+        let app_config = state.config.lock().await.clone();
+        Some(codexl_gateway_usage_webhook_url(&app_config))
+    } else {
+        None
+    };
 
     let mut guard = state.gateway_service.lock().await;
     if let Some(status) = managed_status_from_guard(&mut guard, &health_url).await? {
@@ -86,7 +93,12 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
         });
     }
 
-    let mut handle = start_process(&extension, &config_file.path, health_url.clone())?;
+    let mut handle = start_process(
+        &extension,
+        &config_file.path,
+        health_url.clone(),
+        usage_webhook_url.as_deref(),
+    )?;
     let pid = handle.child.id();
     wait_until_ready(&mut handle).await?;
     *guard = Some(handle);
@@ -155,6 +167,7 @@ fn start_process(
     extension: &BuiltinNodeExtension,
     config_path: &str,
     health_url: String,
+    usage_webhook_url: Option<&str>,
 ) -> Result<GatewayServiceHandle, String> {
     let mut command = Command::new(&extension.node.executable);
     command
@@ -167,11 +180,47 @@ fn start_process(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    if let Some(usage_webhook_url) = usage_webhook_url {
+        command
+            .env("BILLING_ENABLED", "true")
+            .env("BILLING_WEBHOOK_ENABLED", "true")
+            .env("BILLING_WEBHOOK_ENDPOINT", usage_webhook_url)
+            .env("BILLING_WEBHOOK_TIMEOUT_MS", "2000");
+    }
+
     let child = command
         .spawn()
         .map_err(|err| format!("failed to start NeXT AI Gateway: {}", err))?;
 
     Ok(GatewayServiceHandle { child, health_url })
+}
+
+fn gateway_usage_capture_enabled(config: &Value) -> bool {
+    match config
+        .get("codexlUsageCapture")
+        .and_then(|value| value.get("enabled"))
+    {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(Value::String(enabled)) => enabled.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+fn codexl_gateway_usage_webhook_url(config: &AppConfig) -> String {
+    format!("{}/gateway/usage", codexl_http_origin(config))
+}
+
+fn codexl_http_origin(config: &AppConfig) -> String {
+    let host = match config.http_host.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        value => value,
+    };
+    let host_part = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    format!("http://{}:{}", host_part, config.http_port)
 }
 
 async fn wait_until_ready(handle: &mut GatewayServiceHandle) -> Result<(), String> {
