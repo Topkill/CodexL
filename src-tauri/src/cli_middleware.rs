@@ -39,6 +39,8 @@ type SharedOutput<W> = Arc<Mutex<W>>;
 #[cfg(windows)]
 const MIDDLEWARE_FILE_NAME: &str = "codexl-codex-cli-middleware.exe";
 #[cfg(windows)]
+const MIDDLEWARE_FILE_STEM: &str = "codexl-codex-cli-middleware";
+#[cfg(windows)]
 const STDIO_FILE_NAME: &str = "codexl-codex-cli-stdio.cmd";
 
 #[cfg(not(windows))]
@@ -226,7 +228,11 @@ fn program_is_windows_middleware_shim(program: Option<&OsStr>) -> bool {
     program
         .and_then(|program| Path::new(program).file_name())
         .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case(MIDDLEWARE_FILE_NAME))
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name == MIDDLEWARE_FILE_NAME
+                || (name.starts_with(MIDDLEWARE_FILE_STEM) && name.ends_with(".exe"))
+        })
 }
 
 fn resolve_real_cli_path(
@@ -238,7 +244,7 @@ fn resolve_real_cli_path(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     if let Some(path) = explicit_real_cli {
-        return validate_cli_path(expand_home_path(&path));
+        return prepare_real_cli_path(expand_home_path(&path));
     }
 
     let inherited_cli = std::env::var(CODEX_CLI_PATH_ENV)
@@ -248,7 +254,7 @@ fn resolve_real_cli_path(
         .map(|value| expand_home_path(&value))
         .filter(|path| !same_path(path, middleware_path));
     if let Some(path) = inherited_cli {
-        return validate_cli_path(path);
+        return prepare_real_cli_path(path);
     }
 
     bundled_cli_path(codex_app_executable)
@@ -258,7 +264,12 @@ fn resolve_real_cli_path(
                 codex_app_executable
             )
         })
-        .and_then(validate_cli_path)
+        .and_then(prepare_real_cli_path)
+}
+
+fn prepare_real_cli_path(path: PathBuf) -> Result<PathBuf, String> {
+    let path = validate_cli_path(path)?;
+    materialize_windows_appx_cli(path)
 }
 
 fn validate_cli_path(path: PathBuf) -> Result<PathBuf, String> {
@@ -282,6 +293,65 @@ fn validate_cli_path(path: PathBuf) -> Result<PathBuf, String> {
     }
 
     Ok(path)
+}
+
+#[cfg(windows)]
+fn materialize_windows_appx_cli(path: PathBuf) -> Result<PathBuf, String> {
+    if !is_windows_appx_path(&path) {
+        return Ok(path);
+    }
+
+    let package_slug = windows_appx_package_slug(&path).unwrap_or_else(|| "appx".to_string());
+    let target = codexl_home_dir()
+        .join("bin")
+        .join(format!("codexl-real-codex-{}.exe", package_slug));
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if should_copy_middleware_exe(&target, &path) {
+        std::fs::copy(&path, &target).map_err(|e| {
+            format!(
+                "Failed to copy Windows Store Codex CLI from {} to {}: {}",
+                path.to_string_lossy(),
+                target.to_string_lossy(),
+                e
+            )
+        })?;
+    }
+    validate_cli_path(target)
+}
+
+#[cfg(not(windows))]
+fn materialize_windows_appx_cli(path: PathBuf) -> Result<PathBuf, String> {
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn is_windows_appx_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("WindowsApps"))
+    })
+}
+
+#[cfg(windows)]
+fn windows_appx_package_slug(path: &Path) -> Option<String> {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("WindowsApps"))
+        {
+            return components
+                .next()
+                .and_then(|package| package.as_os_str().to_str())
+                .map(slugify_file_segment);
+        }
+    }
+    None
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -316,7 +386,37 @@ fn bundled_cli_path(codex_app_executable: &str) -> Option<PathBuf> {
 }
 
 fn middleware_path() -> PathBuf {
-    codexl_home_dir().join("bin").join(MIDDLEWARE_FILE_NAME)
+    codexl_home_dir()
+        .join("bin")
+        .join(windows_versioned_middleware_file_name())
+}
+
+#[cfg(windows)]
+fn windows_versioned_middleware_file_name() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return MIDDLEWARE_FILE_NAME.to_string();
+    };
+    let Ok(metadata) = std::fs::metadata(&exe) else {
+        return MIDDLEWARE_FILE_NAME.to_string();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+
+    format!(
+        "{}-{}-{}.exe",
+        MIDDLEWARE_FILE_STEM,
+        metadata.len(),
+        modified
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_versioned_middleware_file_name() -> String {
+    MIDDLEWARE_FILE_NAME.to_string()
 }
 
 fn stdio_path(name: Option<&str>) -> PathBuf {
@@ -2548,6 +2648,55 @@ printf ':stdin=%s\n' "$first_line"
         } else {
             assert_eq!(file_name, "codexl-codex-cli-stdio-my-provider-profile");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_appx_cli_is_copied_before_use() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("windows-appx-cli");
+        let source = root
+            .join("WindowsApps")
+            .join("OpenAI.Codex_test")
+            .join("app")
+            .join("resources")
+            .join("codex.exe");
+        std::fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source, b"fake codex cli").expect("write source cli");
+
+        let codexl_home = root.join("codexl-home");
+        std::env::set_var("CODEXL_HOME", &codexl_home);
+
+        let prepared = materialize_windows_appx_cli(source.clone()).expect("materialize cli");
+
+        std::env::remove_var("CODEXL_HOME");
+        assert_eq!(
+            prepared,
+            codexl_home
+                .join("bin")
+                .join("codexl-real-codex-openai-codex-test.exe")
+        );
+        assert_eq!(
+            std::fs::read(&prepared).expect("read copied cli"),
+            b"fake codex cli"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_middleware_shim_accepts_versioned_file_name() {
+        assert!(program_is_windows_middleware_shim(Some(OsStr::new(
+            "codexl-codex-cli-middleware.exe"
+        ))));
+        assert!(program_is_windows_middleware_shim(Some(OsStr::new(
+            "codexl-codex-cli-middleware-123-456.exe"
+        ))));
+        assert!(!program_is_windows_middleware_shim(Some(OsStr::new(
+            "codexl-codex-cli-stdio.cmd"
+        ))));
     }
 
     #[cfg(unix)]

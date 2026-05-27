@@ -89,6 +89,8 @@ pub fn launch_codex(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    configure_windows_user_data_dir(&mut command, codex_home, stdio_name)?;
+
     let mut cli_stdio_path = None;
     if !cli_middleware::is_disabled() {
         let middleware = cli_middleware::prepare(
@@ -395,6 +397,49 @@ fn terminate_pids_windows(mut pids: BTreeSet<u32>) {
     }
 }
 
+#[cfg(windows)]
+fn configure_windows_user_data_dir(
+    command: &mut Command,
+    codex_home: Option<&str>,
+    stdio_name: Option<&str>,
+) -> std::io::Result<()> {
+    let user_data_dir = windows_user_data_dir(codex_home, stdio_name);
+    std::fs::create_dir_all(&user_data_dir)?;
+    command.arg(format!(
+        "--user-data-dir={}",
+        user_data_dir.to_string_lossy()
+    ));
+    command.env("CODEX_ELECTRON_USER_DATA_PATH", &user_data_dir);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_user_data_dir(codex_home: Option<&str>, stdio_name: Option<&str>) -> PathBuf {
+    let base = codex_home
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_home_path(value.to_string()))
+        .unwrap_or_else(|| {
+            user_home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".codex")
+                .join("codexl")
+        });
+
+    base.join(".codexl")
+        .join("codex-app-user-data")
+        .join(safe_path_segment(stdio_name.unwrap_or("default")))
+}
+
+#[cfg(not(windows))]
+fn configure_windows_user_data_dir(
+    _command: &mut Command,
+    _codex_home: Option<&str>,
+    _stdio_name: Option<&str>,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn configure_bot_gateway_bridge_env(
     command: &mut Command,
     stdio_name: Option<&str>,
@@ -497,6 +542,23 @@ fn configure_proxy_env(command: &mut Command, proxy_url: Option<&str>) {
         "ALL_PROXY",
     ] {
         command.env(key, proxy_url);
+    }
+}
+
+fn safe_path_segment(value: &str) -> String {
+    let mut segment = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            segment.push(ch);
+        } else {
+            segment.push('-');
+        }
+    }
+    let segment = segment.trim_matches('-');
+    if segment.is_empty() {
+        "default".to_string()
+    } else {
+        segment.to_string()
     }
 }
 
@@ -1136,5 +1198,50 @@ mod tests {
             pgid,
             command: String::new(),
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_user_data_dir_is_scoped_by_profile() {
+        let home = r"C:\Users\me\.codex";
+
+        let first = windows_user_data_dir(Some(home), Some("Default"));
+        let second = windows_user_data_dir(Some(home), Some("Other Provider"));
+
+        assert_ne!(first, second);
+        assert!(first.ends_with(Path::new("codex-app-user-data").join("Default")));
+        assert!(second.ends_with(Path::new("codex-app-user-data").join("Other-Provider")));
+    }
+
+    #[test]
+    fn configure_windows_user_data_dir_sets_codex_electron_env() {
+        let home =
+            std::env::temp_dir().join(format!("codexl-user-data-env-{}", std::process::id()));
+        let mut command = Command::new("Codex.exe");
+
+        configure_windows_user_data_dir(
+            &mut command,
+            Some(&home.to_string_lossy()),
+            Some("Default"),
+        )
+        .expect("configure user data dir");
+
+        let value = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("CODEX_ELECTRON_USER_DATA_PATH"))
+            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().to_string()))
+            .expect("CODEX_ELECTRON_USER_DATA_PATH env");
+
+        assert_eq!(
+            PathBuf::from(value),
+            home.join(".codexl")
+                .join("codex-app-user-data")
+                .join("Default")
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 }
