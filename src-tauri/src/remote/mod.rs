@@ -2378,6 +2378,7 @@ enum CliAppServerBackend {
 }
 
 struct CliAppBridge {
+    backend: CliAppServerBackend,
     child: Mutex<Option<Child>>,
     codex_home: String,
     connected: AtomicBool,
@@ -2452,6 +2453,7 @@ impl CliAppBridge {
             .ok_or_else(|| "Failed to open Codex CLI app-server stdout".to_string())?;
 
         let bridge = Arc::new(Self {
+            backend,
             child: Mutex::new(Some(child)),
             codex_home,
             connected: AtomicBool::new(true),
@@ -2527,24 +2529,7 @@ impl CliAppBridge {
 
     fn app_server_value_to_bridge_messages(&self, value: Value) -> Vec<Value> {
         let host_id = "local";
-        let method = value.get("method").and_then(Value::as_str);
-        let id = json_id_to_string(value.get("id"));
-        let message = if method.is_some() && id.is_some() {
-            json!({
-                "type": "mcp-request",
-                "hostId": host_id,
-                "request": value,
-            })
-        } else if let Some(method) = method {
-            json!({
-                "type": "mcp-notification",
-                "hostId": host_id,
-                "method": method,
-                "params": value.get("params").cloned().unwrap_or(Value::Null),
-            })
-        } else {
-            value
-        };
+        let message = cli_app_server_value_to_bridge_message(host_id, value);
         vec![self.decorate_notification(message)]
     }
 
@@ -2828,10 +2813,9 @@ impl CliAppBridge {
             .await?;
         decorate_cli_app_server_response(method, &mut response);
         let mut messages = Vec::new();
-        if matches!(
-            request.get("method").and_then(Value::as_str),
-            Some("thread/start" | "thread/resume")
-        ) {
+        if method == "thread/resume"
+            || (method == "thread/start" && self.backend != CliAppServerBackend::ClaudeCode)
+        {
             if let Some(thread) = response
                 .get("result")
                 .and_then(|result| result.get("thread"))
@@ -3018,7 +3002,9 @@ impl CliAppBridge {
             Ok(mut response) => {
                 decorate_cli_app_server_response(method, &mut response);
                 let mut messages = Vec::new();
-                if matches!(method, "thread/start" | "thread/resume") {
+                if method == "thread/resume"
+                    || (method == "thread/start" && self.backend != CliAppServerBackend::ClaudeCode)
+                {
                     messages.extend(self.thread_started_messages_from_response(&response));
                 }
                 messages.push(fetch_response_success(
@@ -3724,6 +3710,30 @@ impl CliAppBridge {
             .into_iter()
             .map(|message| self.decorate_notification(message))
             .collect()
+    }
+}
+
+fn cli_app_server_value_to_bridge_message(host_id: &str, value: Value) -> Value {
+    if value.get("type").and_then(Value::as_str) == Some("ipc-broadcast") {
+        return value;
+    }
+    let method = value.get("method").and_then(Value::as_str);
+    let id = json_id_to_string(value.get("id"));
+    if method.is_some() && id.is_some() {
+        json!({
+            "type": "mcp-request",
+            "hostId": host_id,
+            "request": value,
+        })
+    } else if let Some(method) = method {
+        json!({
+            "type": "mcp-notification",
+            "hostId": host_id,
+            "method": method,
+            "params": value.get("params").cloned().unwrap_or(Value::Null),
+        })
+    } else {
+        value
     }
 }
 
@@ -7523,6 +7533,43 @@ mod tests {
         assert_eq!(bearer_token("bearer   secret"), Some("secret"));
         assert_eq!(bearer_token("Basic secret"), None);
         assert_eq!(bearer_token("Bearer"), None);
+    }
+
+    #[test]
+    fn cli_app_server_preserves_ipc_broadcast_thread_snapshots() {
+        let message = cli_app_server_value_to_bridge_message(
+            "local",
+            json!({
+                "type": "ipc-broadcast",
+                "method": "thread-stream-state-changed",
+                "params": {
+                    "conversationId": "thread-1",
+                    "hostId": "local",
+                    "change": {
+                        "type": "snapshot",
+                        "conversationState": {
+                            "id": "thread-1",
+                            "title": "Greeting received"
+                        }
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            message.get("type").and_then(Value::as_str),
+            Some("ipc-broadcast")
+        );
+        assert_eq!(
+            message.get("method").and_then(Value::as_str),
+            Some("thread-stream-state-changed")
+        );
+        assert_eq!(
+            message
+                .pointer("/params/change/conversationState/title")
+                .and_then(Value::as_str),
+            Some("Greeting received")
+        );
     }
 
     #[tokio::test]

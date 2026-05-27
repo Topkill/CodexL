@@ -317,6 +317,19 @@ pub(super) const WEB_BRIDGE_SCRIPT: &str = r#"(() => {
   }
 
   function normalizeHostMessageForCodexApp(message) {
+    if (
+      message?.type === "mcp-notification" &&
+      message.method === "thread-stream-state-changed" &&
+      message.params &&
+      typeof message.params === "object"
+    ) {
+      message = {
+        type: "thread-stream-state-changed",
+        sourceClientId: message.sourceClientId || message.clientId,
+        version: message.version,
+        ...message.params,
+      };
+    }
     if (message?.type !== "thread-stream-state-changed") {
       return message;
     }

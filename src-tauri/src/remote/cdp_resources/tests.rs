@@ -270,6 +270,8 @@ fn web_bridge_dispatch_seeds_codex_app_state_for_remote_thread_start() {
 
     assert!(expression.contains("reflectThreadStartResponseToCodexApp"));
     assert!(expression.contains("input.request?.method !== \"thread/start\""));
+    assert!(expression.contains("thread.modelProvider === \"claude-code\""));
+    assert!(expression.contains("value.type === \"mcp-notification\""));
     assert!(expression.contains("method: \"thread/started\""));
     assert!(expression.contains("params: { thread: clone(thread) }"));
     assert!(expression.contains("__codexWebBridgeNotificationForwarded"));

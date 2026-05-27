@@ -1491,6 +1491,14 @@ pub(super) fn web_bridge_dispatch_expression(message: &Value) -> String {
               ) {{
                 return value.params;
               }}
+              if (
+                value.type === "mcp-notification" &&
+                value.method === "thread-stream-state-changed" &&
+                value.params &&
+                typeof value.params === "object"
+              ) {{
+                return value.params;
+              }}
               return null;
             }};
             const reflectRemoteThreadStreamStateToCodexApp = (value) => {{
@@ -1523,6 +1531,9 @@ pub(super) fn web_bridge_dispatch_expression(message: &Value) -> String {
               }}
               const thread = response?.message?.result?.thread;
               if (!thread || typeof thread !== "object") {{
+                return;
+              }}
+              if (thread.modelProvider === "claude-code" || thread.source === "claude-code") {{
                 return;
               }}
               // Remote-created threads did not run Codex App's local createConversation()
