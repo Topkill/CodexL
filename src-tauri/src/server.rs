@@ -113,13 +113,23 @@ struct StatusResponse {
 
 pub async fn serve(state: AppState) -> Result<(), String> {
     let config = state.config.lock().await.clone();
-    let listener = TcpListener::bind((config.http_host.as_str(), config.http_port))
-        .await
-        .map_err(|e| format!("failed to bind HTTP server: {}", e))?;
+    let (listener, actual_port) = bind_http_listener(&config.http_host, config.http_port).await?;
+    if actual_port != config.http_port {
+        eprintln!(
+            "CodexL HTTP port {} is unavailable; using {} instead",
+            config.http_port, actual_port
+        );
+        let mut runtime_config = state.config.lock().await;
+        if runtime_config.http_host == config.http_host
+            && runtime_config.http_port == config.http_port
+        {
+            runtime_config.http_port = actual_port;
+        }
+    }
     let local_addr = listener
         .local_addr()
         .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| format!("{}:{}", config.http_host, config.http_port));
+        .unwrap_or_else(|_| format!("{}:{}", config.http_host, actual_port));
 
     eprintln!("CodexL HTTP server listening on http://{}", local_addr);
 
@@ -142,6 +152,38 @@ pub async fn serve(state: AppState) -> Result<(), String> {
             }
         });
     }
+}
+
+async fn bind_http_listener(host: &str, preferred_port: u16) -> Result<(TcpListener, u16), String> {
+    if preferred_port == 0 {
+        let listener = TcpListener::bind((host, 0))
+            .await
+            .map_err(|e| format!("failed to bind HTTP server: {}", e))?;
+        let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+        return Ok((listener, port));
+    }
+
+    let mut first_error = None;
+    for offset in 0..100u16 {
+        let Some(port) = preferred_port.checked_add(offset) else {
+            break;
+        };
+        match TcpListener::bind((host, port)).await {
+            Ok(listener) => return Ok((listener, port)),
+            Err(err) => {
+                if offset == 0 {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "failed to bind HTTP server: {}",
+        first_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no available port found".to_string())
+    ))
 }
 
 pub async fn launch_codex_instance(
@@ -1047,6 +1089,9 @@ async fn running_launch_infos(state: &AppState) -> Result<Vec<LaunchInfo>, Strin
         for (profile_name, instance) in instances.iter_mut() {
             match running_child_pid(&mut instance.child)? {
                 Some(pid) => infos.push(launch_info_from_instance(&instance.info, Some(pid))),
+                None if cdp_endpoint_is_alive(&instance.info).await => {
+                    infos.push(launch_info_from_instance(&instance.info, instance.info.pid))
+                }
                 None => stopped_profiles.push(profile_name.clone()),
             }
         }
@@ -1109,6 +1154,19 @@ fn running_child_pid(child: &mut Child) -> Result<Option<u32>, String> {
         Ok(Some(_status)) => Ok(None),
         Err(err) => Err(err.to_string()),
     }
+}
+
+async fn cdp_endpoint_is_alive(info: &LaunchInfo) -> bool {
+    let url = format!("http://{}:{}/json/list", info.cdp_host, info.cdp_port);
+    let Ok(result) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), reqwest::get(url)).await
+    else {
+        return false;
+    };
+    let Ok(response) = result else {
+        return false;
+    };
+    response.status().is_success()
 }
 
 fn launch_info_from_instance(info: &LaunchInfo, pid: Option<u32>) -> LaunchInfo {
@@ -1279,4 +1337,25 @@ fn add_cors(mut response: Response<HttpBody>) -> Response<HttpBody> {
     );
     headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, "*".parse().unwrap());
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener as StdTcpListener;
+
+    #[tokio::test]
+    async fn bind_http_listener_uses_next_port_when_preferred_is_busy() {
+        let occupied = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
+        let preferred_port = occupied.local_addr().expect("occupied addr").port();
+
+        let (listener, actual_port) = bind_http_listener("127.0.0.1", preferred_port)
+            .await
+            .expect("bind fallback listener");
+
+        assert_ne!(actual_port, preferred_port);
+        assert!(actual_port > preferred_port);
+        drop(listener);
+        drop(occupied);
+    }
 }
