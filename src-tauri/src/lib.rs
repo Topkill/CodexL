@@ -3,6 +3,7 @@ mod cli;
 mod cli_middleware;
 mod config;
 mod extensions;
+mod gateway_usage;
 mod launcher;
 mod platforms;
 mod ports;
@@ -309,6 +310,16 @@ async fn update_gateway_config(
 }
 
 #[tauri::command]
+async fn get_gateway_usage_summary(
+    days: Option<u32>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    hours: Option<u32>,
+) -> Result<gateway_usage::GatewayUsageSummary, String> {
+    gateway_usage::load_usage_summary(days, start_date, end_date, hours).await
+}
+
+#[tauri::command]
 fn get_default_providers() -> Result<Vec<DefaultProviderProfile>, String> {
     config::read_default_provider_profiles()
 }
@@ -592,7 +603,7 @@ async fn configure_bot_integration(
     let Some(profile) = config
         .provider_profiles
         .iter_mut()
-        .find(|profile| profile.name == profile_name)
+        .find(|profile| profile.id == profile_name || profile.name == profile_name)
     else {
         return Err(format!("Provider profile not found: {}", profile_name));
     };
@@ -706,7 +717,7 @@ async fn update_profile_bot_status(
     let Some(profile) = config
         .provider_profiles
         .iter_mut()
-        .find(|profile| profile.name == profile_name)
+        .find(|profile| profile.id == profile_name || profile.name == profile_name)
     else {
         return Err(format!("Provider profile not found: {}", profile_name));
     };
@@ -852,6 +863,7 @@ pub fn run() {
             set_remote_launch_options,
             get_gateway_config,
             update_gateway_config,
+            get_gateway_usage_summary,
             get_default_providers,
             add_existing_provider,
             create_workspace,

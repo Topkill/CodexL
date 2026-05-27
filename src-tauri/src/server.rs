@@ -1,5 +1,6 @@
 use crate::config::{self, AppConfig};
 use crate::extensions::builtins::gateway::{config as gateway_config, service as gateway_service};
+use crate::gateway_usage;
 use crate::platforms::macos;
 use crate::remote::cdp_resources;
 use crate::{launcher, ports, remote, AppState};
@@ -340,7 +341,7 @@ fn apply_launch_request(config: &mut AppConfig, request: &LaunchRequest) -> Resu
         let profile = config
             .provider_profile(profile_name)
             .ok_or_else(|| format!("Provider profile not found: {}", profile_name))?;
-        config.active_provider = profile.name;
+        config.active_provider = config::provider_profile_key(&profile);
     }
     if let Some(codex_home) = request.codex_home.as_ref() {
         config.codex_home = codex_home.clone();
@@ -511,6 +512,9 @@ async fn route_request(
             Ok(json_response(StatusCode::OK, json!(status)))
         }
         (&Method::GET, "/health") => Ok(json_response(StatusCode::OK, json!({ "ok": true }))),
+        (&Method::POST, "/gateway/usage") | (&Method::POST, "/gateway/usage/report") => {
+            receive_gateway_usage_report(request).await
+        }
         (&Method::POST, "/launch") => {
             let launch_request = read_launch_request(request).await?;
             let info = launch_codex_instance(&state, launch_request).await?;
@@ -546,6 +550,34 @@ async fn route_request(
             json!({ "error": "not found" }),
         )),
     }
+}
+
+async fn receive_gateway_usage_report(
+    request: &mut Request<Incoming>,
+) -> Result<Response<HttpBody>, String> {
+    let body = request
+        .body_mut()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?
+        .to_bytes();
+    if body.len() > 5 * 1024 * 1024 {
+        return Ok(json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({ "error": "gateway usage payload is too large" }),
+        ));
+    }
+
+    let payload = serde_json::from_slice::<Value>(&body).map_err(|e| e.to_string())?;
+    let result = gateway_usage::record_usage_report(payload).await?;
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "inserted": result.inserted,
+            "eventId": result.event_id,
+        }),
+    ))
 }
 
 async fn probe_codex_plugin_bridge(

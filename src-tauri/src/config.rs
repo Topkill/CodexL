@@ -722,14 +722,10 @@ impl AppConfig {
         {
             self.provider_profiles.insert(0, default_provider_profile());
         }
-        if self.active_provider.is_empty()
-            || !self
-                .provider_profiles
-                .iter()
-                .any(|profile| profile.name == self.active_provider)
+        if self.active_provider.is_empty() || self.provider_profile(&self.active_provider).is_none()
         {
             if let Some(profile) = self.provider_profiles.first() {
-                self.active_provider = profile.name.clone();
+                self.active_provider = provider_profile_key(profile);
             }
         }
 
@@ -785,35 +781,38 @@ impl AppConfig {
         }
     }
 
-    pub fn add_provider_profile(&mut self, profile: ProviderProfile) {
+    pub fn add_provider_profile(&mut self, mut profile: ProviderProfile) {
+        ensure_provider_profile_identity(&mut profile);
+        let active_provider = provider_profile_key(&profile);
         self.provider_profiles.push(profile.clone());
         self.provider_profiles =
             dedupe_provider_profiles(std::mem::take(&mut self.provider_profiles));
-        self.active_provider = profile.name;
+        self.active_provider = active_provider;
     }
 
-    pub fn remove_provider_profile(&mut self, name: &str) -> Result<ProviderProfile, String> {
-        if name == DEFAULT_PROVIDER_PROFILE_NAME {
+    pub fn remove_provider_profile(&mut self, selector: &str) -> Result<ProviderProfile, String> {
+        let index = self
+            .provider_profile_index(selector)
+            .ok_or_else(|| format!("Provider profile not found: {}", selector))?;
+        if is_default_provider(&self.provider_profiles[index]) {
             return Err("Cannot delete the Default provider".to_string());
         }
 
-        let index = self
-            .provider_profiles
-            .iter()
-            .position(|item| item.name == name)
-            .ok_or_else(|| format!("Provider profile not found: {}", name))?;
-
         let removed = self.provider_profiles.remove(index);
+        let removed_key = provider_profile_key(&removed);
         if let Some(saved) =
             saved_bot_config_from_profile(&removed, Some(now_unix_seconds().to_string()))
         {
             upsert_saved_bot_config(&mut self.bot_configs, saved, true);
         }
-        if self.active_provider == name {
+        if self.active_provider == selector
+            || self.active_provider == removed_key
+            || self.active_provider == removed.name
+        {
             self.active_provider = self
                 .provider_profiles
                 .first()
-                .map(|p| p.name.clone())
+                .map(provider_profile_key)
                 .unwrap_or_default();
         }
         self.normalize();
@@ -823,10 +822,10 @@ impl AppConfig {
 
     pub fn update_provider_profile(
         &mut self,
-        original_name: &str,
+        original_selector: &str,
         mut profile: ProviderProfile,
     ) -> Result<(), String> {
-        if original_name == DEFAULT_PROVIDER_PROFILE_NAME {
+        if original_selector == DEFAULT_PROVIDER_PROFILE_NAME {
             if let Some(existing) = self
                 .provider_profiles
                 .iter_mut()
@@ -850,24 +849,11 @@ impl AppConfig {
             return Ok(());
         }
 
-        let next_name = profile.name.clone();
-        if next_name != original_name
-            && self
-                .provider_profiles
-                .iter()
-                .any(|item| item.name == next_name)
-        {
-            return Err(format!("Provider profile already exists: {}", next_name));
-        }
-
-        let Some(index) = self
-            .provider_profiles
-            .iter()
-            .position(|item| item.name == original_name)
-        else {
-            return Err(format!("Provider profile not found: {}", original_name));
+        let Some(index) = self.provider_profile_index(original_selector) else {
+            return Err(format!("Provider profile not found: {}", original_selector));
         };
 
+        let original = self.provider_profiles[index].clone();
         profile.start_remote_on_launch = self.provider_profiles[index].start_remote_on_launch;
         profile.start_remote_cloud_on_launch =
             self.provider_profiles[index].start_remote_cloud_on_launch;
@@ -877,9 +863,15 @@ impl AppConfig {
         if profile.id.trim().is_empty() {
             profile.id = self.provider_profiles[index].id.clone();
         }
+        if profile.codex_home.trim().is_empty() {
+            profile.codex_home = self.provider_profiles[index].codex_home.clone();
+        }
+        let was_active = self.active_provider == original_selector
+            || self.active_provider == provider_profile_key(&original)
+            || self.active_provider == original.name;
         self.provider_profiles[index] = profile.clone();
-        if self.active_provider == original_name {
-            self.active_provider = profile.name;
+        if was_active {
+            self.active_provider = provider_profile_key(&profile);
         }
         self.normalize();
         Ok(())
@@ -887,16 +879,13 @@ impl AppConfig {
 
     pub fn set_start_remote_on_launch(
         &mut self,
-        profile_name: &str,
+        profile_selector: &str,
         enabled: bool,
     ) -> Result<(), String> {
-        let Some(profile) = self
-            .provider_profiles
-            .iter_mut()
-            .find(|profile| profile.name == profile_name)
-        else {
-            return Err(format!("Provider profile not found: {}", profile_name));
+        let Some(index) = self.provider_profile_index(profile_selector) else {
+            return Err(format!("Provider profile not found: {}", profile_selector));
         };
+        let profile = &mut self.provider_profiles[index];
 
         profile.start_remote_on_launch = enabled;
         if !enabled {
@@ -909,18 +898,15 @@ impl AppConfig {
 
     pub fn set_remote_launch_options(
         &mut self,
-        profile_name: &str,
+        profile_selector: &str,
         start_remote: bool,
         start_cloud: bool,
         remote_e2ee_password: Option<String>,
     ) -> Result<(), String> {
-        let Some(profile) = self
-            .provider_profiles
-            .iter_mut()
-            .find(|profile| profile.name == profile_name)
-        else {
-            return Err(format!("Provider profile not found: {}", profile_name));
+        let Some(index) = self.provider_profile_index(profile_selector) else {
+            return Err(format!("Provider profile not found: {}", profile_selector));
         };
+        let profile = &mut self.provider_profiles[index];
 
         let next_start_remote = start_remote;
         let next_start_cloud = next_start_remote && start_cloud;
@@ -944,24 +930,32 @@ impl AppConfig {
         self.save()
     }
 
-    pub fn provider_profile(&self, name: &str) -> Option<ProviderProfile> {
+    fn provider_profile_index(&self, selector: &str) -> Option<usize> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
         self.provider_profiles
             .iter()
-            .find(|profile| profile.name == name)
-            .cloned()
+            .position(|profile| profile.id.trim() == selector)
+            .or_else(|| {
+                self.provider_profiles
+                    .iter()
+                    .position(|profile| profile.name == selector)
+            })
+    }
+
+    pub fn provider_profile(&self, selector: &str) -> Option<ProviderProfile> {
+        let index = self.provider_profile_index(selector)?;
+        self.provider_profiles.get(index).cloned()
     }
 
     pub fn upsert_saved_bot_config_from_profile(
         &mut self,
-        profile_name: &str,
+        profile_selector: &str,
     ) -> Result<(), String> {
-        let Some(profile) = self
-            .provider_profiles
-            .iter()
-            .find(|profile| profile.name == profile_name)
-            .cloned()
-        else {
-            return Err(format!("Provider profile not found: {}", profile_name));
+        let Some(profile) = self.provider_profile(profile_selector) else {
+            return Err(format!("Provider profile not found: {}", profile_selector));
         };
         let Some(saved) =
             saved_bot_config_from_profile(&profile, Some(now_unix_seconds().to_string()))
@@ -1090,8 +1084,18 @@ pub fn codex_profile_config_format_for_cli(executable: &str) -> CodexProfileConf
 }
 
 pub fn generated_codex_home(profile: &ProviderProfile) -> PathBuf {
+    let configured = profile.codex_home.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
+    }
     let slug = slugify(&profile.name);
-    codexl_home_dir().join("codex-homes").join(&slug)
+    let id = profile.id.trim();
+    let directory = if is_uuid_like(id) {
+        format!("{}-{}", slug, short_profile_id(id))
+    } else {
+        slug
+    };
+    codexl_home_dir().join("codex-homes").join(directory)
 }
 
 pub fn generated_bot_gateway_state_dir(profile_name: &str) -> PathBuf {
@@ -1169,7 +1173,10 @@ pub fn add_existing_provider_profile_with_format(
         &remote_web_asset_version,
     );
     profile.bot = bot;
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_codex_home_config(
         &provider,
         &generated_codex_home(&profile),
@@ -1180,7 +1187,7 @@ pub fn add_existing_provider_profile_with_format(
 }
 
 pub fn create_workspace_profile(input: WorkspaceRequest) -> Result<ProviderProfile, String> {
-    let profile = workspace_profile(
+    let mut profile = workspace_profile(
         input.workspace_name,
         input.proxy_url,
         input.remote_frontend_mode,
@@ -1188,6 +1195,10 @@ pub fn create_workspace_profile(input: WorkspaceRequest) -> Result<ProviderProfi
         input.remote_web_asset_version,
         input.bot,
     )?;
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_providerless_codex_home_config(&profile)?;
     Ok(profile)
 }
@@ -1215,7 +1226,7 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
         return Ok(profile);
     }
 
-    let profile = workspace_profile(
+    let mut profile = workspace_profile(
         input.workspace_name,
         input.proxy_url,
         input.remote_frontend_mode,
@@ -1223,6 +1234,13 @@ pub fn update_workspace_profile(input: UpdateWorkspaceRequest) -> Result<Provide
         input.remote_web_asset_version,
         input.bot,
     )?;
+    if is_uuid_like(&input.original_name) {
+        profile.id = input.original_name.clone();
+    }
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_providerless_codex_home_config(&profile)?;
     Ok(profile)
 }
@@ -1237,6 +1255,7 @@ pub fn update_existing_provider_profile_with_format(
     input: UpdateProviderRequest,
     profile_config_format: CodexProfileConfigFormat,
 ) -> Result<ProviderProfile, String> {
+    let original_selector = input.original_name.clone();
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.profile_name)?;
     let bot = input.bot.clone();
     let proxy_url = input.proxy_url.trim().to_string();
@@ -1259,6 +1278,9 @@ pub fn update_existing_provider_profile_with_format(
         profile_config_format,
     )?;
     let mut profile = provider.to_provider_profile();
+    if is_uuid_like(&original_selector) {
+        profile.id = original_selector;
+    }
     profile.name = workspace_name;
     profile.codex_profile_name = provider_codex_profile_name(&provider);
     profile.proxy_url = proxy_url;
@@ -1269,7 +1291,10 @@ pub fn update_existing_provider_profile_with_format(
         &remote_web_asset_version,
     );
     profile.bot = bot;
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_codex_home_config(
         &provider,
         &generated_codex_home(&profile),
@@ -1344,7 +1369,10 @@ pub fn create_default_provider_with_format(
         &input.remote_web_asset_version,
     );
     profile.bot = input.bot;
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
 
     if profile.name == DEFAULT_PROVIDER_PROFILE_NAME {
         let path = default_codex_config_path();
@@ -1390,7 +1418,10 @@ pub fn create_next_ai_gateway_provider_with_format(
         &input.remote_web_asset_version,
     );
     profile.bot = input.bot;
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_codex_home_config(
         &provider,
         &generated_codex_home(&profile),
@@ -1413,12 +1444,16 @@ pub fn update_next_ai_gateway_provider_profile_with_format(
     input: UpdateNextAiGatewayProviderRequest,
     profile_config_format: CodexProfileConfigFormat,
 ) -> Result<ProviderProfile, String> {
+    let original_selector = input.original_name.clone();
     let workspace_name = workspace_name_or_default(&input.workspace_name, &input.name)?;
     let provider = next_ai_gateway_provider_profile(&input.name, &input.model)?;
     write_default_provider_profile(&provider, true, profile_config_format)?;
     write_provider_codex_home_config(&provider, true, profile_config_format)?;
 
     let mut profile = provider.to_provider_profile();
+    if is_uuid_like(&original_selector) {
+        profile.id = original_selector;
+    }
     profile.name = workspace_name;
     profile.codex_profile_name = provider_codex_profile_name(&provider);
     profile.proxy_url = input.proxy_url.trim().to_string();
@@ -1429,7 +1464,10 @@ pub fn update_next_ai_gateway_provider_profile_with_format(
         &input.remote_web_asset_version,
     );
     profile.bot = input.bot;
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     write_codex_home_config(
         &provider,
         &generated_codex_home(&profile),
@@ -1501,6 +1539,7 @@ fn workspace_profile(
 ) -> Result<ProviderProfile, String> {
     let workspace_name = workspace_name_or_default(&workspace_name, "")?;
     let mut profile = ProviderProfile {
+        id: new_uuid_v4(),
         name: workspace_name,
         codex_profile_name: String::new(),
         provider_name: String::new(),
@@ -1516,7 +1555,10 @@ fn workspace_profile(
         &remote_web_asset_registry_url,
         &remote_web_asset_version,
     );
-    profile.bot.normalize_for_profile(&profile.name);
+    ensure_provider_profile_identity(&mut profile);
+    profile
+        .bot
+        .normalize_for_profile_instance(&profile.name, &profile.id);
     Ok(profile)
 }
 
@@ -2874,16 +2916,7 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
         if !profile.start_remote_e2ee_on_launch {
             profile.remote_e2ee_password.clear();
         }
-        if !is_uuid_like(&profile.id) {
-            profile.id = if is_uuid_like(&profile.bot.integration_id) {
-                profile.bot.integration_id.trim().to_string()
-            } else {
-                new_uuid_v4()
-            };
-        }
-        if profile.codex_home.is_empty() {
-            profile.codex_home = profile_codex_home(&profile);
-        }
+        ensure_provider_profile_identity(&mut profile);
         profile
             .bot
             .normalize_for_profile_instance(&profile.name, &profile.id);
@@ -2892,10 +2925,11 @@ fn dedupe_provider_profiles(profiles: Vec<ProviderProfile>) -> Vec<ProviderProfi
         if profile.name.is_empty() || (!has_provider && !is_providerless) {
             continue;
         }
-        if !deduped
-            .iter()
-            .any(|existing: &ProviderProfile| existing.name == profile.name)
-        {
+        let profile_key = provider_profile_key(&profile);
+        if !deduped.iter().any(|existing: &ProviderProfile| {
+            provider_profile_key(existing) == profile_key
+                || (is_default_provider(existing) && is_default_provider(&profile))
+        }) {
             deduped.push(profile);
         }
     }
@@ -3177,6 +3211,20 @@ fn validate_provider_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_workspace_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is required".to_string());
+    }
+    if name == DEFAULT_PROVIDER_PROFILE_NAME {
+        return Err("Default is reserved".to_string());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("name cannot contain control characters".to_string());
+    }
+    Ok(())
+}
+
 fn workspace_name_or_default(workspace_name: &str, fallback: &str) -> Result<String, String> {
     let name = workspace_name.trim();
     let name = if name.is_empty() {
@@ -3184,8 +3232,32 @@ fn workspace_name_or_default(workspace_name: &str, fallback: &str) -> Result<Str
     } else {
         name
     };
-    validate_provider_name(name)?;
+    validate_workspace_name(name)?;
     Ok(name.to_string())
+}
+
+pub fn provider_profile_key(profile: &ProviderProfile) -> String {
+    let id = profile.id.trim();
+    if is_uuid_like(id) {
+        id.to_string()
+    } else {
+        profile.name.trim().to_string()
+    }
+}
+
+fn ensure_provider_profile_identity(profile: &mut ProviderProfile) {
+    profile.id = profile.id.trim().to_string();
+    if !is_uuid_like(&profile.id) {
+        profile.id = if is_uuid_like(&profile.bot.integration_id) {
+            profile.bot.integration_id.trim().to_string()
+        } else {
+            new_uuid_v4()
+        };
+    }
+    profile.codex_home = normalize_home_path(&profile.codex_home);
+    if profile.codex_home.is_empty() {
+        profile.codex_home = profile_codex_home(profile);
+    }
 }
 
 pub fn normalized_remote_frontend_mode(value: &str) -> String {
@@ -3351,6 +3423,10 @@ fn slugify(value: &str) -> String {
     } else {
         slug
     }
+}
+
+fn short_profile_id(id: &str) -> String {
+    id.chars().filter(|ch| *ch != '-').take(8).collect()
 }
 
 fn toml_escape(value: &str) -> String {
@@ -4009,6 +4085,62 @@ model_provider = "old-provider"
             std::env::remove_var("CODEXL_CODEX_HOME");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_name_accepts_human_readable_text() {
+        let profile = workspace_profile(
+            "客户 Project #1".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            BotProfileConfig::default(),
+        )
+        .expect("workspace name should allow spaces and non-ascii text");
+
+        assert_eq!(profile.name, "客户 Project #1");
+    }
+
+    #[test]
+    fn app_config_keeps_duplicate_workspace_names_by_id() {
+        let mut config = AppConfig {
+            active_provider: DEFAULT_PROVIDER_PROFILE_NAME.to_string(),
+            provider_profiles: vec![default_provider_profile()],
+            ..AppConfig::default()
+        };
+        let first = workspace_profile(
+            "Same Workspace".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            BotProfileConfig::default(),
+        )
+        .expect("first workspace");
+        let second = workspace_profile(
+            "Same Workspace".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            BotProfileConfig::default(),
+        )
+        .expect("second workspace");
+
+        config.add_provider_profile(first);
+        config.add_provider_profile(second);
+        config.normalize();
+
+        let duplicates = config
+            .provider_profiles
+            .iter()
+            .filter(|profile| profile.name == "Same Workspace")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert_ne!(duplicates[0].id, duplicates[1].id);
+        assert!(config.provider_profile(&duplicates[0].id).is_some());
+        assert!(config.provider_profile(&duplicates[1].id).is_some());
     }
 
     #[test]

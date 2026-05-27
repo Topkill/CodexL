@@ -165,10 +165,10 @@ fn workspace_show(args: &[String]) -> Result<i32, String> {
 fn workspace_use(args: &[String]) -> Result<i32, String> {
     let name = positional_name(args, "workspace use <name>")?;
     let mut config = AppConfig::load();
-    if config.provider_profile(&name).is_none() {
-        return Err(format!("workspace not found: {}", name));
-    }
-    config.active_provider = name.clone();
+    let profile = config
+        .provider_profile(&name)
+        .ok_or_else(|| format!("workspace not found: {}", name))?;
+    config.active_provider = config::provider_profile_key(&profile);
     config.normalize();
     config.save()?;
     println!("active workspace: {}", name);
@@ -227,9 +227,6 @@ fn workspace_create(args: &[String]) -> Result<i32, String> {
     }
 
     let mut config = AppConfig::load();
-    if config.provider_profile(&name).is_some() {
-        return Err(format!("workspace already exists: {}", name));
-    }
     let profile = config::create_workspace_profile(WorkspaceRequest {
         workspace_name: name,
         proxy_url,
@@ -238,7 +235,7 @@ fn workspace_create(args: &[String]) -> Result<i32, String> {
         remote_web_asset_version: version,
         bot: config::BotProfileConfig::default(),
     })?;
-    let profile_name = profile.name.clone();
+    let profile_name = config::provider_profile_key(&profile);
     config.add_provider_profile(profile);
     config.save()?;
     let saved_profile = config
@@ -325,7 +322,7 @@ fn workspace_set_remote_frontend(args: &[String]) -> Result<i32, String> {
             profile.remote_web_asset_version = "latest".to_string();
         }
     }
-    let profile_name = profile.name.clone();
+    let profile_name = config::provider_profile_key(&profile);
     config.update_provider_profile(&name, profile)?;
     config.save()?;
     let saved_profile = config
@@ -520,7 +517,7 @@ fn run_codex_command(args: &[String]) -> Result<i32, String> {
     let profile = config
         .provider_profile(&profile_name)
         .ok_or_else(|| format!("workspace not found: {}", profile_name))?;
-    config.active_provider = profile.name.clone();
+    config.active_provider = config::provider_profile_key(&profile);
 
     let executable = resolve_codex_cli_executable(codex_path.as_deref(), &config)?;
     let profile_config_format = config::codex_profile_config_format_for_cli(&executable);
