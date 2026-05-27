@@ -130,6 +130,7 @@ function buildNextAiGateway(pluginDir) {
 
   if (!nextAiGatewaySourceDir) {
     reuseExistingBundleOrThrow(outputFile, "NEXT_AI_GATEWAY_SOURCE_DIR");
+    patchNextAiGatewayBundle(outputFile);
     return;
   }
 
@@ -172,6 +173,33 @@ function buildNextAiGateway(pluginDir) {
       stdio: "inherit",
     },
   );
+  patchNextAiGatewayBundle(outputFile);
+}
+
+function patchNextAiGatewayBundle(outputFile) {
+  let content = readFileSync(outputFile, "utf8");
+  const enabledPatchedMarker = `if(!Xe(r))continue;if(ko(r.enabled)===!1)continue;let s=r,i=zwt(s.transport)||"stdio"`;
+  if (!content.includes(enabledPatchedMarker)) {
+    const marker = `if(!Xe(r))continue;let s=r,i=zwt(s.transport)||"stdio"`;
+    if (!content.includes(marker)) {
+      throw new Error(`NeXT AI Gateway MCP server parser has an unexpected shape: ${outputFile}`);
+    }
+    content = content.replace(marker, enabledPatchedMarker);
+  }
+
+  const stdioModePatchedMarker = `Hwt(s.stdioMessageMode)||"newline-json"`;
+  if (!content.includes(stdioModePatchedMarker)) {
+    const marker = `Hwt(s.stdioMessageMode)||"content-length"`;
+    if (!content.includes(marker)) {
+      throw new Error(`NeXT AI Gateway stdio message mode parser has an unexpected shape: ${outputFile}`);
+    }
+    content = content.replace(marker, stdioModePatchedMarker);
+  }
+
+  if (!content.includes(enabledPatchedMarker) || !content.includes(stdioModePatchedMarker)) {
+    throw new Error(`NeXT AI Gateway MCP server parser has an unexpected shape: ${outputFile}`);
+  }
+  writeFileSync(outputFile, content);
 }
 
 function reuseExistingBundleOrThrow(outputFile, envName) {

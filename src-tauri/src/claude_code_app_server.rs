@@ -4053,10 +4053,17 @@ fn parse_mcp_servers_from_json(
             .and_then(Value::as_str)
             .map(|cwd| resolve_mcp_config_path(base_dir, cwd));
         let command_base = cwd_path.as_deref().unwrap_or(base_dir);
-        let command = server_object
+        let mut command = server_object
             .get("command")
             .and_then(Value::as_str)
             .map(|command| resolve_mcp_command(command_base, command));
+        let mut cwd = cwd_path.map(path_to_string);
+        if standalone_mcp_server_is_computer_use(name, command.as_deref()) {
+            if let Some(global_command) = global_computer_use_client_command() {
+                command = Some(global_command.to_string_lossy().to_string());
+                cwd = global_computer_use_app_dir().map(|path| path.to_string_lossy().to_string());
+            }
+        }
         let args = server_object
             .get("args")
             .and_then(Value::as_array)
@@ -4081,7 +4088,7 @@ fn parse_mcp_servers_from_json(
             args,
             enabled,
             config_path: config_path.to_string_lossy().to_string(),
-            cwd: cwd_path.map(path_to_string),
+            cwd,
             env: server_object
                 .get("env")
                 .filter(|env| env.is_object())
@@ -4129,6 +4136,31 @@ fn path_to_string(path: PathBuf) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
+}
+
+fn standalone_mcp_server_is_computer_use(name: &str, command: Option<&str>) -> bool {
+    name.trim().eq_ignore_ascii_case("computer-use")
+        || command
+            .map(|command| command.contains("SkyComputerUseClient"))
+            .unwrap_or(false)
+}
+
+fn global_computer_use_client_command() -> Option<PathBuf> {
+    let app_dir = global_computer_use_app_dir()?;
+    let command = app_dir
+        .join("Codex Computer Use.app")
+        .join("Contents")
+        .join("SharedSupport")
+        .join("SkyComputerUseClient.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("SkyComputerUseClient");
+    command.is_file().then_some(command)
+}
+
+fn global_computer_use_app_dir() -> Option<PathBuf> {
+    let path = global_default_codex_home_candidate()?.join("computer-use");
+    path.is_dir().then_some(path)
 }
 
 fn mcp_server_name_from_table(table: &str) -> Option<String> {
@@ -10736,6 +10768,84 @@ mod tests {
             .expect("service app path");
 
         assert_eq!(app, root.join("Codex Computer Use.app"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn computer_use_plugin_mcp_prefers_global_codex_home_app() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let root = test_dir("computer-use-global-home");
+        let workspace_home = root.join(".codexl").join("codex-homes").join("Workspace");
+        let workspace_mcp = workspace_home
+            .join("plugins")
+            .join("cache")
+            .join("openai-bundled")
+            .join("computer-use")
+            .join("1.0.0")
+            .join(".mcp.json");
+        let global_client = root
+            .join(".codex")
+            .join("computer-use")
+            .join("Codex Computer Use.app")
+            .join("Contents")
+            .join("SharedSupport")
+            .join("SkyComputerUseClient.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("SkyComputerUseClient");
+        std::fs::create_dir_all(workspace_mcp.parent().expect("workspace mcp parent"))
+            .expect("create workspace mcp parent");
+        std::fs::create_dir_all(global_client.parent().expect("global client parent"))
+            .expect("create global client parent");
+        std::fs::write(
+            &workspace_mcp,
+            r#"{
+  "mcpServers": {
+    "computer-use": {
+      "command": "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+      "args": ["mcp"],
+      "cwd": "."
+    }
+  }
+}"#,
+        )
+        .expect("write workspace mcp config");
+        std::fs::write(&global_client, "").expect("write global computer use client");
+
+        let old_home = std::env::var_os("HOME");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        let old_codexl_home = std::env::var_os("CODEXL_CODEX_HOME");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEX_HOME", &workspace_home);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let servers = standalone_mcp_server_status_list();
+        let computer_use = servers
+            .iter()
+            .find(|server| server.get("name").and_then(Value::as_str) == Some("computer-use"))
+            .expect("computer-use server");
+
+        assert_eq!(
+            computer_use.get("command").and_then(Value::as_str),
+            Some(global_client.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            computer_use.get("cwd").and_then(Value::as_str),
+            Some(
+                root.join(".codex")
+                    .join("computer-use")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            computer_use.get("source").and_then(Value::as_str),
+            Some("plugin")
+        );
+
+        restore_env("HOME", old_home);
+        restore_env("CODEX_HOME", old_codex_home);
+        restore_env("CODEXL_CODEX_HOME", old_codexl_home);
         let _ = std::fs::remove_dir_all(root);
     }
 

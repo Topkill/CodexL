@@ -40,6 +40,14 @@ pub fn gateway_health_url() -> Result<String, String> {
     ))
 }
 
+pub fn gateway_agent_tools_url() -> Result<String, String> {
+    let file = read_gateway_config()?;
+    Ok(format!(
+        "{}/agent/tools",
+        gateway_origin_from_config(&file.config)
+    ))
+}
+
 pub fn codex_provider_api_key() -> Result<String, String> {
     let file = read_gateway_config()?;
     Ok(codex_provider_api_key_from_config(&file.config))

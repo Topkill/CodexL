@@ -122,6 +122,7 @@ pub fn launch_codex(
     }
 
     configure_bot_gateway_bridge_env(&mut command, stdio_name, bot_config, language);
+    configure_global_computer_use_env(&mut command);
     configure_proxy_env(&mut command, proxy_url);
 
     if let Some(codex_home) = codex_home {
@@ -137,6 +138,39 @@ pub fn launch_codex(
         child,
         cli_stdio_path,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn configure_global_computer_use_env(command: &mut Command) {
+    if let Some(path) = global_computer_use_app_path() {
+        command.env("SKY_CUA_SERVICE_PATH", path);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_global_computer_use_env(_command: &mut Command) {}
+
+#[cfg(target_os = "macos")]
+fn global_computer_use_app_path() -> Option<PathBuf> {
+    let path = global_codex_home_candidate()?
+        .join("computer-use")
+        .join("Codex Computer Use.app");
+    path.is_dir().then_some(path)
+}
+
+#[cfg(target_os = "macos")]
+fn global_codex_home_candidate() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("CODEXL_CODEX_HOME") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(PathBuf::from(crate::config::normalize_home_path(value)));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".codex"))
 }
 
 pub fn stop_codex(child: &mut Child) -> std::io::Result<()> {
@@ -1069,6 +1103,9 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    #[cfg(target_os = "macos")]
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolves_cli_from_codex_app_resources_without_launching_app_binary() {
         let root = unique_test_dir("codex-cli-resources");
@@ -1179,6 +1216,40 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn global_computer_use_env_uses_global_home_not_active_codex_home() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env lock");
+        let root = unique_test_dir("global-computer-use-env");
+        let profile_home = root.join(".codexl").join("codex-homes").join("Workspace");
+        let global_app = root
+            .join(".codex")
+            .join("computer-use")
+            .join("Codex Computer Use.app");
+        std::fs::create_dir_all(&profile_home).expect("create profile home");
+        std::fs::create_dir_all(&global_app).expect("create global computer use app");
+
+        let old_home = std::env::var_os("HOME");
+        let old_codex_home = std::env::var_os("CODEX_HOME");
+        let old_codexl_home = std::env::var_os("CODEXL_CODEX_HOME");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CODEX_HOME", &profile_home);
+        std::env::remove_var("CODEXL_CODEX_HOME");
+
+        let mut command = Command::new("codex");
+        configure_global_computer_use_env(&mut command);
+
+        assert_eq!(
+            command_env_value(&command, "SKY_CUA_SERVICE_PATH"),
+            Some(global_app.to_string_lossy().to_string())
+        );
+
+        restore_env("HOME", old_home);
+        restore_env("CODEX_HOME", old_codex_home);
+        restore_env("CODEXL_CODEX_HOME", old_codexl_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn command_env_value(command: &Command, key: &str) -> Option<String> {
         command
             .get_envs()
@@ -1200,6 +1271,15 @@ mod tests {
             ppid,
             pgid,
             command: String::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
         }
     }
 }

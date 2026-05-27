@@ -709,10 +709,13 @@ type GatewayProviderForm = {
   raw: JsonObject;
 };
 type GatewayMcpServerTransport = "stdio" | "websocket";
+type GatewayMcpServerStdioMessageMode = "newline-json" | "content-length";
 type GatewayMcpServerForm = {
   id: string;
   name: string;
+  enabled: boolean;
   transport: GatewayMcpServerTransport;
+  stdioMessageMode: GatewayMcpServerStdioMessageMode;
   command: string;
   args: string;
   cwd: string;
@@ -725,6 +728,14 @@ type GatewayMcpServerForm = {
   startupTimeoutMs: string;
   requestTimeoutMs: string;
   raw: JsonObject;
+};
+type GatewayAvailableTool = {
+  name: string;
+  description: string;
+  inputSchema?: JsonObject;
+};
+type GatewayToolsResponse = {
+  tools?: unknown[];
 };
 type GatewayVirtualToolVisibility = "internal" | "client";
 type GatewayVirtualBaseModelMode = "request" | "fixed" | "strip_prefix" | "strip_suffix";
@@ -1132,7 +1143,12 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     addMcpServer: t("gateway.addMcpServer"),
     editMcpServer: t("gateway.editMcpServer"),
     mcpServerDialogDescription: t("gateway.mcpServerDialogDescription"),
+    availableMcpTools: t("gateway.availableMcpTools"),
+    gatewayToolsLoading: t("gateway.gatewayToolsLoading"),
+    noGatewayTools: t("gateway.noGatewayTools"),
+    unavailableTool: t("gateway.unavailableTool"),
     transport: t("gateway.transport"),
+    stdioMessageMode: t("gateway.stdioMessageMode"),
     command: t("gateway.command"),
     args: t("gateway.args"),
     cwd: t("gateway.cwd"),
@@ -1150,6 +1166,7 @@ function makeAppStrings(t: (key: string, options?: Record<string, unknown>) => s
     virtualProfileDialogDescription: t("gateway.virtualProfileDialogDescription"),
     profileKey: t("gateway.profileKey"),
     description: t("gateway.descriptionField"),
+    disabled: t("gateway.disabled"),
     enabled: t("gateway.enabled"),
     exactAliases: t("gateway.exactAliases"),
     prefixes: t("gateway.prefixes"),
@@ -4127,6 +4144,32 @@ function GatewaySettingsPanel({
   const [virtualProfileDialog, setVirtualProfileDialog] =
     useState<GatewayVirtualProfileDialogState | null>(null);
   const [activeGatewayTab, setActiveGatewayTab] = useState<GatewaySettingsTab>("providers");
+  const [availableTools, setAvailableTools] = useState<GatewayAvailableTool[]>([]);
+  const [availableToolsLoading, setAvailableToolsLoading] = useState(false);
+  const [availableToolsError, setAvailableToolsError] = useState("");
+  const [availableToolsLoaded, setAvailableToolsLoaded] = useState(false);
+
+  const loadGatewayTools = useCallback(async () => {
+    setAvailableToolsLoading(true);
+    setAvailableToolsError("");
+    try {
+      const response = await invoke<GatewayToolsResponse>("get_gateway_tools");
+      setAvailableTools(gatewayAvailableToolsFromResponse(response));
+      setAvailableToolsLoaded(true);
+    } catch (error) {
+      setAvailableToolsError(errorMessage(error));
+      setAvailableTools([]);
+      setAvailableToolsLoaded(true);
+    } finally {
+      setAvailableToolsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeGatewayTab === "tools" && !availableToolsLoaded && !availableToolsLoading) {
+      loadGatewayTools().catch(console.error);
+    }
+  }, [activeGatewayTab, availableToolsLoaded, availableToolsLoading, loadGatewayTools]);
 
   if (!form) {
     return (
@@ -4188,7 +4231,7 @@ function GatewaySettingsPanel({
   const openAddVirtualProfileDialog = () =>
     setVirtualProfileDialog({
       mode: "add",
-      profile: createGatewayVirtualProfileForm(),
+      profile: createGatewayVirtualProfileForm(availableTools),
     });
   const openEditVirtualProfileDialog = (profile: GatewayVirtualProfileForm) =>
     setVirtualProfileDialog({
@@ -4248,6 +4291,7 @@ function GatewaySettingsPanel({
         ),
       };
     });
+    setAvailableToolsLoaded(false);
     setMcpServerDialog(null);
   };
   const saveVirtualProfileDialog = () => {
@@ -4403,8 +4447,12 @@ function GatewaySettingsPanel({
             form.mcpServers.map((server) => (
               <div key={server.id} className="rounded-md border border-border bg-muted/10 px-3 py-3">
                 <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.8fr)_120px_minmax(0,1.4fr)]">
+                  <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,0.8fr)_88px_120px_minmax(0,1.4fr)]">
                     <GatewayProviderSummaryField label={strings.name} value={server.name || strings.none} />
+                    <GatewayProviderSummaryField
+                      label={strings.enabled}
+                      value={server.enabled ? strings.enabled : strings.disabled}
+                    />
                     <GatewayProviderSummaryField label={strings.transport} value={server.transport} />
                     <GatewayProviderSummaryField
                       label={server.transport === "websocket" ? strings.url : strings.command}
@@ -4412,13 +4460,28 @@ function GatewaySettingsPanel({
                     />
                   </div>
                   <div className="flex items-center justify-end gap-2">
+                    <Switch
+                      checked={server.enabled}
+                      aria-label={`${strings.enabled}: ${server.name || strings.mcpServers}`}
+                      onCheckedChange={(checked) => {
+                        setAvailableToolsLoaded(false);
+                        update({
+                          mcpServers: form.mcpServers.map((item) =>
+                            item.id === server.id ? { ...item, enabled: checked === true } : item,
+                          ),
+                        });
+                      }}
+                    />
                     <IconButton title={strings.editMcpServer} onClick={() => openEditMcpServerDialog(server)}>
                       <Pencil className="h-4 w-4" />
                     </IconButton>
                     <IconButton
                       title={strings.delete}
                       className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                      onClick={() => update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) })}
+                      onClick={() => {
+                        setAvailableToolsLoaded(false);
+                        update({ mcpServers: form.mcpServers.filter((item) => item.id !== server.id) });
+                      }}
                     >
                       <Trash2 className="h-4 w-4" />
                     </IconButton>
@@ -4560,8 +4623,12 @@ function GatewaySettingsPanel({
             </DialogHeader>
             <GatewayVirtualProfileEditor
               profile={virtualProfileDialog.profile}
+              availableTools={availableTools}
+              availableToolsLoading={availableToolsLoading}
+              availableToolsError={availableToolsError}
               strings={strings}
               onChange={updateDialogVirtualProfile}
+              onRefreshTools={loadGatewayTools}
             />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setVirtualProfileDialog(null)}>
@@ -5232,6 +5299,11 @@ function GatewayMcpServerEditor({
 }) {
   return (
     <div className="grid gap-4">
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/10 px-3 py-2.5">
+        <div className="text-sm font-medium">{strings.enabled}</div>
+        <Switch checked={server.enabled} onCheckedChange={(checked) => onChange({ enabled: checked === true })} />
+      </div>
+
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label={strings.name}>
           <Input autoFocus value={server.name} onChange={(event) => onChange({ name: event.target.value })} />
@@ -5273,6 +5345,7 @@ function GatewayMcpServerEditor({
             <textarea
               className={gatewayTextareaClassName}
               spellCheck={false}
+              autoCapitalize="none"
               value={server.headersJson}
               onChange={(event) => onChange({ headersJson: event.target.value })}
             />
@@ -5280,23 +5353,59 @@ function GatewayMcpServerEditor({
         </>
       ) : (
         <>
-          <Field label={strings.command}>
-            <Input value={server.command} onChange={(event) => onChange({ command: event.target.value })} />
-          </Field>
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_180px]">
+            <Field label={strings.command}>
+              <Input
+                value={server.command}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                onChange={(event) => onChange({ command: event.target.value })}
+              />
+            </Field>
+            <Field label={strings.stdioMessageMode}>
+              <Select
+                value={server.stdioMessageMode}
+                onValueChange={(value) =>
+                  onChange({
+                    stdioMessageMode: value === "content-length" ? "content-length" : "newline-json",
+                  })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="newline-json">newline-json</SelectItem>
+                  <SelectItem value="content-length">content-length</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
           <Field label={strings.args}>
             <Input
               value={server.args}
               placeholder="-y, @modelcontextprotocol/server-filesystem, ."
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               onChange={(event) => onChange({ args: event.target.value })}
             />
           </Field>
           <Field label={strings.cwd}>
-            <Input value={server.cwd} onChange={(event) => onChange({ cwd: event.target.value })} />
+            <Input
+              value={server.cwd}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              onChange={(event) => onChange({ cwd: event.target.value })}
+            />
           </Field>
           <Field label={strings.envJson}>
             <textarea
               className={gatewayTextareaClassName}
               spellCheck={false}
+              autoCapitalize="none"
               value={server.envJson}
               onChange={(event) => onChange({ envJson: event.target.value })}
             />
@@ -5332,24 +5441,41 @@ function GatewayMcpServerEditor({
 
 function GatewayVirtualProfileEditor({
   profile,
+  availableTools,
+  availableToolsLoading,
+  availableToolsError,
   strings,
   onChange,
+  onRefreshTools,
 }: {
   profile: GatewayVirtualProfileForm;
+  availableTools: GatewayAvailableTool[];
+  availableToolsLoading: boolean;
+  availableToolsError: string;
   strings: AppStrings;
   onChange: (patch: Partial<GatewayVirtualProfileForm>) => void;
+  onRefreshTools: () => Promise<void>;
 }) {
-  const updateTool = (toolId: string, patch: Partial<GatewayVirtualToolForm>) =>
+  const availableToolByName = useMemo(
+    () => new Map(availableTools.map((tool) => [tool.name, tool])),
+    [availableTools],
+  );
+  const selectedToolByName = useMemo(
+    () => new Map(profile.tools.map((tool) => [tool.name, tool])),
+    [profile.tools],
+  );
+  const unavailableSelectedTools = profile.tools.filter((tool) => tool.name && !availableToolByName.has(tool.name));
+  const setToolSelected = (tool: GatewayAvailableTool, selected: boolean) => {
+    if (selected) {
+      if (selectedToolByName.has(tool.name)) return;
+      onChange({ tools: [...profile.tools, gatewayVirtualToolFormFromAvailableTool(tool)] });
+      return;
+    }
+    onChange({ tools: profile.tools.filter((item) => item.name !== tool.name) });
+  };
+  const updateToolVisibility = (toolName: string, visibility: GatewayVirtualToolVisibility) =>
     onChange({
-      tools: profile.tools.map((tool) => (tool.id === toolId ? { ...tool, ...patch } : tool)),
-    });
-  const addTool = () =>
-    onChange({
-      tools: [...profile.tools, createGatewayVirtualToolForm()],
-    });
-  const deleteTool = (toolId: string) =>
-    onChange({
-      tools: profile.tools.filter((tool) => tool.id !== toolId),
+      tools: profile.tools.map((tool) => (tool.name === toolName ? { ...tool, visibility } : tool)),
     });
 
   return (
@@ -5465,66 +5591,107 @@ function GatewayVirtualProfileEditor({
 
       <div className="space-y-3">
         <div className="flex items-center justify-between gap-3">
-          <SectionTitle icon={<ImageIcon className="h-4 w-4" />} title={strings.tools} />
-          <Button type="button" variant="outline" size="sm" onClick={addTool}>
-            <Plus className="h-4 w-4" />
-            {strings.addTool}
+          <SectionTitle icon={<ImageIcon className="h-4 w-4" />} title={strings.availableMcpTools} />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onRefreshTools().catch(console.error)}
+            disabled={availableToolsLoading}
+          >
+            <RefreshCw className={cn("h-4 w-4", availableToolsLoading && "animate-spin")} />
+            {strings.reload}
           </Button>
         </div>
-        <div className="space-y-3">
-          {profile.tools.map((tool) => (
-            <div key={tool.id} className="rounded-md border border-border bg-muted/10 p-3">
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_150px_auto]">
-                <Field label={strings.name}>
-                  <Input value={tool.name} onChange={(event) => updateTool(tool.id, { name: event.target.value })} />
-                </Field>
-                <Field label={strings.visibility}>
-                  <Select
-                    value={tool.visibility}
-                    onValueChange={(value) =>
-                      updateTool(tool.id, { visibility: value === "client" ? "client" : "internal" })
+        {availableToolsError ? (
+          <p className="rounded-md border border-destructive/50 bg-destructive/12 px-3 py-2 text-sm leading-relaxed text-red-300">
+            {availableToolsError}
+          </p>
+        ) : null}
+        {availableToolsLoading ? (
+          <div className="rounded-md border border-border bg-muted/10 px-3 py-3 text-sm text-muted-foreground">
+            {strings.gatewayToolsLoading}
+          </div>
+        ) : null}
+        <div className="space-y-2">
+          {availableTools.map((tool) => {
+            const selectedTool = selectedToolByName.get(tool.name);
+            const selected = Boolean(selectedTool);
+            return (
+              <div
+                key={tool.name}
+                className="grid gap-3 rounded-md border border-border bg-muted/10 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_150px] sm:items-center"
+              >
+                <label className="flex min-w-0 items-start gap-3">
+                  <Checkbox
+                    checked={selected}
+                    onCheckedChange={(checked) => setToolSelected(tool, checked === true)}
+                  />
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium">{tool.name}</span>
+                    {tool.description ? (
+                      <span className="mt-1 line-clamp-2 block text-xs leading-relaxed text-muted-foreground">
+                        {tool.description}
+                      </span>
+                    ) : null}
+                  </span>
+                </label>
+                <Select
+                  value={selectedTool?.visibility || "internal"}
+                  onValueChange={(value) =>
+                    updateToolVisibility(tool.name, value === "client" ? "client" : "internal")
+                  }
+                  disabled={!selected}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="internal">internal</SelectItem>
+                    <SelectItem value="client">client</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            );
+          })}
+          {unavailableSelectedTools.map((tool) => (
+            <div
+              key={tool.id}
+              className="grid gap-3 rounded-md border border-border bg-muted/10 px-3 py-3 opacity-75 sm:grid-cols-[minmax(0,1fr)_150px] sm:items-center"
+            >
+              <label className="flex min-w-0 items-start gap-3">
+                <Checkbox
+                  checked
+                  onCheckedChange={(checked) => {
+                    if (checked !== true) {
+                      onChange({ tools: profile.tools.filter((item) => item.id !== tool.id) });
                     }
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="internal">internal</SelectItem>
-                      <SelectItem value="client">client</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <div className="flex items-end justify-end">
-                  <IconButton
-                    title={strings.delete}
-                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30"
-                    onClick={() => deleteTool(tool.id)}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </IconButton>
-                </div>
-              </div>
-              <div className="mt-3 grid gap-3">
-                <Field label={strings.description}>
-                  <Input
-                    value={tool.description}
-                    onChange={(event) => updateTool(tool.id, { description: event.target.value })}
-                  />
-                </Field>
-                <Field label={strings.inputSchemaJson}>
-                  <textarea
-                    className={gatewayTextareaClassName}
-                    spellCheck={false}
-                    value={tool.inputSchemaJson}
-                    onChange={(event) => updateTool(tool.id, { inputSchemaJson: event.target.value })}
-                  />
-                </Field>
-              </div>
+                  }}
+                />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">{tool.name}</span>
+                  <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+                    {strings.unavailableTool}
+                  </span>
+                </span>
+              </label>
+              <Select
+                value={tool.visibility}
+                onValueChange={(value) => updateToolVisibility(tool.name, value === "client" ? "client" : "internal")}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="internal">internal</SelectItem>
+                  <SelectItem value="client">client</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           ))}
-          {profile.tools.length === 0 ? (
+          {availableTools.length === 0 && unavailableSelectedTools.length === 0 && !availableToolsLoading ? (
             <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
-              {strings.none}
+              {strings.noGatewayTools}
             </div>
           ) : null}
         </div>
@@ -8345,7 +8512,9 @@ function gatewayMcpServerFormFromRaw(raw: JsonObject): GatewayMcpServerForm {
   return {
     id: newLocalId(),
     name: stringValue(raw.name, ""),
+    enabled: booleanValue(raw.enabled, true),
     transport,
+    stdioMessageMode: gatewayMcpServerStdioMessageModeFromRaw(raw.stdioMessageMode, "newline-json"),
     command: stringValue(raw.command, ""),
     args: stringListText(raw.args),
     cwd: stringValue(raw.cwd, ""),
@@ -8365,7 +8534,9 @@ function createGatewayMcpServerForm(): GatewayMcpServerForm {
   return {
     id: newLocalId(),
     name: "",
+    enabled: true,
     transport: "stdio",
+    stdioMessageMode: "newline-json",
     command: "npx",
     args: "-y, @modelcontextprotocol/server-filesystem, .",
     cwd: "",
@@ -8391,6 +8562,7 @@ function cloneGatewayMcpServerForm(server: GatewayMcpServerForm): GatewayMcpServ
 function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObject {
   const raw = cloneJsonObject(server.raw);
   raw.name = server.name.trim();
+  raw.enabled = server.enabled;
   raw.transport = server.transport;
   raw.protocolVersion = server.protocolVersion.trim() || "2024-11-05";
   raw.startupTimeoutMs = integerValue(server.startupTimeoutMs, 10000);
@@ -8410,6 +8582,7 @@ function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObjec
   }
 
   raw.command = server.command.trim();
+  raw.stdioMessageMode = server.stdioMessageMode;
   raw.args = stringListFromText(server.args, "Args");
   raw.env = jsonObjectFromText(server.envJson, "Env JSON");
   if (server.cwd.trim()) {
@@ -8422,6 +8595,20 @@ function gatewayMcpServerConfigFromForm(server: GatewayMcpServerForm): JsonObjec
   delete raw.apiKey;
   delete raw.apiKeyEnv;
   return raw;
+}
+
+function gatewayMcpServerStdioMessageModeFromRaw(
+  value: unknown,
+  fallback: GatewayMcpServerStdioMessageMode,
+): GatewayMcpServerStdioMessageMode {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "content-length" || normalized === "content_length" || normalized === "contentlength") {
+    return "content-length";
+  }
+  if (normalized === "newline-json" || normalized === "newline_json" || normalized === "jsonl") {
+    return "newline-json";
+  }
+  return fallback;
 }
 
 function gatewayMcpServerTarget(server: GatewayMcpServerForm): string {
@@ -8460,17 +8647,17 @@ function gatewayVirtualProfileFormFromRaw(raw: JsonObject): GatewayVirtualProfil
   };
 }
 
-function createGatewayVirtualProfileForm(): GatewayVirtualProfileForm {
+function createGatewayVirtualProfileForm(availableTools: GatewayAvailableTool[] = []): GatewayVirtualProfileForm {
   return {
     id: newLocalId(),
-    profileId: "vision-search",
-    key: "vision-search",
-    displayName: "Vision + Web Search",
-    description: "Inject image/file references and web search through internal MCP tools.",
+    profileId: "mcp-tools",
+    key: "mcp-tools",
+    displayName: "MCP Tools",
+    description: "Inject enabled MCP tools through Gateway virtual models.",
     enabled: true,
     exactAliases: "",
     prefixes: "",
-    suffixes: ":vision-search",
+    suffixes: ":mcp-tools",
     baseModelMode: "strip_suffix",
     fixedModel: "",
     matchMultimodal: true,
@@ -8479,7 +8666,7 @@ function createGatewayVirtualProfileForm(): GatewayVirtualProfileForm {
     maxToolCalls: "8",
     clientToolsPolicy: "allow",
     includeInGatewayModels: true,
-    tools: [createGatewayVirtualToolForm("understand_image"), createGatewayVirtualToolForm("web_search")],
+    tools: availableTools.map(gatewayVirtualToolFormFromAvailableTool),
     raw: {},
   };
 }
@@ -8540,35 +8727,12 @@ function gatewayVirtualToolFormFromRaw(raw: JsonObject): GatewayVirtualToolForm 
   };
 }
 
-function createGatewayVirtualToolForm(name = ""): GatewayVirtualToolForm {
-  const inputSchema =
-    name === "understand_image"
-      ? {
-          type: "object",
-          properties: {
-            image: { type: "string" },
-            question: { type: "string" },
-          },
-          required: ["image"],
-        }
-      : name === "web_search"
-        ? {
-            type: "object",
-            properties: {
-              query: { type: "string" },
-            },
-            required: ["query"],
-          }
-        : { type: "object", additionalProperties: true };
+function gatewayVirtualToolFormFromAvailableTool(tool: GatewayAvailableTool): GatewayVirtualToolForm {
+  const inputSchema = tool.inputSchema && Object.keys(tool.inputSchema).length > 0 ? tool.inputSchema : {};
   return {
     id: newLocalId(),
-    name,
-    description:
-      name === "understand_image"
-        ? "Analyze an image or file referenced by media_ref."
-        : name === "web_search"
-          ? "Search the web."
-          : "",
+    name: tool.name,
+    description: tool.description,
     visibility: "internal",
     inputSchemaJson: jsonText(inputSchema),
     raw: {},
@@ -8587,7 +8751,12 @@ function gatewayVirtualToolConfigFromForm(tool: GatewayVirtualToolForm): JsonObj
   raw.name = tool.name.trim();
   raw.description = tool.description.trim();
   raw.visibility = tool.visibility;
-  raw.inputSchema = jsonObjectFromText(tool.inputSchemaJson, "Input Schema JSON");
+  const inputSchema = jsonObjectFromText(tool.inputSchemaJson, "Input Schema JSON");
+  if (Object.keys(inputSchema).length > 0) {
+    raw.inputSchema = inputSchema;
+  } else {
+    delete raw.inputSchema;
+  }
   delete raw.input_schema;
   delete raw.parameters;
   return raw;
@@ -8641,6 +8810,29 @@ function materializedGatewayVirtualModels(config: JsonObject, baseModels: string
     }
   }
   return result;
+}
+
+function gatewayAvailableToolsFromResponse(response: GatewayToolsResponse): GatewayAvailableTool[] {
+  const tools: GatewayAvailableTool[] = [];
+  const seen = new Set<string>();
+  for (const item of arrayValue(response.tools)) {
+    const tool = gatewayAvailableToolFromRaw(objectValue(item));
+    if (!tool || seen.has(tool.name)) continue;
+    seen.add(tool.name);
+    tools.push(tool);
+  }
+  return tools.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function gatewayAvailableToolFromRaw(raw: JsonObject): GatewayAvailableTool | null {
+  const name = stringValue(raw.name, "").trim();
+  if (!name) return null;
+  const inputSchema = objectValue(raw.inputSchema ?? raw.input_schema ?? raw.parameters);
+  return {
+    name,
+    description: stringValue(raw.description, ""),
+    inputSchema: Object.keys(inputSchema).length > 0 ? inputSchema : undefined,
+  };
 }
 
 function objectValue(value: unknown): JsonObject {

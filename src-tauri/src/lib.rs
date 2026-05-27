@@ -310,6 +310,44 @@ async fn update_gateway_config(
 }
 
 #[tauri::command]
+async fn get_gateway_tools(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    ensure_next_ai_gateway_enabled(state.inner()).await?;
+    gateway_service::ensure_running(state.inner()).await?;
+
+    let url = gateway_config::gateway_agent_tools_url()?;
+    let api_key = gateway_config::codex_provider_api_key()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let mut request = client.get(&url);
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("failed to fetch Gateway MCP tools: {}", err))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Gateway MCP tools request failed: {}{}",
+            status,
+            if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", body.trim())
+            }
+        ));
+    }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|err| format!("failed to parse Gateway MCP tools: {}", err))
+}
+
+#[tauri::command]
 async fn get_gateway_usage_summary(
     days: Option<u32>,
     start_date: Option<String>,
@@ -863,6 +901,7 @@ pub fn run() {
             set_remote_launch_options,
             get_gateway_config,
             update_gateway_config,
+            get_gateway_tools,
             get_gateway_usage_summary,
             get_default_providers,
             add_existing_provider,
