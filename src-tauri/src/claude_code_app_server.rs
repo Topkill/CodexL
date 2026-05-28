@@ -29,10 +29,13 @@ const PERMISSION_APPROVAL_TIMEOUT_MS_ENV: &str =
     "CODEXL_CLAUDE_CODE_PERMISSION_APPROVAL_TIMEOUT_MS";
 const CODEX_APP_SERVER_PROXY_ENV: &str = "CODEXL_CLAUDE_CODE_PROXY_CODEX_APP_SERVER";
 const APP_SERVER_LOG_PATH_ENV: &str = "CODEXL_CLAUDE_CODE_APP_SERVER_LOG";
+const CONTEXT_WINDOW_ENV: &str = "CODEXL_CLAUDE_CODE_CONTEXT_WINDOW";
 const CLAUDE_PATH_ENV: &str = "CLAUDE_PATH";
 const CLAUDE_PATH_OVERRIDE_ENV: &str = "CODEXL_CLAUDE_PATH";
 const DEFAULT_MODEL: &str = "claude-code";
 const DEFAULT_PERMISSION_PROMPT_TOOL: &str = "stdio";
+const DEFAULT_CLAUDE_CONTEXT_WINDOW: i64 = 200_000;
+const CLAUDE_ONE_M_CONTEXT_WINDOW: i64 = 1_000_000;
 const DEFAULT_TURN_IDLE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const DEFAULT_PERMISSION_APPROVAL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const MIN_NATIVE_CLAUDE_BYTES: u64 = 5 * 1024 * 1024;
@@ -948,6 +951,7 @@ struct ClaudeThread {
     archived: bool,
     name: Option<String>,
     turns: Vec<ClaudeTurn>,
+    latest_token_usage_info: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1006,6 +1010,7 @@ struct ClaudeRunResult {
     duration_ms: i64,
     tool_items: Vec<Value>,
     agent_item_streamed: bool,
+    latest_token_usage_info: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -1015,6 +1020,8 @@ struct ClaudeStreamState {
     suppressed_agent_prefix: String,
     result_text: Option<String>,
     result_error: Option<String>,
+    latest_token_usage_info: Option<Value>,
+    latest_model: Option<String>,
     agent_item_started: bool,
     reasoning_item_started: bool,
     reasoning_text: String,
@@ -1255,6 +1262,8 @@ fn stream_log_summary(stream: &ClaudeStreamState) -> Value {
             .collect::<Vec<_>>(),
         "completedToolIds": stream.completed_tool_ids.iter().cloned().collect::<Vec<_>>(),
         "resultSeen": claude_stream_result_seen(stream),
+        "tokenUsageSeen": stream.latest_token_usage_info.is_some(),
+        "latestModel": stream.latest_model.as_deref(),
         "emittedTextBytes": stream.emitted_text.len(),
         "pendingAgentTextBytes": stream.pending_agent_text.len(),
     })
@@ -1953,12 +1962,11 @@ where
             )?;
         }
         "thread/start" => {
-            let (response, notification) = {
+            let (response, _notification) = {
                 let mut state = lock_state(&state)?;
                 state.start_thread(&params)
             };
             write_response(&output, id, response)?;
-            write_notification(&output, notification)?;
         }
         "thread/resume" => {
             let (response, notification) = {
@@ -4378,6 +4386,7 @@ impl ClaudeAppServerState {
             archived: false,
             name,
             turns: Vec::new(),
+            latest_token_usage_info: None,
         };
         let response = thread_runtime_response(&thread, false);
         let notification = json!({
@@ -4423,6 +4432,12 @@ impl ClaudeAppServerState {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut response_thread = thread.clone();
+        let inline_titles = load_claude_inline_thread_titles();
+        apply_inline_claude_thread_title(
+            &mut response_thread,
+            &inline_titles,
+            self.workspace_name.as_deref(),
+        );
         let generated_titles = self.generated_titles();
         apply_generated_titles_to_single_claude_thread(
             &mut response_thread,
@@ -4453,6 +4468,12 @@ impl ClaudeAppServerState {
                 return Err(format!("thread not found: {}", thread_id));
             }
             let mut thread = thread.clone();
+            let inline_titles = load_claude_inline_thread_titles();
+            apply_inline_claude_thread_title(
+                &mut thread,
+                &inline_titles,
+                self.workspace_name.as_deref(),
+            );
             let generated_titles = self.generated_titles();
             apply_generated_titles_to_single_claude_thread(
                 &mut thread,
@@ -4479,12 +4500,19 @@ impl ClaudeAppServerState {
             .unwrap_or(false);
         let mut threads = load_claude_threads(self.workspace_name.clone());
         let mut generated_titles = load_claude_generated_titles();
+        let inline_titles = load_claude_inline_thread_titles();
         for thread in self.threads.values() {
             if let Some(generated_title) = claude_generated_title_from_thread(thread) {
                 generated_titles.push(generated_title);
                 continue;
             }
-            threads.insert(thread.id.clone(), thread.clone());
+            let mut thread = thread.clone();
+            apply_inline_claude_thread_title(
+                &mut thread,
+                &inline_titles,
+                self.workspace_name.as_deref(),
+            );
+            threads.insert(thread.id.clone(), thread);
         }
         apply_generated_titles_to_claude_threads(
             &mut threads,
@@ -4694,9 +4722,11 @@ impl ClaudeAppServerState {
             }),
         );
         let notifications = if is_title_generation {
-            Vec::new()
+            thread.archived = true;
+            vec![claude_thread_archived_notification(&thread_id)]
         } else {
             vec![
+                claude_thread_started_notification(thread),
                 json!({
                     "method": "turn/started",
                     "params": {
@@ -4819,6 +4849,7 @@ impl ClaudeAppServerState {
         thread_id: &str,
         turn_id: &str,
         result: ClaudeRunResult,
+        generated_title_hint: Option<ClaudeGeneratedTitle>,
     ) -> Option<FinishTurnNotifications> {
         let key = (thread_id.to_string(), turn_id.to_string());
         self.active_processes.remove(&key);
@@ -4829,6 +4860,9 @@ impl ClaudeAppServerState {
                 self.interrupted_turns.remove(&key) || turn.status == TurnStatus::Interrupted;
             turn.tool_items = result.tool_items;
             let agent_item_streamed = result.agent_item_streamed;
+            if let Some(latest_token_usage_info) = result.latest_token_usage_info {
+                thread.latest_token_usage_info = Some(latest_token_usage_info);
+            }
             turn.agent_text = result.text;
             turn.duration_ms = Some(result.duration_ms);
             turn.completed_at = Some(now_seconds());
@@ -4846,7 +4880,9 @@ impl ClaudeAppServerState {
             let item = (!agent_item_streamed && !turn.agent_text.is_empty())
                 .then(|| turn.agent_item_json());
             let turn_json = turn.to_json(false);
-            let generated_title = claude_generated_title_from_thread(thread);
+            let generated_title = generated_title_hint
+                .filter(|generated_title| generated_title.title.is_some())
+                .or_else(|| claude_generated_title_from_thread(thread));
             let is_title_generation = generated_title.is_some();
             let thread_stream_state = (!is_title_generation)
                 .then(|| claude_thread_stream_state_changed_notification(thread));
@@ -4860,11 +4896,29 @@ impl ClaudeAppServerState {
         };
         let mut extra_notifications = Vec::new();
         if let Some(generated_title) = generated_title {
+            claude_code_log_event(
+                "title_generation_resolved",
+                json!({
+                    "threadId": thread_id,
+                    "title": generated_title.title.as_deref(),
+                    "sourcePromptPreview": log_text_preview(&generated_title.source_prompt, 120),
+                    "cwd": &generated_title.cwd,
+                    "loadedThreadCount": self.threads.len(),
+                }),
+            );
             if let Some((target_thread_id, name)) = apply_generated_title_to_claude_threads(
                 &mut self.threads,
                 &generated_title,
                 self.workspace_name.as_deref(),
             ) {
+                claude_code_log_event(
+                    "title_generation_applied",
+                    json!({
+                        "titleThreadId": thread_id,
+                        "targetThreadId": &target_thread_id,
+                        "name": &name,
+                    }),
+                );
                 extra_notifications.push(json!({
                     "method": "thread/name/updated",
                     "params": {
@@ -4872,7 +4926,31 @@ impl ClaudeAppServerState {
                         "name": name,
                     },
                 }));
+                if let Some(thread) = self.threads.get(&target_thread_id) {
+                    extra_notifications.push(claude_thread_started_notification(thread));
+                    extra_notifications
+                        .push(claude_thread_stream_state_changed_notification(thread));
+                }
+            } else {
+                claude_code_log_event(
+                    "title_generation_no_target",
+                    json!({
+                        "titleThreadId": thread_id,
+                        "sourcePromptPreview": log_text_preview(&generated_title.source_prompt, 120),
+                        "title": generated_title.title.as_deref(),
+                        "candidateThreads": self.threads.values().map(|thread| {
+                            json!({
+                                "threadId": &thread.id,
+                                "cwd": &thread.cwd,
+                                "name": &thread.name,
+                                "promptPreview": log_text_preview(&thread_initial_prompt(thread), 80),
+                                "isTitleGeneration": is_claude_title_generation_thread(thread),
+                            })
+                        }).collect::<Vec<_>>(),
+                    }),
+                );
             }
+            extra_notifications.push(claude_thread_archived_notification(thread_id));
         }
         Some(FinishTurnNotifications {
             item_completed: (!is_title_generation).then(|| item).flatten().map(|item| {
@@ -4906,6 +4984,20 @@ struct FinishTurnNotifications {
     turn_completed: Option<Value>,
     thread_stream_state: Option<Value>,
     extra_notifications: Vec<Value>,
+}
+
+fn claude_thread_archived_notification(thread_id: &str) -> Value {
+    json!({
+        "method": "thread/archived",
+        "params": { "threadId": thread_id },
+    })
+}
+
+fn claude_thread_started_notification(thread: &ClaudeThread) -> Value {
+    json!({
+        "method": "thread/started",
+        "params": { "thread": thread.to_json(false) },
+    })
 }
 
 fn claude_thread_stream_state_changed_notification(thread: &ClaudeThread) -> Value {
@@ -4950,7 +5042,10 @@ fn claude_conversation_state(thread: &ClaudeThread) -> Value {
         "cwd": thread.cwd,
         "gitInfo": Value::Null,
         "resumeState": "resumed",
-        "latestTokenUsageInfo": Value::Null,
+        "latestTokenUsageInfo": thread
+            .latest_token_usage_info
+            .clone()
+            .unwrap_or(Value::Null),
         "workspaceKind": "project",
         "workspaceBrowserRoot": Value::Null,
         "turnsPagination": {
@@ -5036,6 +5131,10 @@ impl ClaudeThread {
             } else {
                 json!([])
             },
+            "latestTokenUsageInfo": self
+                .latest_token_usage_info
+                .clone()
+                .unwrap_or(Value::Null),
         })
     }
 
@@ -5269,6 +5368,8 @@ fn load_claude_thread_from_transcript_path(
     let mut updated_at = fallback_updated_at;
     let mut pending_user: Option<(Vec<Value>, i64)> = None;
     let mut turns = Vec::new();
+    let mut latest_token_usage_info = None;
+    let mut inline_title = None;
 
     for value in transcript
         .lines()
@@ -5291,6 +5392,9 @@ fn load_claude_thread_from_transcript_path(
         {
             created_at = created_at.min(timestamp);
             updated_at = updated_at.max(timestamp);
+        }
+        if let Some(info) = claude_token_usage_info_from_message(&value, &model) {
+            latest_token_usage_info = Some(info);
         }
         match value.get("type").and_then(Value::as_str) {
             Some("user")
@@ -5374,6 +5478,15 @@ fn load_claude_thread_from_transcript_path(
                     }
                 }
             }
+            Some("ai-title") => {
+                let title_text = value
+                    .get("aiTitle")
+                    .or_else(|| value.get("title"))
+                    .and_then(Value::as_str);
+                if let Some(title_text) = title_text {
+                    inline_title = sanitize_generated_thread_title(title_text);
+                }
+            }
             _ => {}
         }
     }
@@ -5390,7 +5503,9 @@ fn load_claude_thread_from_transcript_path(
         preview = session_id.clone();
     }
 
-    let name = persisted_claude_thread_name(&session_id).or(workspace_name);
+    let name = persisted_claude_thread_name(&session_id)
+        .or(inline_title)
+        .or(workspace_name);
 
     Some(ClaudeThread {
         id: session_id.clone(),
@@ -5405,6 +5520,7 @@ fn load_claude_thread_from_transcript_path(
         archived: false,
         name,
         turns,
+        latest_token_usage_info,
     })
 }
 
@@ -5424,6 +5540,72 @@ fn load_claude_generated_titles() -> Vec<ClaudeGeneratedTitle> {
         .into_iter()
         .filter_map(|path| load_claude_generated_title_from_transcript_path(&path))
         .collect()
+}
+
+fn load_claude_inline_thread_titles() -> BTreeMap<String, String> {
+    let mut titles = BTreeMap::new();
+    for path in claude_transcript_files() {
+        let Ok(transcript) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let (fallback_created_at, fallback_updated_at) = transcript_fallback_times(&path);
+        if claude_generated_title_from_transcript(
+            &transcript,
+            &path,
+            fallback_created_at,
+            fallback_updated_at,
+        )
+        .is_some()
+        {
+            continue;
+        }
+        let Some(title) = claude_inline_thread_title_from_transcript(&transcript) else {
+            continue;
+        };
+        let session_id = claude_session_id_from_transcript(&transcript).or_else(|| {
+            path.file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+        });
+        if let Some(session_id) = session_id {
+            titles.insert(session_id, title);
+        }
+    }
+    titles
+}
+
+fn claude_inline_thread_title_from_transcript(transcript: &str) -> Option<String> {
+    let mut title = None;
+    for value in transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if value.get("type").and_then(Value::as_str) != Some("ai-title") {
+            continue;
+        }
+        let title_text = value
+            .get("aiTitle")
+            .or_else(|| value.get("title"))
+            .and_then(Value::as_str);
+        if let Some(title_text) = title_text {
+            title = sanitize_generated_thread_title(title_text);
+        }
+    }
+    title
+}
+
+fn claude_session_id_from_transcript(transcript: &str) -> Option<String> {
+    transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+                .map(str::to_string)
+        })
+        .last()
 }
 
 fn claude_generated_title_from_transcript(
@@ -5539,12 +5721,16 @@ fn is_claude_title_generation_prompt(prompt: &str) -> bool {
 fn extract_claude_title_generation_source_prompt(prompt: &str) -> Option<String> {
     let normalized = prompt.replace("\r\n", "\n");
     let trimmed = normalized.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
     if !trimmed.starts_with("You are a helpful assistant. You will be presented with a user prompt")
-        || !trimmed.contains("Generate a concise UI title")
+        || !(lower.contains("generate a concise ui title")
+            || lower.contains("generate a clear, informative task title")
+            || lower.contains("structured title field")
+            || lower.contains("short title for a task"))
     {
         return None;
     }
-    let (_, source_prompt) = trimmed.split_once("User prompt:\n")?;
+    let (_, source_prompt) = trimmed.split_once("User prompt:")?;
     let source_prompt = source_prompt.trim();
     (!source_prompt.is_empty()).then(|| source_prompt.to_string())
 }
@@ -5600,6 +5786,27 @@ fn apply_generated_title_to_claude_threads(
     thread.name = Some(title.clone());
     persist_claude_thread_name(&thread_id, Some(&title));
     Some((thread_id, Some(title)))
+}
+
+fn apply_inline_claude_thread_title(
+    thread: &mut ClaudeThread,
+    inline_titles: &BTreeMap<String, String>,
+    workspace_name: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let title = inline_titles
+        .get(&thread.id)
+        .or_else(|| inline_titles.get(&thread.session_id))
+        .or_else(|| inline_titles.get(&thread.claude_session_id))?
+        .clone();
+    if !should_replace_thread_name(thread.name.as_deref(), workspace_name) {
+        return None;
+    }
+    if thread.name.as_deref() == Some(title.as_str()) {
+        return None;
+    }
+    thread.name = Some(title.clone());
+    persist_claude_thread_name(&thread.id, Some(&title));
+    Some((thread.id.clone(), Some(title)))
 }
 
 fn apply_generated_titles_to_single_claude_thread(
@@ -5938,12 +6145,15 @@ where
             "textBytes": result.text.len(),
             "toolItemCount": result.tool_items.len(),
             "agentItemStreamed": result.agent_item_streamed,
+            "tokenUsageSeen": result.latest_token_usage_info.is_some(),
         }),
     );
-    let notifications = match lock_state(&state)
-        .ok()
-        .and_then(|mut state| state.finish_turn(&work.thread_id, &work.turn_id, result))
-    {
+    let generated_title_hint = is_claude_title_generation_prompt(&work.prompt)
+        .then(|| latest_claude_transcript_generated_title(&work))
+        .flatten();
+    let notifications = match lock_state(&state).ok().and_then(|mut state| {
+        state.finish_turn(&work.thread_id, &work.turn_id, result, generated_title_hint)
+    }) {
         Some(notifications) => notifications,
         None => return,
     };
@@ -6065,6 +6275,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -6108,6 +6319,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -6132,6 +6344,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -6173,6 +6386,7 @@ where
             duration_ms: elapsed_millis(started),
             tool_items: Vec::new(),
             agent_item_streamed: false,
+            latest_token_usage_info: None,
         };
     }
     claude_code_log_event(
@@ -6408,12 +6622,14 @@ where
                 work.thread_id.clone(),
                 work.turn_id.clone(),
             );
+            let latest_token_usage_info = claude_run_latest_token_usage_info(&stream, work);
             return ClaudeRunResult {
                 text: final_text,
                 error,
                 duration_ms,
                 tool_items: stream.completed_tool_items,
                 agent_item_streamed,
+                latest_token_usage_info,
             };
         }
 
@@ -6446,6 +6662,7 @@ where
             }
             finalize_open_tool_calls(&output, work, &mut stream, false);
             let agent_item_streamed = !stream.emitted_text.is_empty();
+            let latest_token_usage_info = claude_run_latest_token_usage_info(&stream, work);
             return ClaudeRunResult {
                 text: stream.emitted_text,
                 error: Some(non_empty_join(
@@ -6461,6 +6678,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: stream.completed_tool_items,
                 agent_item_streamed,
+                latest_token_usage_info,
             };
         }
     }
@@ -6489,6 +6707,7 @@ where
             let success = status.success() && stream.result_error.is_none();
             finalize_open_tool_calls(&output, work, &mut stream, success);
             let agent_item_streamed = !stream.emitted_text.is_empty();
+            let latest_token_usage_info = claude_run_latest_token_usage_info(&stream, work);
             let final_text = if stream.emitted_text.is_empty() {
                 stream
                     .result_text
@@ -6519,6 +6738,7 @@ where
                     duration_ms,
                     tool_items: stream.completed_tool_items,
                     agent_item_streamed,
+                    latest_token_usage_info,
                 }
             } else {
                 ClaudeRunResult {
@@ -6536,12 +6756,14 @@ where
                     duration_ms,
                     tool_items: stream.completed_tool_items,
                     agent_item_streamed,
+                    latest_token_usage_info,
                 }
             }
         }
         Err(err) => {
             finalize_open_tool_calls(&output, work, &mut stream, false);
             let agent_item_streamed = !stream.emitted_text.is_empty();
+            let latest_token_usage_info = claude_run_latest_token_usage_info(&stream, work);
             claude_code_log_event(
                 "claude_turn_finish_wait_error",
                 json!({
@@ -6558,6 +6780,7 @@ where
                 duration_ms,
                 tool_items: stream.completed_tool_items,
                 agent_item_streamed,
+                latest_token_usage_info,
             }
         }
     }
@@ -6594,6 +6817,16 @@ where
 
 fn claude_stream_result_seen(stream: &ClaudeStreamState) -> bool {
     stream.result_text.is_some() || stream.result_error.is_some()
+}
+
+fn claude_run_latest_token_usage_info(
+    stream: &ClaudeStreamState,
+    work: &TurnWork,
+) -> Option<Value> {
+    stream
+        .latest_token_usage_info
+        .clone()
+        .or_else(|| latest_claude_transcript_token_usage_info(work))
 }
 
 #[cfg(unix)]
@@ -7333,6 +7566,7 @@ fn handle_claude_stream_message<W>(
 ) where
     W: Write,
 {
+    remember_claude_stream_token_usage(message, work, output, stream);
     match message.get("type").and_then(Value::as_str) {
         Some("stream_event") => {
             if let Some(event) = message.get("event") {
@@ -7357,6 +7591,41 @@ fn handle_claude_stream_message<W>(
         }
         None => {}
     }
+}
+
+fn remember_claude_stream_token_usage<W>(
+    message: &Value,
+    work: &TurnWork,
+    output: &SharedOutput<W>,
+    stream: &mut ClaudeStreamState,
+) where
+    W: Write,
+{
+    if let Some(model) = claude_model_from_message(message) {
+        stream.latest_model = Some(model.to_string());
+    }
+    let fallback_model = stream.latest_model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let Some(info) = claude_token_usage_info_from_message(message, fallback_model) else {
+        return;
+    };
+    if stream.latest_token_usage_info.as_ref() == Some(&info) {
+        return;
+    }
+    stream.latest_token_usage_info = Some(info.clone());
+    if is_claude_title_generation_prompt(&work.prompt) {
+        return;
+    }
+    let _ = write_notification(
+        output,
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": work.thread_id,
+                "conversationId": work.thread_id,
+                "latestTokenUsageInfo": info,
+            },
+        }),
+    );
 }
 
 fn handle_claude_stream_event<W>(
@@ -8382,6 +8651,188 @@ fn claude_result_usage_summary(message: &Value) -> String {
     }
 }
 
+fn claude_token_usage_info_from_message(message: &Value, fallback_model: &str) -> Option<Value> {
+    let usage = claude_usage_from_message(message)?;
+    claude_token_usage_info(
+        usage,
+        claude_model_from_message(message).unwrap_or(fallback_model),
+    )
+}
+
+fn claude_usage_from_message(message: &Value) -> Option<&Value> {
+    message
+        .pointer("/message/usage")
+        .or_else(|| message.get("usage"))
+        .or_else(|| message.pointer("/event/message/usage"))
+        .or_else(|| message.pointer("/event/usage"))
+        .filter(|usage| usage.is_object())
+}
+
+fn claude_model_from_message(message: &Value) -> Option<&str> {
+    message
+        .pointer("/message/model")
+        .and_then(Value::as_str)
+        .or_else(|| message.get("model").and_then(Value::as_str))
+        .or_else(|| {
+            message
+                .pointer("/event/message/model")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+fn claude_token_usage_info(usage: &Value, model: &str) -> Option<Value> {
+    let input_tokens = sum_present_counts(&[
+        first_token_count(
+            usage,
+            &[
+                "input_tokens",
+                "inputTokens",
+                "prompt_tokens",
+                "promptTokens",
+            ],
+        ),
+        first_token_count(
+            usage,
+            &["cache_creation_input_tokens", "cacheCreationInputTokens"],
+        ),
+        first_token_count(usage, &["cache_read_input_tokens", "cacheReadInputTokens"]),
+    ]);
+    let output_tokens = first_token_count(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+    );
+    let total_tokens = first_token_count(usage, &["total_tokens", "totalTokens", "total"])
+        .or_else(|| sum_present_counts(&[input_tokens, output_tokens]))?;
+    if total_tokens <= 0 {
+        return None;
+    }
+
+    let mut last_token_usage = Map::new();
+    if let Some(input_tokens) = input_tokens {
+        last_token_usage.insert("input_tokens".to_string(), json!(input_tokens));
+    }
+    if let Some(output_tokens) = output_tokens {
+        last_token_usage.insert("output_tokens".to_string(), json!(output_tokens));
+    }
+    if let Some(cache_creation_input_tokens) = first_token_count(
+        usage,
+        &["cache_creation_input_tokens", "cacheCreationInputTokens"],
+    ) {
+        last_token_usage.insert(
+            "cache_creation_input_tokens".to_string(),
+            json!(cache_creation_input_tokens),
+        );
+    }
+    if let Some(cache_read_input_tokens) =
+        first_token_count(usage, &["cache_read_input_tokens", "cacheReadInputTokens"])
+    {
+        last_token_usage.insert(
+            "cache_read_input_tokens".to_string(),
+            json!(cache_read_input_tokens),
+        );
+    }
+    last_token_usage.insert("total_tokens".to_string(), json!(total_tokens));
+
+    let context_window = first_token_count(
+        usage,
+        &[
+            "model_context_window",
+            "modelContextWindow",
+            "context_window",
+            "contextWindow",
+            "max_context_window",
+            "maxContextWindow",
+        ],
+    )
+    .unwrap_or_else(|| claude_context_window_for_model(model));
+
+    Some(json!({
+        "last_token_usage": Value::Object(last_token_usage),
+        "model_context_window": context_window,
+        "model": model,
+    }))
+}
+
+fn sum_present_counts(values: &[Option<i64>]) -> Option<i64> {
+    let mut total = 0_i64;
+    let mut present = false;
+    for value in values.iter().flatten() {
+        present = true;
+        total = total.saturating_add((*value).max(0));
+    }
+    present.then_some(total)
+}
+
+fn first_token_count(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(value_as_positive_i64))
+}
+
+fn value_as_positive_i64(value: &Value) -> Option<i64> {
+    let parsed = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .map(|value| value.round() as i64)
+        })?;
+    (parsed >= 0).then_some(parsed)
+}
+
+fn claude_context_window_for_model(model: &str) -> i64 {
+    if let Ok(value) = std::env::var(CONTEXT_WINDOW_ENV) {
+        if let Some(parsed) = parse_context_window_value(&value) {
+            return parsed;
+        }
+    }
+    let normalized = model
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '_' && *ch != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if normalized.contains("1mcontext")
+        || normalized.contains("1m")
+        || normalized.contains("1000000")
+        || normalized.contains("million")
+    {
+        CLAUDE_ONE_M_CONTEXT_WINDOW
+    } else {
+        DEFAULT_CLAUDE_CONTEXT_WINDOW
+    }
+}
+
+fn parse_context_window_value(value: &str) -> Option<i64> {
+    let normalized = value.trim().replace([',', '_'], "");
+    if normalized.is_empty() {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if let Some(number) = lower.strip_suffix('m') {
+        return number
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1_000_000.0).round() as i64)
+            .filter(|value| *value > 0);
+    }
+    if let Some(number) = lower.strip_suffix('k') {
+        return number
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1_000.0).round() as i64)
+            .filter(|value| *value > 0);
+    }
+    lower.parse::<i64>().ok().filter(|value| *value > 0)
+}
+
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
@@ -8411,6 +8862,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -8437,6 +8889,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -8456,6 +8909,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -8489,6 +8943,7 @@ where
             duration_ms: elapsed_millis(started),
             tool_items: Vec::new(),
             agent_item_streamed: false,
+            latest_token_usage_info: None,
         };
     }
     drop(child_stdin);
@@ -8540,6 +8995,7 @@ where
                     duration_ms: elapsed_millis(started),
                     tool_items: Vec::new(),
                     agent_item_streamed,
+                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
                 };
             }
         }
@@ -8601,6 +9057,7 @@ where
                     duration_ms,
                     tool_items: Vec::new(),
                     agent_item_streamed,
+                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
                 }
             } else {
                 ClaudeRunResult {
@@ -8616,6 +9073,7 @@ where
                     duration_ms,
                     tool_items: Vec::new(),
                     agent_item_streamed,
+                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
                 }
             }
         }
@@ -8635,6 +9093,7 @@ where
                 duration_ms,
                 tool_items: Vec::new(),
                 agent_item_streamed,
+                latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
             }
         }
     }
@@ -8710,6 +9169,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -8734,6 +9194,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -8748,6 +9209,7 @@ where
             duration_ms: elapsed_millis(started),
             tool_items: Vec::new(),
             agent_item_streamed: false,
+            latest_token_usage_info: None,
         };
     }
 
@@ -8788,6 +9250,7 @@ where
                             duration_ms: elapsed_millis(started),
                             tool_items: Vec::new(),
                             agent_item_streamed: false,
+                            latest_token_usage_info: None,
                         };
                     }
                     trust_confirmed = true;
@@ -8859,6 +9322,7 @@ where
                                     duration_ms: elapsed_millis(started),
                                     tool_items: Vec::new(),
                                     agent_item_streamed: false,
+                                    latest_token_usage_info: None,
                                 };
                             }
                         }
@@ -8893,6 +9357,7 @@ where
                     duration_ms: elapsed_millis(started),
                     tool_items: Vec::new(),
                     agent_item_streamed: false,
+                    latest_token_usage_info: None,
                 };
             }
         }
@@ -8935,6 +9400,7 @@ where
             duration_ms,
             tool_items: Vec::new(),
             agent_item_streamed: !emitted_text.is_empty(),
+            latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
         }
     } else {
         ClaudeRunResult {
@@ -8952,6 +9418,7 @@ where
             duration_ms,
             tool_items: Vec::new(),
             agent_item_streamed: !emitted_text.is_empty(),
+            latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
         }
     }
 }
@@ -8987,6 +9454,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -9013,6 +9481,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -9032,6 +9501,7 @@ where
                 duration_ms: elapsed_millis(started),
                 tool_items: Vec::new(),
                 agent_item_streamed: false,
+                latest_token_usage_info: None,
             };
         }
     };
@@ -9065,6 +9535,7 @@ where
             duration_ms: elapsed_millis(started),
             tool_items: Vec::new(),
             agent_item_streamed: false,
+            latest_token_usage_info: None,
         };
     }
     drop(child_stdin);
@@ -9116,6 +9587,7 @@ where
                     duration_ms: elapsed_millis(started),
                     tool_items: Vec::new(),
                     agent_item_streamed,
+                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
                 };
             }
         }
@@ -9177,6 +9649,7 @@ where
                     duration_ms,
                     tool_items: Vec::new(),
                     agent_item_streamed,
+                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
                 }
             } else {
                 ClaudeRunResult {
@@ -9192,6 +9665,7 @@ where
                     duration_ms,
                     tool_items: Vec::new(),
                     agent_item_streamed,
+                    latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
                 }
             }
         }
@@ -9211,6 +9685,7 @@ where
                 duration_ms,
                 tool_items: Vec::new(),
                 agent_item_streamed,
+                latest_token_usage_info: latest_claude_transcript_token_usage_info(work),
             }
         }
     }
@@ -9809,6 +10284,30 @@ fn latest_claude_transcript_assistant_text(work: &TurnWork) -> Option<String> {
     let path = claude_transcript_path(work)?;
     let transcript = std::fs::read_to_string(path).ok()?;
     latest_assistant_text_from_transcript(&transcript)
+}
+
+fn latest_claude_transcript_generated_title(work: &TurnWork) -> Option<ClaudeGeneratedTitle> {
+    let path = claude_transcript_path(work)?;
+    load_claude_generated_title_from_transcript_path(&path)
+}
+
+fn latest_claude_transcript_token_usage_info(work: &TurnWork) -> Option<Value> {
+    let path = claude_transcript_path(work)?;
+    let transcript = std::fs::read_to_string(path).ok()?;
+    let mut latest = None;
+    let mut model = DEFAULT_MODEL.to_string();
+    for value in transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if let Some(message_model) = claude_model_from_message(&value) {
+            model = message_model.to_string();
+        }
+        if let Some(info) = claude_token_usage_info_from_message(&value, &model) {
+            latest = Some(info);
+        }
+    }
+    latest
 }
 
 fn claude_transcript_path(work: &TurnWork) -> Option<PathBuf> {
@@ -11421,7 +11920,9 @@ args = ["server.js", "--stdio"]
                     duration_ms: 12,
                     tool_items: Vec::new(),
                     agent_item_streamed: false,
+                    latest_token_usage_info: None,
                 },
+                None,
             )
             .expect("finish turn");
         assert_eq!(
@@ -11987,6 +12488,319 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
     }
 
     #[test]
+    fn non_title_transcript_uses_inline_ai_title_as_name() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-inline-title-load");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let transcript_path = root.join("thread.jsonl");
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"user","sessionId":"thread","cwd":"/tmp","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"ai-title","aiTitle":"Inline greeting","sessionId":"thread"}
+{"type":"assistant","sessionId":"thread","cwd":"/tmp","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","model":"opus","content":[{"type":"text","text":"hello"}]}}
+"#,
+        )
+        .expect("write transcript");
+
+        let thread = load_claude_thread_from_transcript_path(
+            &transcript_path,
+            Some("workspace".to_string()),
+        )
+        .expect("thread");
+        assert_eq!(thread.name.as_deref(), Some("Inline greeting"));
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_list_overlays_live_thread_with_inline_transcript_title() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-inline-title-live");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let cwd = root.join("workspace").to_string_lossy().to_string();
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: Some("workspace".to_string()),
+        };
+        let (response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, _, _, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "hi" }],
+            }))
+            .expect("start turn");
+
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(Path::new(&cwd)));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        let transcript_path = projects_dir.join(format!("{thread_id}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": thread_id,
+                    "cwd": cwd,
+                    "message": {
+                        "role": "user",
+                        "content": [{ "type": "text", "text": "hi" }]
+                    }
+                }),
+                json!({
+                    "type": "ai-title",
+                    "sessionId": thread_id,
+                    "cwd": cwd,
+                    "aiTitle": "Inline greeting"
+                })
+            ),
+        )
+        .expect("write transcript");
+
+        let listed = state.thread_list(&json!({ "limit": 10 }));
+        let listed_threads = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("listed threads");
+        assert_eq!(listed_threads.len(), 1, "{listed_threads:#?}");
+        assert_eq!(
+            listed_threads[0].get("name").and_then(Value::as_str),
+            Some("Inline greeting")
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recognizes_current_claude_title_generation_prompt_template() {
+        let prompt = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nThe tasks typically have to do with coding-related tasks.\nFill the structured title field with plain text.\nGenerate a clear, informative task title.\n\nHow to write a good title:\n- Prefer concrete nouns and verbs.\n- Do not wrap the title in quotes.\n\nUser prompt:\n分析代码说明该项目适配windows还有哪些问题";
+
+        assert_eq!(
+            extract_claude_title_generation_source_prompt(prompt).as_deref(),
+            Some("分析代码说明该项目适配windows还有哪些问题")
+        );
+    }
+
+    #[test]
+    fn title_generation_finish_uses_transcript_ai_title_immediately() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let old_home = std::env::var_os("HOME");
+        let root = test_dir("claude-title-transcript-hint");
+        std::fs::create_dir_all(&root).expect("create temp home");
+        std::env::set_var("HOME", &root);
+
+        let cwd = root.join("workspace").to_string_lossy().to_string();
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: Some("workspace".to_string()),
+        };
+        let (main_response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let main_thread_id = main_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("main thread id")
+            .to_string();
+        let (_, _, main_work, _) = state
+            .start_turn(&json!({
+                "threadId": main_thread_id,
+                "input": [{ "type": "text", "text": "hi" }],
+            }))
+            .expect("start main turn");
+        state
+            .finish_turn(
+                &main_work.thread_id,
+                &main_work.turn_id,
+                ClaudeRunResult {
+                    text: "Hello".to_string(),
+                    error: None,
+                    duration_ms: 1,
+                    tool_items: Vec::new(),
+                    agent_item_streamed: true,
+                    latest_token_usage_info: None,
+                },
+                None,
+            )
+            .expect("finish main turn");
+
+        let (title_response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let title_thread_id = title_response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("title thread id")
+            .to_string();
+        let title_prompt = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nThe tasks typically have to do with coding-related tasks.\nFill the structured title field with plain text.\nGenerate a clear, informative task title.\n\nUser prompt:\nhi";
+        let (_, _, title_work, _) = state
+            .start_turn(&json!({
+                "threadId": title_thread_id,
+                "input": [{ "type": "text", "text": title_prompt }],
+            }))
+            .expect("start title turn");
+        let projects_dir = root
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(Path::new(&cwd)));
+        std::fs::create_dir_all(&projects_dir).expect("create claude projects dir");
+        let transcript_path = projects_dir.join(format!("{}.jsonl", title_work.claude_session_id));
+        std::fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": title_work.claude_session_id,
+                    "cwd": cwd,
+                    "message": {
+                        "role": "user",
+                        "content": [{ "type": "text", "text": title_prompt }]
+                    }
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": title_work.claude_session_id,
+                    "cwd": cwd,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": "Fallback title" }]
+                    }
+                }),
+                json!({
+                    "type": "ai-title",
+                    "sessionId": title_work.claude_session_id,
+                    "cwd": cwd,
+                    "aiTitle": "Transcript title"
+                })
+            ),
+        )
+        .expect("write title transcript");
+
+        let title_hint = latest_claude_transcript_generated_title(&title_work).expect("title hint");
+        let title_notifications = state
+            .finish_turn(
+                &title_work.thread_id,
+                &title_work.turn_id,
+                ClaudeRunResult {
+                    text: String::new(),
+                    error: None,
+                    duration_ms: 1,
+                    tool_items: Vec::new(),
+                    agent_item_streamed: true,
+                    latest_token_usage_info: None,
+                },
+                Some(title_hint),
+            )
+            .expect("finish title turn");
+
+        assert_eq!(
+            title_notifications
+                .extra_notifications
+                .iter()
+                .find(|notification| {
+                    notification.get("method").and_then(Value::as_str)
+                        == Some("thread/name/updated")
+                })
+                .and_then(|notification| notification.pointer("/params/threadId"))
+                .and_then(Value::as_str),
+            Some(main_thread_id.as_str())
+        );
+        assert_eq!(
+            title_notifications
+                .extra_notifications
+                .iter()
+                .find(|notification| {
+                    notification.get("method").and_then(Value::as_str)
+                        == Some("thread/name/updated")
+                })
+                .and_then(|notification| notification.pointer("/params/name"))
+                .and_then(Value::as_str),
+            Some("Transcript title")
+        );
+
+        restore_env("HOME", old_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_start_notification_is_deferred_until_first_non_title_turn() {
+        let root = test_dir("claude-deferred-thread-start");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let output_path = root.join("out.jsonl");
+        let input = format!(
+            "{}\n{}\n",
+            json!({"id":"1","method":"initialize","params":{}}),
+            json!({"id":"2","method":"thread/start","params":{"cwd":root}})
+        );
+
+        run_stdio_app_server_with_io(
+            vec![],
+            std::io::Cursor::new(input.into_bytes()),
+            File::create(&output_path).expect("create output"),
+        )
+        .expect("run app server");
+
+        let responses = json_lines(&std::fs::read_to_string(&output_path).expect("read output"));
+        assert!(response_by_id(&responses, "2")
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(
+            responses
+                .iter()
+                .all(|message| message.get("method").and_then(Value::as_str)
+                    != Some("thread/started")),
+            "thread/start should not expose a sidebar entry before the first prompt is known"
+        );
+
+        let mut state = ClaudeAppServerState {
+            active_processes: BTreeMap::new(),
+            app_responses: BTreeMap::new(),
+            interrupted_turns: BTreeSet::new(),
+            threads: BTreeMap::new(),
+            workspace_name: Some("workspace".to_string()),
+        };
+        let (response, _) = state.start_thread(&json!({ "cwd": root }));
+        let thread_id = response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .expect("thread id")
+            .to_string();
+        let (_, notifications, _, _) = state
+            .start_turn(&json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": "hi" }],
+            }))
+            .expect("start turn");
+        assert!(
+            notifications.iter().any(|notification| {
+                notification.get("method").and_then(Value::as_str) == Some("thread/started")
+            }),
+            "non-title turns should publish the real thread once the prompt is known"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn thread_list_hides_in_memory_title_generation_thread_and_updates_main_title() {
         let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let old_home = std::env::var_os("HOME");
@@ -12025,16 +12839,25 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
                     duration_ms: 1,
                     tool_items: Vec::new(),
                     agent_item_streamed: true,
+                    latest_token_usage_info: None,
                 },
+                None,
             )
             .expect("finish main turn");
 
-        let (title_response, _) = state.start_thread(&json!({ "cwd": cwd }));
+        let (title_response, title_thread_started_notification) =
+            state.start_thread(&json!({ "cwd": cwd }));
         let title_thread_id = title_response
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .expect("title thread id")
             .to_string();
+        assert_eq!(
+            title_thread_started_notification
+                .get("method")
+                .and_then(Value::as_str),
+            Some("thread/started")
+        );
         let title_prompt = "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.\nGenerate a concise UI title (up to 36 characters) for this task.\n\nUser prompt:\nhi";
         let (_, title_start_notifications, title_work, stale_processes) = state
             .start_turn(&json!({
@@ -12044,8 +12867,14 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
             .expect("start title turn");
         assert!(stale_processes.is_empty());
         assert!(
-            title_start_notifications.is_empty(),
-            "title generation turn should not be exposed as a visible turn"
+            title_start_notifications.iter().any(|notification| {
+                notification.get("method").and_then(Value::as_str) == Some("thread/archived")
+                    && notification
+                        .pointer("/params/threadId")
+                        .and_then(Value::as_str)
+                        == Some(title_thread_id.as_str())
+            }),
+            "title generation thread should be hidden after its prompt is recognized"
         );
         let title_notifications = state
             .finish_turn(
@@ -12057,7 +12886,9 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
                     duration_ms: 1,
                     tool_items: Vec::new(),
                     agent_item_streamed: true,
+                    latest_token_usage_info: None,
                 },
+                None,
             )
             .expect("finish title turn");
 
@@ -12079,6 +12910,19 @@ claude --resume acd0d82c-f9f7-4455-95fd-4ab7e0e9130b
                 .and_then(|notification| notification.pointer("/params/name"))
                 .and_then(Value::as_str),
             Some("Greeting")
+        );
+        assert!(
+            title_notifications
+                .extra_notifications
+                .iter()
+                .any(|notification| {
+                    notification.get("method").and_then(Value::as_str) == Some("thread/archived")
+                        && notification
+                            .pointer("/params/threadId")
+                            .and_then(Value::as_str)
+                            == Some(title_thread_id.as_str())
+                }),
+            "finish should repeat the hide notification for title generation threads"
         );
 
         let listed = state.thread_list(&json!({ "limit": 10 }));
@@ -12978,6 +13822,102 @@ sleep 60
     }
 
     #[test]
+    fn emits_claude_token_usage_updates_from_assistant_messages() {
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let work = TurnWork {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            agent_item_id: "agent".to_string(),
+            cli_item_id: "cli".to_string(),
+            claude_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: "hello".to_string(),
+            resume_existing: false,
+        };
+        let mut stream = ClaudeStreamState::default();
+        let mut command_output = String::new();
+
+        handle_claude_stream_message(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-20250514",
+                    "content": [{ "type": "text", "text": "hello" }],
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_creation_input_tokens": 20,
+                        "cache_read_input_tokens": 30,
+                        "output_tokens": 7
+                    }
+                }
+            }),
+            &work,
+            &output,
+            &mut stream,
+            &mut command_output,
+        );
+
+        let usage = stream.latest_token_usage_info.as_ref().expect("usage info");
+        assert_eq!(
+            usage
+                .pointer("/last_token_usage/total_tokens")
+                .and_then(Value::as_i64),
+            Some(157)
+        );
+        assert_eq!(
+            usage.get("model_context_window").and_then(Value::as_i64),
+            Some(DEFAULT_CLAUDE_CONTEXT_WINDOW)
+        );
+        let output =
+            String::from_utf8(output.lock().expect("output lock").clone()).expect("utf8 output");
+        let notification = json_lines(&output)
+            .into_iter()
+            .find(|message| {
+                message.get("method").and_then(Value::as_str) == Some("thread/tokenUsage/updated")
+            })
+            .expect("token usage notification");
+        assert_eq!(
+            notification
+                .pointer("/params/latestTokenUsageInfo/last_token_usage/total_tokens")
+                .and_then(Value::as_i64),
+            Some(157)
+        );
+    }
+
+    #[test]
+    fn claude_transcript_threads_include_latest_token_usage_info() {
+        let root = test_dir("claude-token-usage");
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let transcript_path = root.join("thread.jsonl");
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"user","sessionId":"thread","cwd":"/tmp","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"assistant","sessionId":"thread","cwd":"/tmp","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","model":"claude-opus-4-1m","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":42,"output_tokens":8}}}
+"#,
+        )
+        .expect("write transcript");
+
+        let thread =
+            load_claude_thread_from_transcript_path(&transcript_path, None).expect("thread");
+        let state = claude_conversation_state(&thread);
+
+        assert_eq!(
+            state
+                .pointer("/latestTokenUsageInfo/last_token_usage/total_tokens")
+                .and_then(Value::as_i64),
+            Some(50)
+        );
+        assert_eq!(
+            state
+                .pointer("/latestTokenUsageInfo/model_context_window")
+                .and_then(Value::as_i64),
+            Some(CLAUDE_ONE_M_CONTEXT_WINDOW)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn streamed_tool_arguments_are_visible_on_started_item() {
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let work = TurnWork {
@@ -13395,7 +14335,9 @@ sleep 60
                     duration_ms: 1,
                     tool_items: Vec::new(),
                     agent_item_streamed: true,
+                    latest_token_usage_info: None,
                 },
+                None,
             )
             .expect("finish turn");
 

@@ -3321,6 +3321,14 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     ) {
       return message.params;
     }
+    if (
+      message.type === "mcp-notification" &&
+      message.method === "thread-stream-state-changed" &&
+      message.params &&
+      typeof message.params === "object"
+    ) {
+      return message.params;
+    }
     return null;
   }
 
