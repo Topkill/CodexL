@@ -512,6 +512,9 @@ async fn route_request(
             Ok(json_response(StatusCode::OK, json!(status)))
         }
         (&Method::GET, "/health") => Ok(json_response(StatusCode::OK, json!({ "ok": true }))),
+        (&Method::POST, "/gateway/auth/introspect") => {
+            receive_gateway_auth_introspection(request).await
+        }
         (&Method::POST, "/gateway/usage") | (&Method::POST, "/gateway/usage/report") => {
             receive_gateway_usage_report(request).await
         }
@@ -550,6 +553,57 @@ async fn route_request(
             json!({ "error": "not found" }),
         )),
     }
+}
+
+async fn receive_gateway_auth_introspection(
+    request: &mut Request<Incoming>,
+) -> Result<Response<HttpBody>, String> {
+    let expected = gateway_config::codex_provider_api_key()?;
+    let credential = request_header(request, gateway_config::GATEWAY_AUTH_CREDENTIAL_HEADER)
+        .unwrap_or_default()
+        .trim();
+    if !constant_time_eq(credential, &expected) {
+        return Ok(json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({ "error": "invalid gateway auth credential" }),
+        ));
+    }
+
+    let body = request
+        .body_mut()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?
+        .to_bytes();
+    if body.len() > 64 * 1024 {
+        return Ok(json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({ "error": "gateway auth payload is too large" }),
+        ));
+    }
+
+    let payload = serde_json::from_slice::<Value>(&body).map_err(|e| e.to_string())?;
+    let token = payload
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let active = constant_time_eq(token, &expected);
+    let response = if active {
+        json!({
+            "active": true,
+            "userId": gateway_config::GATEWAY_AUTH_USER_ID,
+            "tenantId": gateway_config::GATEWAY_AUTH_TENANT_ID,
+            "sub": gateway_config::GATEWAY_AUTH_SUBJECT,
+            "organizationId": "codexl",
+            "plan": "local",
+            "apiKeyId": gateway_config::NEXT_AI_GATEWAY_PROVIDER_NAME,
+        })
+    } else {
+        json!({ "active": false })
+    };
+
+    Ok(json_response(StatusCode::OK, response))
 }
 
 async fn receive_gateway_usage_report(
@@ -1239,6 +1293,24 @@ fn launch_info(config: &AppConfig, pid: Option<u32>, cli_stdio_path: Option<Stri
             .map(|profile| config::normalized_remote_frontend_mode(&profile.remote_frontend_mode))
             .unwrap_or_else(|| config::REMOTE_FRONTEND_MODE_APP.to_string()),
     }
+}
+
+fn request_header<'a>(request: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in left.as_bytes().iter().zip(right.as_bytes()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 fn is_websocket_upgrade(request: &Request<Incoming>) -> bool {

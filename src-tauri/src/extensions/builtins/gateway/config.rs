@@ -1,9 +1,18 @@
+use rand::RngCore;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+#[cfg(windows)]
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 
 pub const NEXT_AI_GATEWAY_PROVIDER_NAME: &str = "next-ai-gateway";
 pub const NEXT_AI_GATEWAY_API_KEY: &str = "codexl-next-ai-gateway";
+pub const GATEWAY_AUTH_CREDENTIAL_HEADER: &str = "x-codexl-gateway-auth";
+pub const GATEWAY_AUTH_USER_ID: &str = "codexl";
+pub const GATEWAY_AUTH_TENANT_ID: &str = "local";
+pub const GATEWAY_AUTH_SUBJECT: &str = "codexl-local";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,9 +25,12 @@ pub fn read_gateway_config() -> Result<GatewayConfigFile, String> {
     let path = gateway_config_path();
     ensure_gateway_config_file(&path)?;
     let content = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
-    let config = serde_json::from_str::<Value>(&content).map_err(|err| err.to_string())?;
+    let mut config = serde_json::from_str::<Value>(&content).map_err(|err| err.to_string())?;
     if !config.is_object() {
         return Err("Gateway config must be a JSON object".to_string());
+    }
+    if ensure_gateway_auth_config(&mut config, None) {
+        write_gateway_config_value(&path, &config)?;
     }
 
     Ok(GatewayConfigFile {
@@ -78,7 +90,7 @@ pub fn write_codex_model_catalog(selected_model: &str) -> Result<String, String>
     let temp_path = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(&catalog).map_err(|err| err.to_string())?;
     std::fs::write(&temp_path, format!("{}\n", content)).map_err(|err| err.to_string())?;
-    std::fs::rename(&temp_path, &path).map_err(|err| err.to_string())?;
+    replace_file(&temp_path, &path)?;
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -329,26 +341,22 @@ fn gateway_origin_from_config(config: &Value) -> String {
 }
 
 fn codex_provider_api_key_from_config(config: &Value) -> String {
-    let auth = config.get("auth");
-    let auth_enabled = auth
-        .and_then(|value| value.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    first_gateway_key_from_config(config).unwrap_or_else(|| NEXT_AI_GATEWAY_API_KEY.to_string())
+}
 
-    if auth_enabled {
-        for keys in [
-            auth.and_then(|value| value.get("principals")),
-            auth.and_then(|value| value.get("keys")),
-            config.get("principals"),
-            config.get("keys"),
-        ] {
-            if let Some(key) = first_gateway_key(keys) {
-                return key;
-            }
+fn first_gateway_key_from_config(config: &Value) -> Option<String> {
+    let auth = config.get("auth");
+    for keys in [
+        auth.and_then(|value| value.get("principals")),
+        auth.and_then(|value| value.get("keys")),
+        config.get("principals"),
+        config.get("keys"),
+    ] {
+        if let Some(key) = first_gateway_key(keys) {
+            return Some(key);
         }
     }
-
-    NEXT_AI_GATEWAY_API_KEY.to_string()
+    None
 }
 
 fn first_gateway_key(value: Option<&Value>) -> Option<String> {
@@ -375,18 +383,15 @@ fn first_gateway_key(value: Option<&Value>) -> Option<String> {
 }
 
 pub fn write_gateway_config(config: Value) -> Result<GatewayConfigFile, String> {
+    let mut config = config;
     if !config.is_object() {
         return Err("Gateway config must be a JSON object".to_string());
     }
 
     let path = gateway_config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let temp_path = path.with_extension("json.tmp");
-    let content = serde_json::to_string_pretty(&config).map_err(|err| err.to_string())?;
-    std::fs::write(&temp_path, format!("{}\n", content)).map_err(|err| err.to_string())?;
-    std::fs::rename(&temp_path, &path).map_err(|err| err.to_string())?;
+    let previous = read_gateway_config_value(&path).ok();
+    ensure_gateway_auth_config(&mut config, previous.as_ref());
+    write_gateway_config_value(&path, &config)?;
 
     Ok(GatewayConfigFile {
         path: path.to_string_lossy().to_string(),
@@ -394,8 +399,10 @@ pub fn write_gateway_config(config: Value) -> Result<GatewayConfigFile, String> 
     })
 }
 
-fn ensure_gateway_config_file(path: &PathBuf) -> Result<(), String> {
+fn ensure_gateway_config_file(path: &Path) -> Result<(), String> {
     if path.is_file() {
+        #[cfg(windows)]
+        tighten_gateway_config_permissions_once(path)?;
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -403,7 +410,31 @@ fn ensure_gateway_config_file(path: &PathBuf) -> Result<(), String> {
     }
     let content =
         serde_json::to_string_pretty(&default_gateway_config()).map_err(|err| err.to_string())?;
-    std::fs::write(path, format!("{}\n", content)).map_err(|err| err.to_string())
+    std::fs::write(path, format!("{}\n", content)).map_err(|err| err.to_string())?;
+    tighten_gateway_config_permissions(path)?;
+    Ok(())
+}
+
+fn read_gateway_config_value(path: &Path) -> Result<Value, String> {
+    let content = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let config = serde_json::from_str::<Value>(&content).map_err(|err| err.to_string())?;
+    if !config.is_object() {
+        return Err("Gateway config must be a JSON object".to_string());
+    }
+    Ok(config)
+}
+
+fn write_gateway_config_value(path: &Path, config: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let temp_path = path.with_extension("json.tmp");
+    let content = serde_json::to_string_pretty(config).map_err(|err| err.to_string())?;
+    std::fs::write(&temp_path, format!("{}\n", content)).map_err(|err| err.to_string())?;
+    tighten_gateway_config_permissions(&temp_path)?;
+    replace_file(&temp_path, path)?;
+    tighten_gateway_config_permissions(path)?;
+    Ok(())
 }
 
 fn gateway_config_path() -> PathBuf {
@@ -443,9 +474,7 @@ fn default_gateway_config() -> Value {
         "port": 14589,
         "bodyLimitBytes": 52428800,
         "Providers": [],
-        "auth": {
-            "enabled": false
-        },
+        "auth": default_gateway_auth_config(),
         "billing": {
             "enabled": false
         },
@@ -469,6 +498,259 @@ fn default_gateway_config() -> Value {
             "enabled": false
         }
     })
+}
+
+fn default_gateway_auth_config() -> Value {
+    gateway_auth_config_with_key(&random_gateway_api_key())
+}
+
+fn gateway_auth_config_with_key(key: &str) -> Value {
+    json!({
+        "enabled": true,
+        "mode": "http_introspection",
+        "required": true,
+        "keys": [gateway_auth_key_entry(key)],
+        "introspection": {
+            "tokenHeader": "authorization",
+            "tokenBearerOnly": true
+        }
+    })
+}
+
+fn ensure_gateway_auth_config(config: &mut Value, previous: Option<&Value>) -> bool {
+    if !config.is_object() {
+        return false;
+    }
+
+    let key = first_non_default_gateway_key(config)
+        .or_else(|| previous.and_then(first_non_default_gateway_key))
+        .unwrap_or_else(random_gateway_api_key);
+
+    let object = config.as_object_mut().expect("checked object");
+    let auth = object.entry("auth").or_insert_with(|| json!({}));
+    let mut changed = false;
+    if !auth.is_object() {
+        *auth = json!({});
+        changed = true;
+    }
+    let auth_object = auth.as_object_mut().expect("checked object");
+
+    changed |= set_json_bool(auth_object, "enabled", true);
+    changed |= set_json_string(auth_object, "mode", "http_introspection");
+    changed |= set_json_bool(auth_object, "required", true);
+
+    let keys_need_update = auth_object
+        .get("keys")
+        .and_then(|value| first_gateway_key(Some(value)))
+        .map(|value| value == NEXT_AI_GATEWAY_API_KEY)
+        .unwrap_or(true);
+    if keys_need_update {
+        auth_object.insert("keys".to_string(), json!([gateway_auth_key_entry(&key)]));
+        changed = true;
+    }
+
+    let introspection = auth_object
+        .entry("introspection")
+        .or_insert_with(|| json!({}));
+    if !introspection.is_object() {
+        *introspection = json!({});
+        changed = true;
+    }
+    let introspection_object = introspection.as_object_mut().expect("checked object");
+    changed |= set_json_string(introspection_object, "tokenHeader", "authorization");
+    changed |= set_json_bool(introspection_object, "tokenBearerOnly", true);
+
+    changed
+}
+
+fn first_non_default_gateway_key(config: &Value) -> Option<String> {
+    first_gateway_key_from_config(config).filter(|key| key != NEXT_AI_GATEWAY_API_KEY)
+}
+
+fn gateway_auth_key_entry(key: &str) -> Value {
+    json!({
+        "key": key,
+        "userId": GATEWAY_AUTH_USER_ID,
+        "tenantId": GATEWAY_AUTH_TENANT_ID,
+        "subject": GATEWAY_AUTH_SUBJECT
+    })
+}
+
+fn set_json_bool(object: &mut serde_json::Map<String, Value>, key: &str, value: bool) -> bool {
+    if object.get(key).and_then(Value::as_bool) == Some(value) {
+        return false;
+    }
+    object.insert(key.to_string(), Value::Bool(value));
+    true
+}
+
+fn set_json_string(object: &mut serde_json::Map<String, Value>, key: &str, value: &str) -> bool {
+    if object.get(key).and_then(Value::as_str) == Some(value) {
+        return false;
+    }
+    object.insert(key.to_string(), Value::String(value.to_string()));
+    true
+}
+
+fn random_gateway_api_key() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut key = String::from("cxl_gw_");
+    for byte in bytes {
+        key.push_str(&format!("{:02x}", byte));
+    }
+    key
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp_path: &Path, path: &Path) -> Result<(), String> {
+    std::fs::rename(temp_path, path).map_err(|err| err.to_string())
+}
+
+#[cfg(windows)]
+fn replace_file(temp_path: &Path, path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return std::fs::rename(temp_path, path).map_err(|err| err.to_string());
+    }
+
+    let backup_path = path.with_extension("json.bak");
+    let _ = std::fs::remove_file(&backup_path);
+    std::fs::rename(path, &backup_path).map_err(|err| {
+        format!(
+            "failed to prepare Windows file replacement for {}: {}",
+            path.display(),
+            err
+        )
+    })?;
+
+    match std::fs::rename(temp_path, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = std::fs::rename(&backup_path, path);
+            Err(format!(
+                "failed to replace {} on Windows: {}",
+                path.display(),
+                err
+            ))
+        }
+    }
+}
+
+fn tighten_gateway_config_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)
+            .map_err(|err| err.to_string())?
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        tighten_gateway_config_permissions_windows(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn tighten_gateway_config_permissions_once(path: &Path) -> Result<(), String> {
+    static SECURED_GATEWAY_CONFIG_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+    let cache_key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let secured_paths = SECURED_GATEWAY_CONFIG_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let guard = secured_paths
+            .lock()
+            .map_err(|_| "Gateway config permission cache is poisoned".to_string())?;
+        if guard.contains(&cache_key) {
+            return Ok(());
+        }
+    }
+
+    tighten_gateway_config_permissions(path)?;
+
+    let mut guard = secured_paths
+        .lock()
+        .map_err(|_| "Gateway config permission cache is poisoned".to_string())?;
+    guard.insert(cache_key);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn tighten_gateway_config_permissions_windows(path: &Path) -> Result<(), String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$target = $args[0]
+if ([string]::IsNullOrWhiteSpace($target)) {
+    throw 'missing Gateway config path'
+}
+
+$item = Get-Item -LiteralPath $target -Force
+$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$system = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$admins = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$acl = [System.Security.AccessControl.FileSecurity]::new()
+$acl.SetOwner($current)
+$acl.SetAccessRuleProtection($true, $false)
+$rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+$propagation = [System.Security.AccessControl.PropagationFlags]::None
+$type = [System.Security.AccessControl.AccessControlType]::Allow
+
+foreach ($sid in @($current, $system, $admins)) {
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid,
+        $rights,
+        $inheritance,
+        $propagation,
+        $type
+    )
+    $acl.AddAccessRule($rule)
+}
+
+Set-Acl -LiteralPath $item.FullName -AclObject $acl
+"#;
+
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .arg(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let output = command.output().map_err(|err| {
+        format!(
+            "failed to secure Gateway config permissions on Windows: {}",
+            err
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err("failed to secure Gateway config permissions on Windows".to_string())
+    } else {
+        Err(format!(
+            "failed to secure Gateway config permissions on Windows: {}",
+            stderr
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -526,5 +808,79 @@ mod tests {
                 "openai/search-fixed-short",
             ]
         );
+    }
+
+    #[test]
+    fn gateway_auth_config_generates_local_api_key() {
+        let mut config = json!({
+            "auth": {
+                "enabled": false
+            }
+        });
+
+        assert!(ensure_gateway_auth_config(&mut config, None));
+        let key = codex_provider_api_key_from_config(&config);
+
+        assert_eq!(config["auth"]["enabled"], json!(true));
+        assert_eq!(config["auth"]["mode"], json!("http_introspection"));
+        assert_eq!(config["auth"]["required"], json!(true));
+        assert_eq!(
+            config["auth"]["introspection"]["tokenHeader"],
+            json!("authorization")
+        );
+        assert_eq!(
+            config["auth"]["introspection"]["tokenBearerOnly"],
+            json!(true)
+        );
+        assert_ne!(key, NEXT_AI_GATEWAY_API_KEY);
+        assert!(key.starts_with("cxl_gw_"));
+        assert_eq!(config["auth"]["keys"][0]["key"], json!(key));
+    }
+
+    #[test]
+    fn gateway_auth_config_preserves_previous_key_when_rewritten() {
+        let previous = json!({
+            "auth": {
+                "enabled": true,
+                "keys": [
+                    {
+                        "key": "cxl_gw_existing"
+                    }
+                ]
+            }
+        });
+        let mut config = json!({
+            "Providers": []
+        });
+
+        assert!(ensure_gateway_auth_config(&mut config, Some(&previous)));
+
+        assert_eq!(
+            codex_provider_api_key_from_config(&config),
+            "cxl_gw_existing"
+        );
+    }
+
+    #[test]
+    fn replace_file_overwrites_existing_target() {
+        let root = std::env::temp_dir().join(format!(
+            "codexl-gateway-replace-file-{}-{}",
+            std::process::id(),
+            random_gateway_api_key()
+        ));
+        std::fs::create_dir_all(&root).expect("create test dir");
+        let target = root.join("gateway.config.json");
+        let temp = root.join("gateway.config.json.tmp");
+        std::fs::write(&target, "old").expect("write target");
+        std::fs::write(&temp, "new").expect("write temp");
+
+        replace_file(&temp, &target).expect("replace file");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "new"
+        );
+        assert!(!temp.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -2444,6 +2444,14 @@ fn provider_detail_from_default_config(profile: &ProviderProfile) -> DefaultProv
         detail.base_url = profile.base_url.clone();
     }
     detail.model = profile.model.clone();
+    if provider_profile_uses_next_ai_gateway(profile) {
+        if let Ok(base_url) = gateway_config::codex_provider_base_url() {
+            detail.base_url = base_url;
+        }
+        if let Ok(api_key) = gateway_config::codex_provider_api_key() {
+            detail.api_key = api_key;
+        }
+    }
 
     detail
 }

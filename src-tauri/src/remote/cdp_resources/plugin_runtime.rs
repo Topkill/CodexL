@@ -992,7 +992,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "settings-context-11";
+  const RUNTIME_BUILD = "settings-context-12";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -1003,6 +1003,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const SETTINGS_PANEL_ATTR = "data-codexl-settings-panel";
   const CONTEXT_INDICATOR_ID = "codexl-context-indicator";
   const CONTEXT_TOOLTIP_ID = "codexl-context-indicator-tooltip";
+  const SETTINGS_REFRESH_BURST_DELAYS_MS = [0, 120, 360, 900, 1800];
+  const SETTINGS_INTERACTION_SCAN_WINDOW_MS = 4500;
+  const CONTEXT_INDICATOR_BURST_DELAYS_MS = [0, 150, 500, 1200];
   const existing = window.__codexlPluginRuntime;
   if (existing && existing.version === RUNTIME_VERSION && existing.build === RUNTIME_BUILD) {
     existing.reconfigure?.(BRIDGE_URL);
@@ -1028,6 +1031,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       showAllSessions: false,
       showContextIndicators: false,
     },
+    contextIndicatorCleanup: [],
     contextUsageByThread: new Map(),
     contextUsageSessionRefreshByThread: new Map(),
     latestContextUsage: null,
@@ -1040,7 +1044,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     status: "booting",
     statusDetail: "",
     nextId: 1,
+    settingsInteractionUntil: 0,
     settingsDiagnostics: [],
+    settingsRefreshTimers: [],
     version: RUNTIME_VERSION,
   };
   window.__codexlPluginRuntime = runtime;
@@ -1645,7 +1651,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     }
     runtime.pending.clear();
     try {
-      removeContextIndicator();
+      uninstallContextIndicator();
     } catch {}
     try {
       removeCodexLSettingsInjection();
@@ -1870,14 +1876,14 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       throw error;
     } finally {
       updateSettingsUi();
-      updateContextIndicator();
+      syncContextIndicator();
     }
   }
 
   function setShowContextIndicators(enabled) {
     runtime.codexlSettings.showContextIndicators = !!enabled;
     updateSettingsUi();
-    updateContextIndicator();
+    syncContextIndicator();
     request("storage:set", {
       key: SHOW_CONTEXT_INDICATORS_KEY,
       pluginId: CORE_PLUGIN_ID,
@@ -2798,18 +2804,110 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     };
   }
 
-  function refreshCodexLSettingsNav() {
+  function settingsLocationKey() {
+    return `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  }
+
+  function hasCodexLSettingsInjection() {
+    return !!document.querySelector(
+      `[${SETTINGS_NAV_ATTR}="1"], [${SETTINGS_PANEL_ATTR}="1"]`
+    );
+  }
+
+  function settingsScanWindowActive() {
+    return Date.now() < (runtime.settingsInteractionUntil || 0);
+  }
+
+  function shouldScanSettingsDom(force = false) {
+    return (
+      force ||
+      isSettingsRoute() ||
+      settingsScanWindowActive() ||
+      hasCodexLSettingsInjection()
+    );
+  }
+
+  function clearSettingsRefreshTimers() {
+    for (const timer of runtime.settingsRefreshTimers.splice(0)) {
+      window.clearTimeout(timer);
+    }
+  }
+
+  function scheduleSettingsRefresh({ delay = 0, diagnostics = false, force = false } = {}) {
+    if (!document.body) {
+      return;
+    }
+    if (delay > 0) {
+      const timer = window.setTimeout(() => {
+        scheduleSettingsRefresh({ diagnostics, force });
+      }, delay);
+      runtime.settingsRefreshTimers.push(timer);
+      return;
+    }
+    if (runtime.settingsRefreshScheduled) {
+      return;
+    }
+    runtime.settingsRefreshScheduled = true;
+    window.requestAnimationFrame(() => {
+      runtime.settingsRefreshScheduled = false;
+      refreshCodexLSettingsNav({ diagnostics, force });
+    });
+  }
+
+  function scheduleSettingsRefreshBurst(reason = "unknown") {
+    runtime.settingsInteractionUntil = Math.max(
+      runtime.settingsInteractionUntil || 0,
+      Date.now() + SETTINGS_INTERACTION_SCAN_WINDOW_MS
+    );
+    clearSettingsRefreshTimers();
+    settingsDebugLog("CodexL settings refresh scheduled", { reason }, "info", { emit: false });
+    for (const delay of SETTINGS_REFRESH_BURST_DELAYS_MS) {
+      scheduleSettingsRefresh({ delay });
+    }
+  }
+
+  function settingsTriggerText(target) {
+    const element =
+      target instanceof Element
+        ? target.closest('button, a, [role="button"], [role="menuitem"], [role="tab"], [aria-label], [title]')
+        : null;
+    if (!element || element.closest(`#${ROOT_ID}`)) {
+      return "";
+    }
+    return [
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      normalizedText(element).slice(0, 120),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+  }
+
+  function targetLooksLikeSettingsTrigger(target) {
+    const text = settingsTriggerText(target);
+    return /\bsettings\b|\u8bbe\u7f6e/.test(text);
+  }
+
+  function refreshCodexLSettingsNav({ diagnostics = false, force = false } = {}) {
+    if (!shouldScanSettingsDom(force)) {
+      return false;
+    }
     const shell = findSettingsShell();
     const nav = (shell && findSettingsNav(shell)) || findBestSettingsNavCandidate(document);
     if (!nav) {
-      settingsDebugLog(
-        "CodexL settings nav not found",
-        getSettingsDiagnostics({ shell, nav }),
-        "info",
-        { emit: false }
-      );
-      removeCodexLSettingsInjection();
-      return;
+      if (diagnostics) {
+        settingsDebugLog(
+          "CodexL settings nav not found",
+          getSettingsDiagnostics({ shell, nav }),
+          "info",
+          { emit: false }
+        );
+      }
+      if (hasCodexLSettingsInjection()) {
+        removeCodexLSettingsInjection();
+      }
+      return false;
     }
     removeMisplacedSettingsNavItems(nav);
     const item = ensureSettingsNavItem(nav);
@@ -2820,6 +2918,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       shell: elementDebugSummary(shell),
     }, "info", { emit: false });
     updateSettingsUi();
+    return true;
   }
 
   function installCodexLSettingsInjector() {
@@ -2832,23 +2931,71 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       href: window.location.href,
       version: RUNTIME_VERSION,
     });
-    let scheduled = false;
-    const scheduleRefresh = () => {
-      if (scheduled) {
+    const onPotentialSettingsOpen = (event) => {
+      if (targetLooksLikeSettingsTrigger(event.target)) {
+        scheduleSettingsRefreshBurst("settings-interaction");
+      }
+    };
+    const onPotentialSettingsKey = (event) => {
+      if (
+        (event.key === "Enter" || event.key === " ") &&
+        targetLooksLikeSettingsTrigger(event.target)
+      ) {
+        scheduleSettingsRefreshBurst("settings-keyboard");
+      }
+    };
+    const onLocationChange = () => {
+      const key = settingsLocationKey();
+      if (runtime.settingsLastLocationKey === key) {
         return;
       }
-      scheduled = true;
-      window.requestAnimationFrame(() => {
-        scheduled = false;
-        refreshCodexLSettingsNav();
-      });
+      runtime.settingsLastLocationKey = key;
+      if (isSettingsRoute()) {
+        scheduleSettingsRefreshBurst("settings-route");
+      } else if (!settingsScanWindowActive() && hasCodexLSettingsInjection()) {
+        removeCodexLSettingsInjection();
+      }
     };
-    const observer = new MutationObserver(scheduleRefresh);
-    observer.observe(document.body, { childList: true, subtree: true });
-    const interval = window.setInterval(refreshCodexLSettingsNav, 1000);
-    runtime.cleanup.push(() => observer.disconnect());
-    runtime.cleanup.push(() => window.clearInterval(interval));
-    refreshCodexLSettingsNav();
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+    const dispatchLocationChange = () => {
+      window.dispatchEvent(new Event("codexl-location-change"));
+    };
+    const wrappedPushState = function codexlPushState(...args) {
+      const result = originalPushState.apply(this, args);
+      window.setTimeout(dispatchLocationChange, 0);
+      return result;
+    };
+    const wrappedReplaceState = function codexlReplaceState(...args) {
+      const result = originalReplaceState.apply(this, args);
+      window.setTimeout(dispatchLocationChange, 0);
+      return result;
+    };
+    try {
+      history.pushState = wrappedPushState;
+      history.replaceState = wrappedReplaceState;
+    } catch {}
+    document.addEventListener("click", onPotentialSettingsOpen, true);
+    document.addEventListener("keydown", onPotentialSettingsKey, true);
+    window.addEventListener("codexl-location-change", onLocationChange, true);
+    window.addEventListener("hashchange", onLocationChange, true);
+    window.addEventListener("popstate", onLocationChange, true);
+    runtime.cleanup.push(() => {
+      clearSettingsRefreshTimers();
+      document.removeEventListener("click", onPotentialSettingsOpen, true);
+      document.removeEventListener("keydown", onPotentialSettingsKey, true);
+      window.removeEventListener("codexl-location-change", onLocationChange, true);
+      window.removeEventListener("hashchange", onLocationChange, true);
+      window.removeEventListener("popstate", onLocationChange, true);
+      if (history.pushState === wrappedPushState) {
+        history.pushState = originalPushState;
+      }
+      if (history.replaceState === wrappedReplaceState) {
+        history.replaceState = originalReplaceState;
+      }
+    });
+    runtime.settingsLastLocationKey = "";
+    onLocationChange();
   }
 
   function threadIdFromUrlLike(value) {
@@ -2999,10 +3146,20 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     return null;
   }
 
-  function rememberActiveThreadId(value) {
+  function clearActiveContextUsage(reason = "unknown") {
+    runtime.activeThreadId = null;
+    runtime.latestContextUsage = null;
+    runtime.lastContextClearReason = reason;
+    scheduleContextIndicatorUpdate();
+  }
+
+  function rememberActiveThreadId(value, { clearWhenMissing = false } = {}) {
     const threadId = normalizeThreadId(value);
     if (threadId) {
       runtime.activeThreadId = threadId;
+      scheduleContextIndicatorUpdate();
+    } else if (clearWhenMissing) {
+      clearActiveContextUsage("missing-thread-id");
     }
     return threadId;
   }
@@ -3138,7 +3295,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       }
     }
     runtime.latestContextUsage = usage;
-    updateContextIndicator();
+    scheduleContextIndicatorUpdate();
     return true;
   }
 
@@ -3226,6 +3383,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     if (change.type === "snapshot") {
       const conversationState = change.conversationState;
       const snapshotThreadId = normalizeThreadId(conversationState?.id ?? threadId);
+      if (snapshotThreadId) {
+        rememberActiveThreadId(snapshotThreadId);
+      }
       const tokenUsage = tokenUsageFromConversationState(conversationState);
       if (tokenUsage) {
         rememberContextUsageForThread(
@@ -3235,6 +3395,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         );
       }
       return true;
+    }
+    if (threadId) {
+      rememberActiveThreadId(threadId);
     }
     scanAppServerTokenUsage(change, threadId, "app-server:thread-stream-state-changed");
     return true;
@@ -3255,7 +3418,9 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       return true;
     }
     if (method === "thread/started") {
-      rememberActiveThreadId(params.thread ?? params.threadId ?? params.conversationId);
+      rememberActiveThreadId(params.thread ?? params.threadId ?? params.conversationId, {
+        clearWhenMissing: true,
+      });
       return true;
     }
     return false;
@@ -3268,8 +3433,15 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     if (message.type === "mcp-request") {
       const request = message.request;
       const params = request?.params;
-      if (request?.method === "thread/start" || request?.method === "thread/resume") {
-        rememberActiveThreadId(params?.threadId ?? params?.conversationId);
+      if (request?.method === "thread/start") {
+        const threadId = rememberActiveThreadId(params?.threadId ?? params?.conversationId);
+        if (!threadId) {
+          clearActiveContextUsage("thread-start");
+        }
+      } else if (request?.method === "thread/resume") {
+        rememberActiveThreadId(params?.threadId ?? params?.conversationId, {
+          clearWhenMissing: true,
+        });
       }
       return false;
     }
@@ -3697,38 +3869,93 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
       removeContextIndicator();
       return;
     }
+    const usage = currentContextUsage();
+    if (!usage) {
+      removeContextIndicator();
+      return;
+    }
     const indicator = ensureContextIndicator(sendButton);
     if (indicator) {
-      renderContextIndicator(indicator, currentContextUsage());
+      renderContextIndicator(indicator, usage);
     }
   }
 
+  function scheduleContextIndicatorUpdate() {
+    if (!runtime.codexlSettings.showContextIndicators || !document.body) {
+      removeContextIndicator();
+      return;
+    }
+    if (runtime.contextIndicatorUpdateScheduled) {
+      return;
+    }
+    runtime.contextIndicatorUpdateScheduled = true;
+    window.requestAnimationFrame(() => {
+      runtime.contextIndicatorUpdateScheduled = false;
+      updateContextIndicator();
+    });
+  }
+
+  function scheduleContextIndicatorBurst() {
+    for (const timer of runtime.contextIndicatorTimers || []) {
+      window.clearTimeout(timer);
+    }
+    runtime.contextIndicatorTimers = [];
+    for (const delay of CONTEXT_INDICATOR_BURST_DELAYS_MS) {
+      const timer = window.setTimeout(scheduleContextIndicatorUpdate, delay);
+      runtime.contextIndicatorTimers.push(timer);
+    }
+  }
+
+  function uninstallContextIndicator() {
+    for (const timer of runtime.contextIndicatorTimers || []) {
+      window.clearTimeout(timer);
+    }
+    runtime.contextIndicatorTimers = [];
+    for (const cleanup of runtime.contextIndicatorCleanup.splice(0)) {
+      try {
+        cleanup();
+      } catch {}
+    }
+    runtime.contextIndicatorInstalled = false;
+    runtime.contextIndicatorUpdateScheduled = false;
+    removeContextIndicator();
+  }
+
   function installContextIndicator() {
-    if (runtime.contextIndicatorInstalled || !document.body) {
+    if (!runtime.codexlSettings.showContextIndicators || !document.body) {
+      uninstallContextIndicator();
+      return;
+    }
+    if (runtime.contextIndicatorInstalled) {
+      scheduleContextIndicatorBurst();
       return;
     }
     runtime.contextIndicatorInstalled = true;
-    let scheduled = false;
-    const scheduleUpdate = () => {
-      if (scheduled) {
-        return;
-      }
-      scheduled = true;
-      window.requestAnimationFrame(() => {
-        scheduled = false;
-        updateContextIndicator();
-      });
-    };
-    const observer = new MutationObserver(scheduleUpdate);
-    observer.observe(document.body, {
-      characterData: true,
-      childList: true,
-      subtree: true,
+    const onLightweightUiChange = () => scheduleContextIndicatorUpdate();
+    const onRouteOrViewportChange = () => scheduleContextIndicatorBurst();
+    document.addEventListener("focusin", onLightweightUiChange, true);
+    document.addEventListener("input", onLightweightUiChange, true);
+    window.addEventListener("resize", onRouteOrViewportChange, true);
+    window.addEventListener("codexl-location-change", onRouteOrViewportChange, true);
+    window.addEventListener("hashchange", onRouteOrViewportChange, true);
+    window.addEventListener("popstate", onRouteOrViewportChange, true);
+    runtime.contextIndicatorCleanup.push(() => {
+      document.removeEventListener("focusin", onLightweightUiChange, true);
+      document.removeEventListener("input", onLightweightUiChange, true);
+      window.removeEventListener("resize", onRouteOrViewportChange, true);
+      window.removeEventListener("codexl-location-change", onRouteOrViewportChange, true);
+      window.removeEventListener("hashchange", onRouteOrViewportChange, true);
+      window.removeEventListener("popstate", onRouteOrViewportChange, true);
     });
-    const interval = window.setInterval(updateContextIndicator, 1500);
-    runtime.cleanup.push(() => observer.disconnect());
-    runtime.cleanup.push(() => window.clearInterval(interval));
-    updateContextIndicator();
+    scheduleContextIndicatorBurst();
+  }
+
+  function syncContextIndicator() {
+    if (runtime.codexlSettings.showContextIndicators) {
+      installContextIndicator();
+    } else {
+      uninstallContextIndicator();
+    }
   }
 
   function mount() {
@@ -4007,11 +4234,19 @@ mod tests {
         assert!(script.contains("latestTokenUsageInfo"));
         assert!(script.contains("tokenUsageInfo"));
         assert!(script.contains("threadIdFromLocation"));
+        assert!(script.contains("scheduleSettingsRefreshBurst"));
+        assert!(script.contains("syncContextIndicator"));
         assert!(script.contains("toLocaleString(\"en-US\")"));
         assert!(script.contains("data-codexl-context-title"));
         assert!(script.contains("codexl-context-indicator-tooltip"));
         assert!(script.contains("bindContextIndicatorTooltip"));
+        assert!(script.contains("clearActiveContextUsage"));
+        assert!(script.contains("clearActiveContextUsage(\"thread-start\")"));
         assert!(script.contains("const usage = runtime.contextUsageByThread.get(threadId) || null"));
+        assert!(script.contains("if (!usage)"));
+        assert!(!script.contains("new MutationObserver"));
+        assert!(!script.contains("setInterval(refreshCodexLSettingsNav"));
+        assert!(!script.contains("setInterval(updateContextIndicator"));
         assert!(script.contains("background: transparent"));
         assert!(script.contains("border: 0"));
         assert!(!script.contains("right: 48px"));

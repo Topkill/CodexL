@@ -54,10 +54,17 @@ pub async fn sync_with_config(
 
 pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, String> {
     let health_url = gateway_config::gateway_health_url()?;
-    if let Some(status) = managed_running_status(state, &health_url).await? {
+    let auth_probe_url = gateway_config::gateway_agent_tools_url()?;
+    if let Some(status) = managed_running_status(state, &health_url, &auth_probe_url).await? {
         return Ok(status);
     }
     if gateway_health_ok(&health_url).await {
+        if !gateway_rejects_unauthenticated(&auth_probe_url).await {
+            return Err(format!(
+                "NeXT AI Gateway is already running at {}, but it does not enforce CodexL authentication. Stop that process or change the Gateway port.",
+                health_url
+            ));
+        }
         return Ok(GatewayServiceStatus {
             running: true,
             managed: false,
@@ -72,18 +79,28 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
             .await
             .map_err(|err| err.to_string())??;
     let config_file = gateway_config::read_gateway_config()?;
+    let app_config = state.config.lock().await.clone();
+    let auth_introspection_url = codexl_gateway_auth_introspection_url(&app_config);
+    let auth_secret = gateway_config::codex_provider_api_key()?;
     let usage_webhook_url = if gateway_usage_capture_enabled(&config_file.config) {
-        let app_config = state.config.lock().await.clone();
         Some(codexl_gateway_usage_webhook_url(&app_config))
     } else {
         None
     };
 
     let mut guard = state.gateway_service.lock().await;
-    if let Some(status) = managed_status_from_guard(&mut guard, &health_url).await? {
+    if let Some(status) =
+        managed_status_from_guard(&mut guard, &health_url, &auth_probe_url).await?
+    {
         return Ok(status);
     }
     if gateway_health_ok(&health_url).await {
+        if !gateway_rejects_unauthenticated(&auth_probe_url).await {
+            return Err(format!(
+                "NeXT AI Gateway is already running at {}, but it does not enforce CodexL authentication. Stop that process or change the Gateway port.",
+                health_url
+            ));
+        }
         return Ok(GatewayServiceStatus {
             running: true,
             managed: false,
@@ -97,10 +114,18 @@ pub async fn ensure_running(state: &AppState) -> Result<GatewayServiceStatus, St
         &extension,
         &config_file.path,
         health_url.clone(),
+        &auth_introspection_url,
+        &auth_secret,
         usage_webhook_url.as_deref(),
     )?;
     let pid = handle.child.id();
     wait_until_ready(&mut handle).await?;
+    if !gateway_rejects_unauthenticated(&auth_probe_url).await {
+        return Err(format!(
+            "NeXT AI Gateway started at {}, but authentication was not enforced.",
+            health_url
+        ));
+    }
     *guard = Some(handle);
 
     Ok(GatewayServiceStatus {
@@ -126,14 +151,16 @@ pub async fn stop(state: &AppState) -> Result<(), String> {
 async fn managed_running_status(
     state: &AppState,
     health_url: &str,
+    auth_probe_url: &str,
 ) -> Result<Option<GatewayServiceStatus>, String> {
     let mut guard = state.gateway_service.lock().await;
-    managed_status_from_guard(&mut guard, health_url).await
+    managed_status_from_guard(&mut guard, health_url, auth_probe_url).await
 }
 
 async fn managed_status_from_guard(
     guard: &mut Option<GatewayServiceHandle>,
     health_url: &str,
+    auth_probe_url: &str,
 ) -> Result<Option<GatewayServiceStatus>, String> {
     let Some(handle) = guard.as_mut() else {
         return Ok(None);
@@ -149,7 +176,10 @@ async fn managed_status_from_guard(
         return Ok(None);
     }
 
-    if handle.health_url == health_url && gateway_health_ok(health_url).await {
+    if handle.health_url == health_url
+        && gateway_health_ok(health_url).await
+        && gateway_rejects_unauthenticated(auth_probe_url).await
+    {
         return Ok(Some(GatewayServiceStatus {
             running: true,
             managed: true,
@@ -167,6 +197,8 @@ fn start_process(
     extension: &BuiltinNodeExtension,
     config_path: &str,
     health_url: String,
+    auth_introspection_url: &str,
+    auth_secret: &str,
     usage_webhook_url: Option<&str>,
 ) -> Result<GatewayServiceHandle, String> {
     let mut command = Command::new(&extension.node.executable);
@@ -176,6 +208,21 @@ fn start_process(
         .env("CODEXL_HOME", super::super::codexl_home_dir())
         .env("GATEWAY_CONFIG_PATH", config_path)
         .env("CODEXL_NEXT_AI_GATEWAY_CONFIG_PATH", config_path)
+        .env("AUTH_ENABLED", "true")
+        .env("AUTH_MODE", "http_introspection")
+        .env("AUTH_REQUIRED", "true")
+        .env("AUTH_INTROSPECTION_ENDPOINT", auth_introspection_url)
+        .env("AUTH_INTROSPECTION_TOKEN_HEADER", "authorization")
+        .env("AUTH_INTROSPECTION_TOKEN_BEARER_ONLY", "true")
+        .env(
+            "AUTH_INTROSPECTION_CREDENTIAL_HEADER",
+            gateway_config::GATEWAY_AUTH_CREDENTIAL_HEADER,
+        )
+        .env(
+            "AUTH_INTROSPECTION_CREDENTIAL_ENV",
+            "CODEXL_GATEWAY_AUTH_SECRET",
+        )
+        .env("CODEXL_GATEWAY_AUTH_SECRET", auth_secret)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -186,6 +233,12 @@ fn start_process(
             .env("BILLING_WEBHOOK_ENABLED", "true")
             .env("BILLING_WEBHOOK_ENDPOINT", usage_webhook_url)
             .env("BILLING_WEBHOOK_TIMEOUT_MS", "2000");
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
     }
 
     let child = command
@@ -208,6 +261,10 @@ fn gateway_usage_capture_enabled(config: &Value) -> bool {
 
 fn codexl_gateway_usage_webhook_url(config: &AppConfig) -> String {
     format!("{}/gateway/usage", codexl_http_origin(config))
+}
+
+fn codexl_gateway_auth_introspection_url(config: &AppConfig) -> String {
+    format!("{}/gateway/auth/introspect", codexl_http_origin(config))
 }
 
 fn codexl_http_origin(config: &AppConfig) -> String {
@@ -259,5 +316,27 @@ async fn gateway_health_ok(url: &str) -> bool {
         .send()
         .await
         .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn gateway_rejects_unauthenticated(url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(HEALTH_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    client
+        .get(url)
+        .send()
+        .await
+        .map(|response| {
+            matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+        })
         .unwrap_or(false)
 }
