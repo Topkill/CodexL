@@ -1,6 +1,7 @@
 use super::cdp::{cdp_send, connect_target, list_targets};
 use super::*;
-use crate::config::AppConfig;
+use crate::config::{generated_codex_home, AppConfig, ProviderProfile};
+use crate::extensions::builtins::gateway::config as gateway_config;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::collections::HashSet;
@@ -395,6 +396,7 @@ async fn plugin_bridge_socket_response(raw: &str) -> Value {
             })
         }),
         "session:context-usage" => renderer_session_context_usage(&request),
+        "models:list-for-host" => plugin_list_models_for_host_response(&request),
         "transcribe:fetch" => plugin_transcribe_fetch_response(&request).await,
         "storage:get" => renderer_plugin_storage_get(&request),
         "storage:set" => renderer_plugin_storage_set(&request),
@@ -417,6 +419,236 @@ async fn plugin_bridge_socket_response(raw: &str) -> Value {
             "error": error,
         }),
     }
+}
+
+fn plugin_list_models_for_host_response(request: &Value) -> Result<Value, String> {
+    let config = AppConfig::load();
+    let Some(profile) = config.provider_profile(&config.active_provider) else {
+        return Ok(json!({
+            "type": "models-list-for-host",
+            "handled": false,
+        }));
+    };
+    let Some(catalog_path) = codex_model_catalog_path_for_profile(&profile) else {
+        return Ok(json!({
+            "type": "models-list-for-host",
+            "handled": false,
+        }));
+    };
+    let content = fs::read_to_string(&catalog_path)
+        .map_err(|err| format!("Failed to read model catalog {}: {}", catalog_path, err))?;
+    let catalog = serde_json::from_str::<Value>(&content)
+        .map_err(|err| format!("Failed to parse model catalog {}: {}", catalog_path, err))?;
+    let response = list_models_for_host_from_catalog(&catalog, &profile.model, request)?;
+    Ok(json!({
+        "type": "models-list-for-host",
+        "handled": true,
+        "response": response,
+    }))
+}
+
+fn codex_model_catalog_path_for_profile(profile: &ProviderProfile) -> Option<String> {
+    if profile.provider_name.trim() == gateway_config::NEXT_AI_GATEWAY_PROVIDER_NAME {
+        if let Ok(path) = gateway_config::write_codex_model_catalog(&profile.model) {
+            return Some(path);
+        }
+    }
+
+    let config_path = generated_codex_home(profile).join("config.toml");
+    let content = fs::read_to_string(config_path).ok()?;
+    top_level_toml_string(&content, "model_catalog_json")
+}
+
+fn list_models_for_host_from_catalog(
+    catalog: &Value,
+    default_model: &str,
+    request: &Value,
+) -> Result<Value, String> {
+    let include_hidden = request
+        .get("includeHidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let offset = request
+        .get("cursor")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+        })
+        .unwrap_or(0) as usize;
+    let limit = request
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(usize::MAX);
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Model catalog missing models array".to_string())?;
+    let items = models
+        .iter()
+        .filter_map(|item| codex_model_catalog_item_for_host(item, default_model))
+        .filter(|item| {
+            include_hidden
+                || item
+                    .get("hidden")
+                    .and_then(Value::as_bool)
+                    .map(|hidden| !hidden)
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let end = offset.saturating_add(limit).min(items.len());
+    let data = if offset < items.len() {
+        items[offset..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    let next_cursor = if end < items.len() {
+        Value::String(end.to_string())
+    } else {
+        Value::Null
+    };
+
+    Ok(json!({
+        "data": data,
+        "nextCursor": next_cursor,
+    }))
+}
+
+fn codex_model_catalog_item_for_host(item: &Value, default_model: &str) -> Option<Value> {
+    let model = catalog_string_field(item, &["model", "id", "slug", "display_name", "name"])?;
+    let display_name = catalog_string_field(item, &["displayName", "display_name", "name"])
+        .unwrap_or_else(|| model.clone());
+    let description = catalog_string_field(item, &["description"]).unwrap_or_default();
+    let hidden = catalog_model_is_hidden(item);
+    Some(json!({
+        "id": model,
+        "model": model,
+        "upgrade": catalog_field_or_null(item, &["upgrade"]),
+        "upgradeInfo": catalog_field_or_null(item, &["upgradeInfo", "upgrade_info"]),
+        "availabilityNux": catalog_field_or_null(item, &["availabilityNux", "availability_nux"]),
+        "displayName": display_name,
+        "description": description,
+        "hidden": hidden,
+        "supportedReasoningEfforts": catalog_supported_reasoning_efforts(item),
+        "defaultReasoningEffort": catalog_field_or_null(item, &["defaultReasoningEffort", "default_reasoning_level"]),
+        "inputModalities": catalog_field_or_array(item, &["inputModalities", "input_modalities"]),
+        "supportsPersonality": catalog_field_or_bool(item, &["supportsPersonality", "supports_personality"], false),
+        "additionalSpeedTiers": catalog_field_or_array(item, &["additionalSpeedTiers", "additional_speed_tiers"]),
+        "serviceTiers": catalog_field_or_array(item, &["serviceTiers", "service_tiers"]),
+        "defaultServiceTier": catalog_field_or_null(item, &["defaultServiceTier", "default_service_tier"]),
+        "isDefault": !default_model.trim().is_empty() && model == default_model.trim(),
+    }))
+}
+
+fn catalog_model_is_hidden(item: &Value) -> bool {
+    if item.get("hidden").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let visibility = catalog_string_field(item, &["visibility"]).unwrap_or_default();
+    !visibility.is_empty() && visibility != "list"
+}
+
+fn catalog_supported_reasoning_efforts(item: &Value) -> Value {
+    let Some(levels) = item
+        .get("supportedReasoningEfforts")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            item.get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+        })
+    else {
+        return json!([]);
+    };
+
+    Value::Array(
+        levels
+            .iter()
+            .filter_map(|level| {
+                let effort = catalog_string_field(level, &["reasoningEffort", "effort"])?;
+                Some(json!({
+                    "reasoningEffort": effort,
+                    "description": catalog_string_field(level, &["description"]).unwrap_or_default(),
+                }))
+            })
+            .collect(),
+    )
+}
+
+fn catalog_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
+fn catalog_field_or_null(item: &Value, keys: &[&str]) -> Value {
+    keys.iter()
+        .find_map(|key| item.get(*key).cloned())
+        .unwrap_or(Value::Null)
+}
+
+fn catalog_field_or_array(item: &Value, keys: &[&str]) -> Value {
+    keys.iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_array).cloned())
+        .map(Value::Array)
+        .unwrap_or_else(|| json!([]))
+}
+
+fn catalog_field_or_bool(item: &Value, keys: &[&str], default_value: bool) -> Value {
+    keys.iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_bool))
+        .map(Value::Bool)
+        .unwrap_or(Value::Bool(default_value))
+}
+
+fn top_level_toml_string(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            return None;
+        }
+        let Some((name, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if name.trim() == key {
+            return parse_basic_toml_string(value.trim());
+        }
+    }
+    None
+}
+
+fn parse_basic_toml_string(value: &str) -> Option<String> {
+    let mut chars = value.trim_start().chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut output = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            output.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+        if quote == '"' && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(output);
+        }
+        output.push(ch);
+    }
+    None
 }
 
 async fn plugin_transcribe_fetch_response(request: &Value) -> Result<Value, String> {
@@ -992,7 +1224,7 @@ fn safe_relative_path(value: &str) -> Option<PathBuf> {
 
 const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   const RUNTIME_VERSION = "__CODEXL_PLUGIN_RUNTIME_VERSION__";
-  const RUNTIME_BUILD = "settings-context-12";
+  const RUNTIME_BUILD = "settings-context-18";
   const BRIDGE_URL = "__CODEXL_PLUGIN_BRIDGE_URL__";
   const ROOT_ID = "codexl-plugin-runtime-root";
   const CORE_PLUGIN_ID = "codexl.core";
@@ -1099,6 +1331,7 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
     hook.onCommitFiberRoot = function onCommitFiberRoot(id, root, priorityLevel, didError) {
       runtime.lastFiberRoot = root;
       updateUi();
+      scheduleGatewayModelQuerySelectorRepair();
       if (originalOnCommitFiberRoot) {
         return originalOnCommitFiberRoot(id, root, priorityLevel, didError);
       }
@@ -1186,6 +1419,295 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         reject(new Error(`Plugin bridge request timed out: ${type}`));
       }, 30000);
     });
+  }
+
+  function desktopApiFetchEndpoint(message) {
+    if (message?.type !== "fetch" || typeof message.url !== "string") {
+      return "";
+    }
+    try {
+      const url = new URL(message.url, window.location.href);
+      if (url.protocol !== "vscode:" || url.hostname !== "codex") {
+        return "";
+      }
+      return url.pathname.replace(/^\/+/, "");
+    } catch {
+      const prefix = "vscode://codex/";
+      return message.url.startsWith(prefix) ? message.url.slice(prefix.length).split(/[?#]/, 1)[0] : "";
+    }
+  }
+
+  function desktopApiFetchParams(message) {
+    let body = message?.body;
+    if (typeof body === "string") {
+      if (!body.trim()) {
+        body = {};
+      } else {
+        try {
+          body = JSON.parse(body);
+        } catch {
+          body = {};
+        }
+      }
+    }
+    if (!body || typeof body !== "object") {
+      return {};
+    }
+    return body.params && typeof body.params === "object" ? body.params : body;
+  }
+
+  function dispatchDesktopApiFetchMessage(message, response) {
+    if (!message?.requestId) {
+      return;
+    }
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: response,
+        origin: window.location.origin,
+        source: window,
+      }),
+    );
+  }
+
+  function dispatchDesktopApiFetchSuccess(message, body) {
+    dispatchDesktopApiFetchMessage(message, {
+      type: "fetch-response",
+      requestId: message.requestId,
+      responseType: "success",
+      status: 200,
+      headers: { "content-type": "application/json" },
+      bodyJsonString: JSON.stringify(body ?? null),
+    });
+  }
+
+  function dispatchDesktopApiFetchError(message, status, error) {
+    dispatchDesktopApiFetchMessage(message, {
+      type: "fetch-response",
+      requestId: message.requestId,
+      responseType: "error",
+      status,
+      error: String(error || "CodexL desktop API request failed"),
+    });
+  }
+
+  function isListModelsForHostDesktopApiRequest(message) {
+    if (String(message?.method || "POST").toUpperCase() !== "POST") {
+      return false;
+    }
+    return desktopApiFetchEndpoint(message) === "list-models-for-host";
+  }
+
+  async function maybeHandleListModelsForHostDesktopApiRequest(message) {
+    if (!isListModelsForHostDesktopApiRequest(message) || !message?.requestId) {
+      return false;
+    }
+    const result = await request("models:list-for-host", {
+      ...desktopApiFetchParams(message),
+      method: message.method || "POST",
+      requestId: message.requestId,
+      url: message.url,
+    });
+    if (!result?.handled) {
+      return false;
+    }
+    dispatchDesktopApiFetchSuccess(message, result.response);
+    return true;
+  }
+
+  function installDesktopApiHostModelListEventInterceptor() {
+    if (runtime.desktopApiHostModelListEventInterceptorInstalled) {
+      return;
+    }
+    runtime.desktopApiHostModelListEventInterceptorInstalled = true;
+    const pendingRequestIds = new Set();
+    runtime.desktopApiHostModelListPendingRequestIds = pendingRequestIds;
+    const handleRequest = async (message) => {
+      if (!isListModelsForHostDesktopApiRequest(message) || !message?.requestId) {
+        return;
+      }
+      pendingRequestIds.add(message.requestId);
+      try {
+        await maybeHandleListModelsForHostDesktopApiRequest(message);
+      } catch (error) {
+        log("error", "CodexL desktop API model list failed", String(error));
+        dispatchDesktopApiFetchError(message, 500, error?.message || error);
+      } finally {
+        window.setTimeout(() => pendingRequestIds.delete(message.requestId), 1000);
+      }
+    };
+    const onMessageFromView = (event) => {
+      handleRequest(event?.detail);
+    };
+    const onNativeFetchResponse = (event) => {
+      const data = event?.data;
+      if (
+        data?.type === "fetch-response" &&
+        data?.responseType === "error" &&
+        data?.status === 432 &&
+        pendingRequestIds.has(data.requestId)
+      ) {
+        event.stopImmediatePropagation();
+        event.preventDefault?.();
+      }
+    };
+    window.addEventListener("codex-message-from-view", onMessageFromView, true);
+    window.addEventListener("message", onNativeFetchResponse, true);
+    runtime.cleanup.push(() => {
+      window.removeEventListener("codex-message-from-view", onMessageFromView, true);
+      window.removeEventListener("message", onNativeFetchResponse, true);
+    });
+    log("info", "CodexL desktop API model list event interceptor installed");
+  }
+
+  function maybeQueryClientFromCandidate(candidate) {
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+    if (candidate.queryClient?.getQueryCache) {
+      return candidate.queryClient;
+    }
+    if (candidate.getQueryCache && candidate.getQueryData) {
+      return candidate;
+    }
+    return null;
+  }
+
+  function findQueryClientFromFiber(fiber) {
+    let owner = fiber;
+    for (let depth = 0; owner && depth < 100; depth += 1, owner = owner.return || null) {
+      let hook = owner.memoizedState;
+      for (let index = 0; hook && index < 160; index += 1, hook = hook.next || null) {
+        const value = hook.memoizedState;
+        const queryClient =
+          maybeQueryClientFromCandidate(value) ||
+          maybeQueryClientFromCandidate(value?.current) ||
+          maybeQueryClientFromCandidate(value?.value) ||
+          maybeQueryClientFromCandidate(value?.state) ||
+          maybeQueryClientFromCandidate(value?.data);
+        if (queryClient) {
+          return queryClient;
+        }
+      }
+    }
+    return null;
+  }
+
+  function findComposerModelQueryClient() {
+    const trigger = document.querySelector("[data-codex-intelligence-trigger]");
+    return findQueryClientFromFiber(getFiber(trigger));
+  }
+
+  function modelId(value) {
+    return String(value?.model || value?.id || "").trim();
+  }
+
+  function looksLikeGatewayModelList(models) {
+    return models.some((model) => {
+      const id = modelId(model);
+      return id.includes("/") || id.includes(":") || id.includes(" ");
+    });
+  }
+
+  function gatewayModelSelectResult(rawData) {
+    const rawModels = Array.isArray(rawData?.data) ? rawData.data : [];
+    const models = rawModels.filter((model) => model && !model.hidden && modelId(model));
+    if (!models.length || !looksLikeGatewayModelList(models)) {
+      return null;
+    }
+    return {
+      defaultModel: models.find((model) => model.isDefault) || models[0] || null,
+      models,
+    };
+  }
+
+  function selectedModelsLength(value) {
+    return Array.isArray(value?.models) ? value.models.length : null;
+  }
+
+  function repairGatewayModelObserverSelect(query, observer, replacement) {
+    if (!observer?.options || typeof observer.setOptions !== "function") {
+      return false;
+    }
+    let selected = null;
+    try {
+      selected = observer.options.select?.(query.state.data);
+    } catch {}
+    if (selectedModelsLength(selected) !== 0) {
+      return false;
+    }
+    const patchedSelect = () => replacement;
+    Object.defineProperty(patchedSelect, "__codexlGatewayModelSelectPatch", {
+      configurable: true,
+      value: true,
+    });
+    observer.setOptions({
+      ...observer.options,
+      select: patchedSelect,
+    });
+    try {
+      observer.updateResult?.();
+    } catch {}
+    return true;
+  }
+
+  function repairGatewayModelQuerySelectors() {
+    const queryClient = findComposerModelQueryClient();
+    if (!queryClient?.getQueryCache) {
+      return 0;
+    }
+    let patched = 0;
+    try {
+      for (const query of queryClient.getQueryCache().getAll()) {
+        if (!JSON.stringify(query.queryKey || []).includes("models")) {
+          continue;
+        }
+        const replacement = gatewayModelSelectResult(query.state?.data);
+        if (!replacement) {
+          continue;
+        }
+        for (const observer of query.observers || []) {
+          if (repairGatewayModelObserverSelect(query, observer, replacement)) {
+            patched += 1;
+          }
+        }
+        if (patched > 0) {
+          try {
+            query.setData?.(query.state.data);
+          } catch {}
+        }
+      }
+    } catch (error) {
+      runtime.gatewayModelQuerySelectorRepairError = String(error);
+    }
+    if (patched > 0 && !runtime.gatewayModelQuerySelectorRepairLogged) {
+      runtime.gatewayModelQuerySelectorRepairLogged = true;
+      log("info", "CodexL gateway model query selector repaired", String(patched));
+    }
+    return patched;
+  }
+
+  function scheduleGatewayModelQuerySelectorRepair() {
+    if (runtime.gatewayModelQuerySelectorRepairTimer) {
+      return;
+    }
+    runtime.gatewayModelQuerySelectorRepairTimer = window.setTimeout(() => {
+      runtime.gatewayModelQuerySelectorRepairTimer = null;
+      repairGatewayModelQuerySelectors();
+    }, 50);
+  }
+
+  function installGatewayModelQuerySelectorRepair() {
+    if (runtime.gatewayModelQuerySelectorRepairInstalled) {
+      return;
+    }
+    runtime.gatewayModelQuerySelectorRepairInstalled = true;
+    const burstDelays = [0, 120, 360, 900, 1800, 3600, 7200];
+    for (const delay of burstDelays) {
+      const timer = window.setTimeout(repairGatewayModelQuerySelectors, delay);
+      runtime.cleanup.push(() => window.clearTimeout(timer));
+    }
+    const interval = window.setInterval(repairGatewayModelQuerySelectors, 1500);
+    runtime.cleanup.push(() => window.clearInterval(interval));
   }
 
   function isTranscribeFetchUrl(value) {
@@ -1337,6 +1859,110 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
         window.fetch = originalFetch;
       }
     });
+  }
+
+  function installDesktopApiHostModelListInterceptor() {
+    if (runtime.desktopApiHostModelListInstallStarted) {
+      return;
+    }
+    runtime.desktopApiHostModelListInstallStarted = true;
+    installDesktopApiHostModelListEventInterceptor();
+    let attempts = 0;
+    const patchBridge = () => {
+      const bridge = window.electronBridge;
+      if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+        return false;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(bridge, "sendMessageFromView");
+      if (descriptor?.get?.__codexlHostModelListDescriptor) {
+        runtime.desktopApiHostModelListPatched = true;
+        return true;
+      }
+      if (bridge.sendMessageFromView.__codexlHostModelListPatch) {
+        runtime.desktopApiHostModelListPatched = true;
+        return true;
+      }
+      let originalSendMessageFromView = bridge.sendMessageFromView;
+      let exposedSendMessageFromView = null;
+      const expose = (value) => {
+        originalSendMessageFromView = value;
+        if (typeof value !== "function") {
+          exposedSendMessageFromView = value;
+          return;
+        }
+        if (value.__codexlHostModelListPatch) {
+          exposedSendMessageFromView = value;
+          return;
+        }
+        const patchedSendMessageFromView = async function codexlSendMessageFromView(message) {
+          if (isListModelsForHostDesktopApiRequest(message)) {
+            try {
+              if (await maybeHandleListModelsForHostDesktopApiRequest(message)) {
+                return;
+              }
+            } catch (error) {
+              log("error", "CodexL desktop API model list failed", String(error));
+              dispatchDesktopApiFetchError(message, 500, error?.message || error);
+              return;
+            }
+          }
+          return value.call(this, message);
+        };
+        Object.defineProperty(patchedSendMessageFromView, "__codexlHostModelListPatch", {
+          configurable: true,
+          value: true,
+        });
+        exposedSendMessageFromView = patchedSendMessageFromView;
+      };
+      expose(originalSendMessageFromView);
+      const getter = function codexlHostModelListSendMessageGetter() {
+        return exposedSendMessageFromView;
+      };
+      Object.defineProperty(getter, "__codexlHostModelListDescriptor", {
+        configurable: true,
+        value: true,
+      });
+      Object.defineProperty(bridge, "sendMessageFromView", {
+        configurable: true,
+        get: getter,
+        set: expose,
+      });
+      runtime.cleanup.push(() => {
+        const currentDescriptor = Object.getOwnPropertyDescriptor(bridge, "sendMessageFromView");
+        if (currentDescriptor?.get?.__codexlHostModelListDescriptor) {
+          Object.defineProperty(bridge, "sendMessageFromView", {
+            configurable: true,
+            value: originalSendMessageFromView,
+            writable: true,
+          });
+        }
+      });
+      runtime.desktopApiHostModelListPatched = true;
+      if (!runtime.desktopApiHostModelListPatchedLogged) {
+        runtime.desktopApiHostModelListPatchedLogged = true;
+        log("info", "CodexL desktop API model list interceptor installed");
+      }
+      return true;
+    };
+    const tryInstall = () => {
+      attempts += 1;
+      try {
+        patchBridge();
+      } catch (error) {
+        runtime.desktopApiHostModelListPatchError = String(error);
+      }
+      if (attempts < 80) {
+        runtime.desktopApiHostModelListInstallTimer = window.setTimeout(tryInstall, 250);
+      } else if (!window.electronBridge?.sendMessageFromView?.__codexlHostModelListPatch) {
+        log("info", "CodexL desktop API model list bridge patch unavailable; event interceptor active");
+      }
+    };
+    runtime.cleanup.push(() => {
+      if (runtime.desktopApiHostModelListInstallTimer) {
+        window.clearTimeout(runtime.desktopApiHostModelListInstallTimer);
+      }
+    });
+    tryInstall();
   }
 
   function isTranscribeDesktopApiRequest(method, url) {
@@ -4184,6 +4810,8 @@ const CODEXL_PLUGIN_BOOTSTRAP: &str = r#"(() => {
   });
 
   installTranscribeFetchInterceptor();
+  installDesktopApiHostModelListInterceptor();
+  installGatewayModelQuerySelectorRepair();
   installDesktopApiTranscribeInterceptor();
   installReactHook();
   if (document.readyState === "loading") {
@@ -4211,7 +4839,11 @@ mod tests {
         assert!(script.contains("plugin:list"));
         assert!(script.contains("storage:get"));
         assert!(script.contains("transcribe:fetch"));
+        assert!(script.contains("models:list-for-host"));
         assert!(script.contains("installTranscribeFetchInterceptor"));
+        assert!(script.contains("installDesktopApiHostModelListInterceptor"));
+        assert!(script.contains("installGatewayModelQuerySelectorRepair"));
+        assert!(script.contains("codex-message-from-view"));
         assert!(script.contains("installDesktopApiTranscribeInterceptor"));
         assert!(script.contains("setting-storage-"));
         assert!(script.contains("new WebSocket"));
@@ -4373,5 +5005,84 @@ mod tests {
         assert!(expression.contains("__codexlPluginRuntime"));
         assert!(expression.contains("acceptCdpResponse"));
         assert!(expression.contains("\"pong\""));
+    }
+
+    #[test]
+    fn list_models_for_host_from_catalog_matches_desktop_shape() {
+        let catalog = json!({
+            "models": [
+                {
+                    "slug": "Big model/glm-5.1",
+                    "display_name": "Big model/glm-5.1",
+                    "description": "NextAI Gateway model Big model/glm-5.1",
+                    "visibility": "list",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        { "effort": "low", "description": "Low reasoning" },
+                        { "effort": "xhigh", "description": "Extra high reasoning" }
+                    ],
+                    "input_modalities": ["text", "image"],
+                    "additional_speed_tiers": [],
+                    "service_tiers": []
+                },
+                {
+                    "slug": "hidden-model",
+                    "visibility": "hidden"
+                }
+            ]
+        });
+
+        let response = list_models_for_host_from_catalog(
+            &catalog,
+            "Big model/glm-5.1",
+            &json!({ "includeHidden": false }),
+        )
+        .expect("model list");
+        let data = response
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("data array");
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            data[0].get("model").and_then(Value::as_str),
+            Some("Big model/glm-5.1")
+        );
+        assert_eq!(
+            data[0].get("isDefault").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data[0]
+                .pointer("/supportedReasoningEfforts/1/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("xhigh")
+        );
+        assert_eq!(
+            data[0]
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            data[0]
+                .pointer("/inputModalities/1")
+                .and_then(Value::as_str),
+            Some("image")
+        );
+    }
+
+    #[test]
+    fn top_level_toml_string_stops_before_sections() {
+        let content = r#"model_catalog_json = "/tmp/catalog.json"
+[profiles.nextai]
+model_catalog_json = "/tmp/profile-catalog.json"
+"#;
+
+        assert_eq!(
+            top_level_toml_string(content, "model_catalog_json").as_deref(),
+            Some("/tmp/catalog.json")
+        );
+        assert_eq!(top_level_toml_string(content, "missing"), None);
     }
 }

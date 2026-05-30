@@ -756,6 +756,9 @@ impl AppConfig {
         if is_providerless_workspace(&profile) {
             return None;
         }
+        if provider_profile_uses_next_ai_gateway(&profile) {
+            return None;
+        }
         if provider_profile_uses_top_level_config(&profile) {
             return None;
         }
@@ -773,6 +776,12 @@ impl AppConfig {
         }
 
         let profile = self.provider_profile(&self.active_provider)?;
+        if provider_profile_uses_next_ai_gateway(&profile) {
+            return None;
+        }
+        if provider_profile_uses_top_level_config(&profile) {
+            return None;
+        }
         let provider_name = profile.provider_name.trim();
         if provider_name.is_empty() {
             None
@@ -1134,6 +1143,7 @@ pub fn ensure_provider_codex_home_with_format(
             write_codex_home_config(&detail, &codex_home, false, profile_config_format)?;
         } else if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles {
             migrate_codex_home_profile_config(&codex_home, profile, true)?;
+            sync_codex_home_app_server_defaults(&codex_home, profile)?;
         }
     }
     sync_provider_bot_media_mcp_config(profile, &codex_home, profile.bot.bridge_enabled())?;
@@ -1315,11 +1325,14 @@ pub fn update_default_provider_selection_with_format(
     let profile = update_existing_default_provider(input, profile_config_format)?;
     let path = default_codex_config_path();
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = if uses_top_level_provider_config(&profile) {
+    let updated = if uses_top_level_provider_config(&profile)
+        || default_provider_uses_next_ai_gateway(&profile)
+    {
         set_top_level_model_provider_config(&content, &profile.provider_name, &profile.model)
     } else {
         set_top_level_model_config(&content, &profile.model)
     };
+    let updated = set_next_ai_gateway_model_catalog_config(&updated, &profile)?;
     std::fs::write(path, updated).map_err(|e| e.to_string())
 }
 
@@ -1641,23 +1654,15 @@ fn write_codex_home_config(
         force_defaults,
         profile_config_format,
     );
-    let updated = if uses_top_level_provider_config(profile) {
+    let updated = if uses_top_level_provider_config(profile)
+        || default_provider_uses_next_ai_gateway(profile)
+        || profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
+    {
         set_top_level_model_provider_config(&updated, &profile.provider_name, &profile.model)
-    } else if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles {
-        clear_top_level_string_config(
-            &clear_top_level_model_config(&updated),
-            "model_catalog_json",
-        )
     } else {
         set_top_level_model_config(&updated, &profile.model)
     };
-    let updated = if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
-        && !uses_top_level_provider_config(profile)
-    {
-        updated
-    } else {
-        set_next_ai_gateway_model_catalog_config(&updated, profile)?
-    };
+    let updated = set_next_ai_gateway_model_catalog_config(&updated, profile)?;
     std::fs::write(&target_config_path, updated).map_err(|e| e.to_string())?;
 
     if profile_config_format == CodexProfileConfigFormat::SeparateProfileFiles
@@ -1795,6 +1800,53 @@ fn migrate_codex_home_profile_config(
     }
 
     let updated = remove_legacy_profile_config(&content, profile_name);
+    if updated != content {
+        std::fs::write(config_path, ensure_trailing_newline(&updated))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn sync_codex_home_app_server_defaults(
+    codex_home: &Path,
+    profile: &ProviderProfile,
+) -> Result<(), String> {
+    if is_providerless_workspace(profile)
+        || is_default_provider(profile)
+        || provider_profile_uses_top_level_config(profile)
+    {
+        return Ok(());
+    }
+
+    let profile_name = profile.codex_profile_name.trim();
+    if profile_name.is_empty() || profile_name == DEFAULT_PROVIDER_PROFILE_NAME {
+        return Ok(());
+    }
+
+    let config_path = codex_home.join("config.toml");
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let mut detail = provider_detail_from_default_config(profile);
+    let profile_config_path = separate_profile_config_path(codex_home, profile_name);
+    if let Ok(profile_content) = std::fs::read_to_string(profile_config_path) {
+        if let Some(parsed) =
+            parse_separate_provider_profile(profile_name, &content, &profile_content)
+        {
+            detail.provider_name = parsed.provider_name;
+            detail.model = parsed.model;
+            if !parsed.base_url.is_empty() {
+                detail.base_url = parsed.base_url;
+            }
+            if !parsed.api_key.is_empty() {
+                detail.api_key = parsed.api_key;
+            }
+        }
+    }
+
+    let updated = upsert_provider_definition_content(&content, &detail, false);
+    let updated =
+        set_top_level_model_provider_config(&updated, &detail.provider_name, &detail.model);
+    let updated = set_next_ai_gateway_model_catalog_config(&updated, &detail)?;
     if updated != content {
         std::fs::write(config_path, ensure_trailing_newline(&updated))
             .map_err(|e| e.to_string())?;
@@ -3750,15 +3802,12 @@ requires_openai_auth = true
         assert!(!content.contains("base_url = \"\""));
 
         let config = AppConfig {
-            active_provider: "workspace".to_string(),
+            active_provider: provider_profile_key(&profile),
             provider_profiles: vec![profile],
             ..AppConfig::default()
         };
         assert_eq!(config.active_cli_profile(), None);
-        assert_eq!(
-            config.active_cli_model_provider(),
-            Some("custom".to_string())
-        );
+        assert_eq!(config.active_cli_model_provider(), None);
 
         if let Some(value) = old_home {
             std::env::set_var("HOME", value);
@@ -3826,6 +3875,7 @@ requires_openai_auth = true
         let workspace_config =
             std::fs::read_to_string(&workspace_config_path).expect("read workspace config");
         assert!(workspace_config.contains("model = \"zhipu/glm-4.6\""));
+        assert!(workspace_config.contains("model_provider = \"next-ai-gateway\""));
         assert!(workspace_config.contains("model_catalog_json = "));
 
         let default_config = std::fs::read_to_string(root.join(".codex").join("config.toml"))
@@ -4004,6 +4054,24 @@ requires_openai_auth = true
             config.active_cli_model_provider(),
             Some("custom-provider".to_string())
         );
+    }
+
+    #[test]
+    fn next_ai_gateway_provider_uses_codex_home_top_level_config() {
+        let config = AppConfig {
+            active_provider: "gateway".to_string(),
+            provider_profiles: vec![ProviderProfile {
+                name: "gateway".to_string(),
+                codex_profile_name: "nextai".to_string(),
+                provider_name: gateway_config::NEXT_AI_GATEWAY_PROVIDER_NAME.to_string(),
+                model: "openai/gpt-4.1".to_string(),
+                ..ProviderProfile::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(config.active_cli_profile(), None);
+        assert_eq!(config.active_cli_model_provider(), None);
     }
 
     #[test]
@@ -4357,6 +4425,8 @@ model_reasoning_effort = "high"
         let workspace_home = generated_codex_home(&profile);
         let workspace_config =
             std::fs::read_to_string(workspace_home.join("config.toml")).expect("read workspace");
+        assert!(workspace_config.contains("model_provider = \"bs\""));
+        assert!(workspace_config.contains("model = \"new-model\""));
         assert!(!workspace_config.contains("[profiles.bs]"));
         assert!(workspace_config.contains("[model_providers.bs]"));
         let workspace_profile_config =
@@ -4702,7 +4772,7 @@ model_provider = "bs"
         std::env::remove_var("CODEXL_CODEX_HOME");
 
         let profile = ProviderProfile {
-            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            id: "bs".to_string(),
             name: "bs".to_string(),
             codex_profile_name: "bs".to_string(),
             provider_name: "bs".to_string(),
@@ -4777,7 +4847,7 @@ model_provider = "bs"
         std::env::remove_var("CODEXL_CODEX_HOME");
 
         let profile = ProviderProfile {
-            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            id: "bs".to_string(),
             name: "bs".to_string(),
             codex_profile_name: "bs".to_string(),
             provider_name: "bs".to_string(),
@@ -4807,6 +4877,8 @@ model_provider = "bs"
 
         assert!(!content.contains("profile = \"bs\""));
         assert!(!content.contains("[profiles.bs]"));
+        assert!(content.contains("model_provider = \"bs\""));
+        assert!(content.contains("model = \"existing-profile-model\""));
         assert!(content.contains("https://existing.example/v1"));
         assert!(content.contains("existing-token"));
         assert!(profile_content.contains("existing-profile-model"));

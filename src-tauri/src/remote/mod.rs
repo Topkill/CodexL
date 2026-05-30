@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -2416,22 +2417,15 @@ impl CliAppBridge {
         let mut command = match backend {
             CliAppServerBackend::CodexCli => {
                 let mut command = TokioCommand::new(&executable);
-                if let Some(profile) = cli_profile.as_deref() {
-                    match profile_config_format {
-                        config::CodexProfileConfigFormat::SeparateProfileFiles => {
-                            command.arg("--profile").arg(profile);
-                        }
-                        config::CodexProfileConfigFormat::LegacyProfilesTable => {
-                            command.arg("-c").arg(cli_config_string("profile", profile));
-                        }
-                    }
-                }
-                if let Some(model_provider) = cli_model_provider.as_deref() {
-                    command
-                        .arg("-c")
-                        .arg(cli_config_string("model_provider", model_provider));
-                }
-                command.arg("app-server").arg("--analytics-default-enabled");
+                command.args(cli_middleware::real_cli_args(
+                    cli_profile.as_deref(),
+                    cli_model_provider.as_deref(),
+                    profile_config_format,
+                    vec![
+                        OsString::from("app-server"),
+                        OsString::from("--analytics-default-enabled"),
+                    ],
+                ));
                 command
             }
             CliAppServerBackend::ClaudeCode => {
@@ -3750,19 +3744,6 @@ fn cli_app_server_value_to_bridge_message(host_id: &str, value: Value) -> Value 
     } else {
         value
     }
-}
-
-fn cli_config_string(key: &str, value: &str) -> String {
-    format!("{}=\"{}\"", key, toml_string_escape(value))
-}
-
-fn toml_string_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
 }
 
 fn configure_tokio_proxy_env(command: &mut TokioCommand, proxy_url: &str) {

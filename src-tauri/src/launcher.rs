@@ -89,7 +89,7 @@ pub fn launch_codex(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    configure_windows_user_data_dir(&mut command, codex_home, stdio_name)?;
+    configure_electron_user_data_dir(&mut command, codex_home, stdio_name)?;
 
     let mut cli_stdio_path = None;
     if !cli_middleware::is_disabled() {
@@ -431,13 +431,13 @@ fn terminate_pids_windows(mut pids: BTreeSet<u32>) {
     }
 }
 
-#[cfg(windows)]
-fn configure_windows_user_data_dir(
+#[cfg(any(windows, target_os = "macos"))]
+fn configure_electron_user_data_dir(
     command: &mut Command,
     codex_home: Option<&str>,
     stdio_name: Option<&str>,
 ) -> std::io::Result<()> {
-    let user_data_dir = windows_user_data_dir(codex_home, stdio_name);
+    let user_data_dir = electron_user_data_dir(codex_home, stdio_name);
     std::fs::create_dir_all(&user_data_dir)?;
     command.arg(format!(
         "--user-data-dir={}",
@@ -447,8 +447,8 @@ fn configure_windows_user_data_dir(
     Ok(())
 }
 
-#[cfg(windows)]
-fn windows_user_data_dir(codex_home: Option<&str>, stdio_name: Option<&str>) -> PathBuf {
+#[cfg(any(windows, target_os = "macos"))]
+fn electron_user_data_dir(codex_home: Option<&str>, stdio_name: Option<&str>) -> PathBuf {
     let base = codex_home
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -465,8 +465,8 @@ fn windows_user_data_dir(codex_home: Option<&str>, stdio_name: Option<&str>) -> 
         .join(safe_path_segment(stdio_name.unwrap_or("default")))
 }
 
-#[cfg(not(windows))]
-fn configure_windows_user_data_dir(
+#[cfg(not(any(windows, target_os = "macos")))]
+fn configure_electron_user_data_dir(
     _command: &mut Command,
     _codex_home: Option<&str>,
     _stdio_name: Option<&str>,
@@ -1284,16 +1284,20 @@ mod tests {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_tests {
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod electron_user_data_tests {
     use super::*;
 
     #[test]
-    fn windows_user_data_dir_is_scoped_by_profile() {
-        let home = r"C:\Users\me\.codex";
+    fn electron_user_data_dir_is_scoped_by_profile() {
+        let home = if cfg!(windows) {
+            r"C:\Users\me\.codex"
+        } else {
+            "/Users/me/.codex"
+        };
 
-        let first = windows_user_data_dir(Some(home), Some("Default"));
-        let second = windows_user_data_dir(Some(home), Some("Other Provider"));
+        let first = electron_user_data_dir(Some(home), Some("Default"));
+        let second = electron_user_data_dir(Some(home), Some("Other Provider"));
 
         assert_ne!(first, second);
         assert!(first.ends_with(Path::new("codex-app-user-data").join("Default")));
@@ -1301,12 +1305,12 @@ mod windows_tests {
     }
 
     #[test]
-    fn configure_windows_user_data_dir_sets_codex_electron_env() {
+    fn configure_electron_user_data_dir_sets_codex_electron_env() {
         let home =
             std::env::temp_dir().join(format!("codexl-user-data-env-{}", std::process::id()));
-        let mut command = Command::new("Codex.exe");
+        let mut command = Command::new(if cfg!(windows) { "Codex.exe" } else { "Codex" });
 
-        configure_windows_user_data_dir(
+        configure_electron_user_data_dir(
             &mut command,
             Some(&home.to_string_lossy()),
             Some("Default"),

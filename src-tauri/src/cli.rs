@@ -1,4 +1,5 @@
 use crate::{
+    cli_middleware,
     config::{
         self, AppConfig, ProviderProfile, WorkspaceRequest, REMOTE_FRONTEND_MODE_APP,
         REMOTE_FRONTEND_MODE_CLAUDE_CODE, REMOTE_FRONTEND_MODE_CLI,
@@ -6,7 +7,7 @@ use crate::{
     launcher, remote, server, AppState,
 };
 use serde::Serialize;
-use std::process::Command;
+use std::{ffi::OsString, process::Command};
 
 pub fn run_if_requested() -> bool {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -525,8 +526,14 @@ fn run_codex_command(args: &[String]) -> Result<i32, String> {
         config::ensure_provider_codex_home_with_format(&profile, profile_config_format)?;
     config.normalize();
 
-    let mut real_args = codex_profile_args_for_config(&config, profile_config_format);
-    real_args.extend(forwarded);
+    let active_cli_profile = config.active_cli_profile();
+    let active_cli_model_provider = config.active_cli_model_provider();
+    let real_args = cli_middleware::real_cli_args(
+        active_cli_profile.as_deref(),
+        active_cli_model_provider.as_deref(),
+        profile_config_format,
+        forwarded.into_iter().map(OsString::from).collect(),
+    );
     let status = Command::new(&executable)
         .args(&real_args)
         .env("CODEX_HOME", config.codex_home.clone())
@@ -543,43 +550,6 @@ fn resolve_codex_cli_executable(
         explicit_path,
         &config.codex_path,
     ))
-}
-
-fn codex_profile_args_for_config(
-    config: &AppConfig,
-    profile_config_format: config::CodexProfileConfigFormat,
-) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(profile) = config.active_cli_profile() {
-        match profile_config_format {
-            config::CodexProfileConfigFormat::SeparateProfileFiles => {
-                args.push("--profile".to_string());
-                args.push(profile);
-            }
-            config::CodexProfileConfigFormat::LegacyProfilesTable => {
-                args.push("-c".to_string());
-                args.push(cli_config_string("profile", &profile));
-            }
-        }
-    }
-    if let Some(model_provider) = config.active_cli_model_provider() {
-        args.push("-c".to_string());
-        args.push(cli_config_string("model_provider", &model_provider));
-    }
-    args
-}
-
-fn cli_config_string(key: &str, value: &str) -> String {
-    format!("{}=\"{}\"", key, toml_string_escape(value))
-}
-
-fn toml_string_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
 }
 
 fn parse_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), String> {

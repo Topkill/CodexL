@@ -783,7 +783,7 @@ fn claude_code_app_server_args() -> Vec<OsString> {
     args
 }
 
-fn real_cli_args(
+pub(crate) fn real_cli_args(
     profile: Option<&str>,
     model_provider: Option<&str>,
     profile_config_format: CodexProfileConfigFormat,
@@ -792,10 +792,13 @@ fn real_cli_args(
     let mut real_args = Vec::new();
     if let Some(profile) = profile {
         match profile_config_format {
-            CodexProfileConfigFormat::SeparateProfileFiles => {
+            CodexProfileConfigFormat::SeparateProfileFiles
+                if codex_args_accept_profile_flag(&args) =>
+            {
                 real_args.push(OsString::from("--profile"));
                 real_args.push(OsString::from(profile));
             }
+            CodexProfileConfigFormat::SeparateProfileFiles => {}
             CodexProfileConfigFormat::LegacyProfilesTable => {
                 real_args.push(OsString::from("-c"));
                 real_args.push(OsString::from(cli_config_string("profile", profile)));
@@ -811,6 +814,85 @@ fn real_cli_args(
     }
     real_args.extend(args);
     real_args
+}
+
+pub(crate) fn codex_args_accept_profile_flag(args: &[OsString]) -> bool {
+    let positionals = codex_positional_args(args);
+    let Some(command) = positionals.first().map(String::as_str) else {
+        return true;
+    };
+
+    match command {
+        "exec" | "e" | "review" | "resume" | "fork" | "mcp" | "sandbox" => true,
+        "debug" => positionals
+            .get(1)
+            .is_some_and(|subcommand| subcommand == "prompt-input"),
+        "login" | "logout" | "plugin" | "mcp-server" | "app-server" | "remote-control" | "app"
+        | "completion" | "update" | "doctor" | "apply" | "a" | "cloud" | "exec-server"
+        | "features" | "help" => false,
+        _ => true,
+    }
+}
+
+fn codex_positional_args(args: &[OsString]) -> Vec<String> {
+    let mut positionals = Vec::new();
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if codex_option_takes_value(arg) {
+            if !arg.contains('=') {
+                skip_next = true;
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+
+        positionals.push(arg.to_string());
+        if positionals.len() >= 2 {
+            break;
+        }
+    }
+
+    positionals
+}
+
+fn codex_option_takes_value(arg: &str) -> bool {
+    let option = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
+    matches!(
+        option,
+        "-c" | "--config"
+            | "--enable"
+            | "--disable"
+            | "--remote"
+            | "--remote-auth-token-env"
+            | "-i"
+            | "--image"
+            | "-m"
+            | "--model"
+            | "--local-provider"
+            | "-p"
+            | "--profile"
+            | "-s"
+            | "--sandbox"
+            | "-C"
+            | "--cd"
+            | "--add-dir"
+            | "-a"
+            | "--ask-for-approval"
+    )
 }
 
 fn cli_config_string(key: &str, value: &str) -> String {
@@ -1042,7 +1124,10 @@ fn track_request_line_with_workspace(
 
     update_current_cwd_from_request(&value, method, current_cwd);
 
-    if !matches!(method, "account/read" | "getAuthStatus" | "thread/list") {
+    if !matches!(
+        method,
+        "account/read" | "getAuthStatus" | "thread/list" | "config/read" | "model/list"
+    ) {
         return;
     }
 
@@ -1152,8 +1237,11 @@ fn rewrite_stdout_line(
     };
 
     if value.get("error").is_some() {
+        log_protocol_response_summary(&request, &value);
         return line.to_vec();
     }
+
+    log_protocol_response_summary(&request, &value);
 
     match request.method.as_str() {
         "account/read" => value["result"] = chatgpt_auth.account_read_result(),
@@ -1167,6 +1255,140 @@ fn rewrite_stdout_line(
     };
     rewritten.extend_from_slice(line_ending(line));
     rewritten
+}
+
+fn log_protocol_response_summary(request: &RequestInfo, response: &Value) {
+    let Some(summary) = protocol_response_summary(request, response) else {
+        return;
+    };
+    let Some(mut log) = open_log_file_from_env(MIDDLEWARE_LOG_ENV) else {
+        return;
+    };
+    let _ = writeln!(log, "[{}] {}", timestamp_seconds(), summary);
+}
+
+fn protocol_response_summary(request: &RequestInfo, response: &Value) -> Option<String> {
+    if let Some(error) = response.get("error") {
+        let code = error
+            .get("code")
+            .map(json_log_scalar)
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(log_preview)
+            .unwrap_or_default();
+        return Some(format!(
+            "response method={} error_code={} error_message={}",
+            request.method, code, message
+        ));
+    }
+
+    match request.method.as_str() {
+        "config/read" => Some(config_read_response_summary(request, response)),
+        "model/list" => Some(model_list_response_summary(response)),
+        _ => None,
+    }
+}
+
+fn config_read_response_summary(request: &RequestInfo, response: &Value) -> String {
+    let result = response.get("result").unwrap_or(&Value::Null);
+    let config = result.get("config").unwrap_or(result);
+    format!(
+        "response method=config/read model={} model_provider={} profile={} model_catalog_json={} cwd={}",
+        json_path_string(config, &["model"]).unwrap_or_default(),
+        json_path_string(config, &["model_provider"]).unwrap_or_default(),
+        json_path_string(config, &["profile"]).unwrap_or_default(),
+        json_path_string(config, &["model_catalog_json"]).unwrap_or_default(),
+        json_path_string(&request.params, &["cwd"]).unwrap_or_default()
+    )
+}
+
+fn model_list_response_summary(response: &Value) -> String {
+    let result = response.get("result").unwrap_or(&Value::Null);
+    let models = model_list_array(result);
+    let count = models.map(|models| models.len()).unwrap_or(0);
+    let hidden_count = models
+        .map(|models| {
+            models
+                .iter()
+                .filter(|model| model.get("hidden").and_then(Value::as_bool) == Some(true))
+                .count()
+        })
+        .unwrap_or(0);
+    let first = models
+        .map(|models| {
+            models
+                .iter()
+                .take(5)
+                .filter_map(model_display_id)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let default_model = [
+        "default_model",
+        "defaultModel",
+        "default",
+        "selected_model",
+        "selectedModel",
+    ]
+    .iter()
+    .find_map(|key| json_path_string(result, &[*key]))
+    .unwrap_or_default();
+    format!(
+        "response method=model/list count={} hidden_count={} default_model={} first_models={}",
+        count, hidden_count, default_model, first
+    )
+}
+
+fn model_list_array(result: &Value) -> Option<&Vec<Value>> {
+    result
+        .get("models")
+        .and_then(Value::as_array)
+        .or_else(|| result.get("data").and_then(Value::as_array))
+        .or_else(|| result.get("items").and_then(Value::as_array))
+        .or_else(|| result.as_array())
+}
+
+fn model_display_id(model: &Value) -> Option<String> {
+    ["model", "id", "slug", "name", "label"]
+        .iter()
+        .find_map(|key| model.get(*key).and_then(Value::as_str))
+        .map(log_preview)
+}
+
+fn json_path_string(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    match current {
+        Value::String(value) => Some(log_preview(value)),
+        Value::Null => None,
+        other => Some(json_log_scalar(other)),
+    }
+}
+
+fn json_log_scalar(value: &Value) -> String {
+    match value {
+        Value::String(value) => log_preview(value),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => String::new(),
+        Value::Array(values) => format!("array:{}", values.len()),
+        Value::Object(values) => format!("object:{}", values.len()),
+    }
+}
+
+fn log_preview(value: &str) -> String {
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(120).collect::<String>();
+    if chars.next().is_some() {
+        format!("{}...", preview)
+    } else {
+        preview
+    }
 }
 
 fn rewrite_thread_list_response(value: &mut Value, params: &Value) {
@@ -2647,7 +2869,28 @@ printf ':stdin=%s\n' "$first_line"
     }
 
     #[test]
-    fn separate_profile_files_use_profile_flag_for_real_cli() {
+    fn separate_profile_files_use_profile_flag_for_runtime_real_cli() {
+        let args = real_cli_args(
+            Some("test-profile"),
+            Some("test-provider"),
+            CodexProfileConfigFormat::SeparateProfileFiles,
+            vec![OsString::from("exec")],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--profile"),
+                OsString::from("test-profile"),
+                OsString::from("-c"),
+                OsString::from("model_provider=\"test-provider\""),
+                OsString::from("exec"),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_skips_profile_flag_for_real_cli() {
         let args = real_cli_args(
             Some("test-profile"),
             Some("test-provider"),
@@ -2658,13 +2901,32 @@ printf ':stdin=%s\n' "$first_line"
         assert_eq!(
             args,
             vec![
-                OsString::from("--profile"),
-                OsString::from("test-profile"),
                 OsString::from("-c"),
                 OsString::from("model_provider=\"test-provider\""),
                 OsString::from("app-server"),
             ]
         );
+    }
+
+    #[test]
+    fn profile_flag_detection_handles_global_options() {
+        assert!(!codex_args_accept_profile_flag(&[
+            OsString::from("-c"),
+            OsString::from("model=\"gpt-5\""),
+            OsString::from("app-server"),
+        ]));
+        assert!(codex_args_accept_profile_flag(&[
+            OsString::from("--config=model=\"gpt-5\""),
+            OsString::from("exec"),
+        ]));
+        assert!(codex_args_accept_profile_flag(&[
+            OsString::from("debug"),
+            OsString::from("prompt-input"),
+        ]));
+        assert!(!codex_args_accept_profile_flag(&[
+            OsString::from("debug"),
+            OsString::from("models"),
+        ]));
     }
 
     #[test]
